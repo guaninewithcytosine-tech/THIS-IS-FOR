@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>代購</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
+<style>
+:root{
+  --c1:#7df725;--c2:#00b8a4;--c3:#7b5cff;--c4:#ff4f9a;--c5:#ffd84d;
+  --on1:#0a0a0a;--on2:#fff;--on3:#fff;--on4:#0a0a0a;--on5:#0a0a0a;
+  --bg:#f1eee5;--surface:#fffdf7;--surface-2:#efebe0;--surface-3:#e5e0d2;
+  --ink:#191712;--dim:#6a655a;--faint:#a39d8e;
+  --stroke:#191712;--hardc:#191712;
+  --r:12px;--r-sm:8px;
+  --disp:"Bricolage Grotesque","Noto Sans TC",system-ui,sans-serif;
+  --body:"Noto Sans TC",-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang TC",sans-serif;
+}
+[data-mode="dark"]{
+  --bg:#15130d;--surface:#201d15;--surface-2:#2a261b;--surface-3:#352f21;
+  --ink:#f4efe2;--dim:#aaa28d;--faint:#6f6857;--stroke:#5b5238;--hardc:#000;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--body);background:var(--bg);color:var(--ink);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
+button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
+input,textarea{font-family:inherit;font-size:14px;color:var(--ink)}
+a{color:inherit;text-decoration:none}
+img{display:block}
+
+/* ── HEADER ── */
+.hdr{position:sticky;top:0;z-index:60;background:var(--surface);border-bottom:2px solid var(--stroke)}
+.hdr-top{position:relative;display:flex;flex-direction:column;align-items:center;padding:14px 24px 0;max-width:1100px;margin:0 auto}
+.brand{font-family:var(--disp);font-weight:900;font-size:32px;letter-spacing:-.06em;text-transform:uppercase;color:var(--brand-c,var(--c1));margin-bottom:2px;line-height:1}
+.hdr-nav{display:flex;gap:0}
+.hdr-tools{position:fixed;top:14px;right:24px;z-index:80;display:flex;align-items:center;gap:8px}
+.mode-btn{width:34px;height:34px;border-radius:8px;border:2px solid var(--stroke);background:var(--surface-2);box-shadow:2px 2px 0 var(--hardc);display:flex;align-items:center;justify-content:center;font-size:14px;transition:.12s}
+.mode-btn:hover{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--hardc)}
+
+/* NAV TABS — admin style */
+.nav-tab{position:relative;display:flex;align-items:center;height:54px;padding:0 18px;font-size:13px;font-weight:800;color:var(--dim);cursor:pointer;transition:color .14s;white-space:nowrap}
+.nav-tab::after{content:"";position:absolute;left:50%;bottom:6px;width:0;height:2.5px;border-radius:99px;background:var(--c1);transform:translateX(-50%);transition:width .15s}
+.nav-tab[data-tab="instock"]::after{background:var(--c4)}
+.nav-tab[data-tab="query"]::after{background:var(--c3)}
+.nav-tab:hover{color:var(--ink)}
+.nav-tab.active{color:var(--ink)}
+.nav-tab.active::after{width:24px}
+
+/* ── MAIN ── */
+.main{max-width:1100px;margin:0 auto;padding:24px 24px 100px}
+.view{display:none}.view.active{display:block}
+
+/* STORE DESC BANNER */
+.store-banner{background:var(--surface);border:2px solid var(--stroke);border-radius:var(--r);padding:15px 18px;margin-bottom:22px;font-size:13.5px;line-height:1.8;color:var(--dim);white-space:pre-wrap;word-break:break-word;box-shadow:3px 3px 0 var(--hardc)}
+.store-banner:empty{display:none}
+
+/* CAMPAIGN LIST */
+.camp-list{display:flex;flex-direction:column;gap:12px}
+
+/* CAMPAIGN ROW — clickable list item */
+.camp-row{background:var(--surface);border:2px solid var(--stroke);border-radius:var(--r);overflow:hidden;box-shadow:4px 4px 0 var(--hardc);cursor:pointer;transition:.12s;display:flex;align-items:stretch}
+.camp-row:hover{transform:translate(1px,1px);box-shadow:3px 3px 0 var(--hardc)}
+.camp-row:active{transform:translate(3px,3px);box-shadow:1px 1px 0 var(--hardc)}
+.camp-row-thumb{width:100px;height:90px;object-fit:cover;border-right:2px solid var(--stroke);flex-shrink:0}
+.camp-row-thumb-empty{width:100px;flex-shrink:0;background:var(--surface-3);border-right:2px solid var(--stroke);display:flex;align-items:center;justify-content:center;color:var(--faint);font-size:24px}
+.camp-row-body{flex:1;padding:14px 16px;display:flex;flex-direction:column;justify-content:center;gap:5px;min-width:0}
+.camp-row-name{font-family:var(--disp);font-size:15px;font-weight:800;line-height:1.3}
+.camp-row-meta{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.camp-row-desc{font-size:12.5px;color:var(--dim);line-height:1.5;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+.camp-row-arrow{padding:0 16px;display:flex;align-items:center;color:var(--faint);font-size:18px;flex-shrink:0}
+.tag{display:inline-block;padding:2px 8px;border-radius:5px;font-size:11px;font-weight:800;border:2px solid var(--stroke)}
+.tag-open{background:var(--tag-open-bg,var(--c1));color:var(--tag-open-fg,var(--on1))}
+.tag-instock{background:var(--tag-instock-bg,var(--c4));color:var(--tag-instock-fg,var(--on4))}
+.tag-dim{background:var(--surface-2);color:var(--dim)}
+
+/* ── CAMPAIGN DETAIL PAGE ── */
+.detail-view{display:none;flex-direction:column;gap:0}
+.detail-view.active{display:flex}
+.detail-back{display:inline-flex;align-items:center;gap:8px;padding:8px 12px;border-radius:8px;border:2px solid var(--stroke);background:var(--surface-2);font-size:13px;font-weight:800;box-shadow:2px 2px 0 var(--hardc);margin-bottom:18px;cursor:pointer;transition:.12s;width:fit-content}
+.detail-back:hover{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--hardc)}
+.detail-cover{width:100%;max-height:280px;object-fit:cover;border-radius:var(--r);border:2px solid var(--stroke);margin-bottom:18px}
+.detail-name{font-family:var(--disp);font-size:22px;font-weight:900;margin-bottom:8px;line-height:1.3}
+.detail-meta{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.detail-desc{font-size:13.5px;color:var(--dim);line-height:1.8;white-space:pre-wrap;word-break:break-word;margin-bottom:16px}
+.detail-desc:empty{display:none}
+.sell-link{display:inline-flex;align-items:center;gap:6px;padding:9px 14px;border-radius:8px;background:var(--surface-2);border:2px solid var(--stroke);font-size:13px;font-weight:800;box-shadow:2px 2px 0 var(--hardc);margin-bottom:18px;transition:.12s}
+.sell-link:hover{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--hardc)}
+.remit{background:var(--surface-2);border-left:4px solid var(--c2);padding:12px 14px;border-radius:0 var(--r-sm) var(--r-sm) 0;font-size:13px;line-height:1.8;white-space:pre-wrap;word-break:break-word;color:var(--dim);margin-bottom:20px}
+.remit:empty{display:none}
+
+/* SECTIONS */
+.sec-block{margin-bottom:20px}
+.sec-title{font-size:15px;font-weight:900;color:var(--ink);margin-bottom:10px;padding-bottom:10px;border-bottom:2px solid var(--stroke)}
+.prod-list{display:flex;flex-direction:column;gap:6px}
+.prod-row{display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--surface);border:2px solid var(--stroke);border-radius:var(--r-sm);box-shadow:2px 2px 0 var(--hardc)}
+.prod-thumb{width:40px;height:40px;border-radius:7px;object-fit:cover;border:1.5px solid var(--stroke);flex-shrink:0}
+.prod-thumb-empty{width:40px;height:40px;border-radius:7px;background:var(--surface-3);border:1.5px solid var(--stroke);flex-shrink:0}
+.prod-info{flex:1;min-width:0}
+.prod-name{font-weight:800;font-size:13.5px}
+.prod-price{font-size:12px;color:var(--dim);margin-top:1px}
+.qty-wrap{display:flex;align-items:center;gap:7px;flex-shrink:0}
+.qty-btn{width:28px;height:28px;border-radius:7px;border:2px solid var(--stroke);background:var(--surface-2);font-size:15px;font-weight:900;display:flex;align-items:center;justify-content:center;transition:.1s;line-height:1}
+.qty-btn:hover{background:var(--surface-3)}
+.qty-num{font-family:var(--disp);font-weight:900;font-size:15px;min-width:20px;text-align:center}
+
+/* CART BAR */
+.cart-bar{position:fixed;bottom:0;left:0;right:0;background:var(--surface);border-top:2px solid var(--stroke);padding:12px 24px;z-index:50;display:none}
+.cart-bar.show{display:block}
+.cart-bar-inner{max-width:1100px;margin:0 auto;display:flex;align-items:center;gap:14px}
+.cart-info{flex:1;font-size:13px;font-weight:700;color:var(--dim)}
+.cart-info b{font-family:var(--disp);font-size:17px;color:var(--ink)}
+.cart-btn{padding:11px 24px;border-radius:9px;background:var(--btn-bg,var(--c1));color:var(--btn-fg,var(--on1));font-weight:900;font-size:14px;border:2px solid var(--stroke);box-shadow:3px 3px 0 var(--hardc);transition:.12s}
+.cart-btn:hover{transform:translate(1px,1px);box-shadow:2px 2px 0 var(--hardc)}
+
+/* OVERLAY / MODAL */
+.overlay{position:fixed;inset:0;z-index:100;background:rgba(20,16,8,.5);display:none;align-items:flex-end;justify-content:center}
+.overlay.show{display:flex}
+@media(min-width:600px){.overlay{align-items:center;padding:20px}}
+.modal{background:var(--surface);border:2px solid var(--stroke);width:100%;max-width:500px;max-height:92vh;overflow-y:auto;padding:22px;border-radius:var(--r) var(--r) 0 0;box-shadow:0 -4px 0 var(--hardc)}
+@media(min-width:600px){.modal{border-radius:var(--r);box-shadow:6px 6px 0 var(--hardc)}}
+.modal-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.modal-title{font-family:var(--disp);font-size:17px;font-weight:800}
+.modal-x{width:30px;height:30px;border-radius:7px;border:2px solid var(--stroke);background:var(--surface-2);display:flex;align-items:center;justify-content:center;font-size:14px}
+.modal-x:hover{background:var(--surface-3)}
+.order-lines{background:var(--surface-2);border:2px solid var(--stroke);border-radius:var(--r-sm);padding:12px 14px;margin-bottom:16px;font-size:13px;line-height:1.8}
+.order-total{display:flex;justify-content:space-between;border-top:1.5px solid var(--stroke);margin-top:8px;padding-top:8px;font-weight:800}
+.order-total b{font-family:var(--disp);font-size:16px}
+.fld{margin-bottom:12px}
+.lbl{display:block;font-size:10.5px;font-weight:900;letter-spacing:.06em;text-transform:uppercase;color:var(--dim);margin-bottom:5px}
+.inp,.txt{width:100%;padding:10px 12px;background:var(--surface-2);border:2px solid var(--stroke);border-radius:var(--r-sm);outline:none;font-size:14px;transition:.12s}
+.inp:focus,.txt:focus{box-shadow:3px 3px 0 var(--c1)}
+.txt{resize:none;min-height:60px;line-height:1.6}
+.sub-btn{width:100%;padding:13px;border-radius:9px;background:var(--btn-bg,var(--c1));color:var(--btn-fg,var(--on1));font-weight:900;font-size:15px;border:2px solid var(--stroke);box-shadow:3px 3px 0 var(--hardc);transition:.12s;margin-top:4px}
+.sub-btn:hover{transform:translate(1px,1px);box-shadow:2px 2px 0 var(--hardc)}
+.sub-btn:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:3px 3px 0 var(--hardc)}
+.success{text-align:center;padding:28px 16px}
+.success .ico{font-size:44px;margin-bottom:10px}
+.success h3{font-family:var(--disp);font-size:20px;font-weight:900;margin-bottom:8px}
+.success p{color:var(--dim);font-size:13.5px;line-height:1.7}
+
+/* QUERY */
+.q-wrap{max-width:460px;margin:0 auto}
+.q-btn{width:100%;padding:11px;border-radius:9px;background:var(--btn-bg,var(--c1));color:var(--btn-fg,var(--on1));font-weight:900;font-size:14px;border:2px solid var(--stroke);box-shadow:3px 3px 0 var(--hardc);transition:.12s;margin-top:4px}
+.q-btn:hover{transform:translate(1px,1px);box-shadow:2px 2px 0 var(--hardc)}
+.q-result{margin-top:18px}
+.o-card{background:var(--surface);border:2px solid var(--stroke);border-radius:var(--r);padding:16px;margin-bottom:10px;box-shadow:3px 3px 0 var(--hardc)}
+.o-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.o-name{font-weight:900;font-size:14px}
+.badge{padding:3px 9px;border-radius:5px;font-size:11px;font-weight:800;border:2px solid var(--stroke)}
+.badge-paid{background:var(--c1);color:var(--on1)}
+.badge-pend{background:var(--c5);color:var(--on5)}
+.o-row{font-size:13px;color:var(--dim);margin-bottom:3px}
+.o-row b{color:var(--ink);font-weight:800}
+.second-query-block{margin-top:12px;padding:12px 13px;background:var(--surface-2);border:2px solid var(--stroke);border-radius:var(--r-sm);font-size:13px;line-height:1.75;color:var(--dim)}
+.second-query-title{font-weight:900;color:var(--ink);margin-bottom:5px}
+.second-query-line b{color:var(--ink);font-weight:900}
+.query-sell-link{display:inline-flex;align-items:center;justify-content:center;gap:6px;margin-top:10px;padding:8px 12px;border-radius:8px;background:var(--btn-bg,var(--c1));color:var(--btn-fg,var(--on1));border:2px solid var(--stroke);box-shadow:2px 2px 0 var(--hardc);font-size:13px;font-weight:900;transition:.12s}
+.query-sell-link:hover{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--hardc)}
+.no-res{text-align:center;padding:36px 20px;color:var(--faint);font-weight:700}
+.empty{text-align:center;padding:60px 20px;color:var(--faint);font-weight:700}
+.empty .ico{font-size:40px;margin-bottom:10px}
+
+/* LOGI PROGRESS — same as seller admin */
+.logi-wrap{margin-top:14px;padding-top:14px;border-top:1.5px solid var(--stroke)}
+.logi-label{font-size:10.5px;font-weight:900;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);margin-bottom:12px}
+.logi-steps{display:flex;align-items:flex-start;padding:2px 0 0;--progress-muted:#55514a;--progress-line:#8d887d}
+[data-mode="dark"] .logi-steps{--progress-muted:#a29b8d;--progress-line:#756f62}
+.logi-step{position:relative;flex:1;display:flex;flex-direction:column;align-items:center;gap:5px;min-width:0}
+.logi-step:not(:first-child)::before{content:"";position:absolute;top:14px;left:-50%;width:100%;height:3px;background:var(--progress-line);border:0;z-index:0}
+.logi-step.done:not(:first-child)::before,.logi-step.active:not(:first-child)::before{background:var(--logi-active-c,var(--c2))}
+.logi-dot{position:relative;z-index:1;width:32px;height:32px;border-radius:50%;background:var(--surface);border:3px solid var(--progress-line);display:flex;align-items:center;justify-content:center;font-family:var(--disp);font-size:12px;font-weight:900;color:var(--progress-muted);line-height:1}
+.logi-step.done .logi-dot{background:var(--surface);border-color:var(--logi-active-c,var(--c2));color:var(--logi-active-c,var(--c2))}
+.logi-step.active .logi-dot{background:var(--logi-active-c,var(--c2));border-color:var(--logi-active-c,var(--c2));color:var(--on2);transform:none}
+.logi-name{font-size:11px;line-height:1.15;text-align:center;color:var(--dim);font-weight:900;white-space:nowrap;letter-spacing:-.02em}
+.logi-step.done .logi-name{color:var(--dim)}
+.logi-step.active .logi-name{color:var(--ink);font-weight:900}
+.tag-closed{background:var(--tag-closed-bg,var(--surface-2));color:var(--tag-closed-fg,var(--dim));border-color:var(--stroke)}
+.camp-row.closed{opacity:.85;cursor:default}
+.camp-row.closed:hover{transform:none;box-shadow:4px 4px 0 var(--hardc)}
+/* GROUP FILTER */
+.group-filter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
+.group-tag{padding:6px 14px;border-radius:999px;border:2px solid var(--stroke);font-size:12.5px;font-weight:800;background:var(--surface);color:var(--dim);cursor:pointer;transition:.12s;box-shadow:2px 2px 0 var(--hardc)}
+.group-tag:hover{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--hardc);color:var(--ink)}
+.group-tag.active{background:var(--c1);color:var(--on1);border-color:var(--stroke)}
+.camp-group-label{font-size:10.5px;font-weight:900;letter-spacing:.06em;text-transform:uppercase;color:var(--faint);margin-top:4px}
+
+/* INSTOCK CATEGORY TABS */
+.store-category-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px}
+.store-category-tab{display:inline-flex;align-items:center;gap:8px;padding:8px 14px;border-radius:999px;border:2px solid var(--stroke);background:var(--surface);color:var(--dim);font-size:12.5px;font-weight:900;box-shadow:2px 2px 0 var(--hardc);cursor:pointer;transition:.12s}
+.store-category-tab:hover{transform:translate(1px,1px);box-shadow:1px 1px 0 var(--hardc);color:var(--ink)}
+.store-category-tab.active{background:var(--c1);color:var(--on1)}
+.store-category-count{font-family:var(--disp);font-size:12px;padding:1px 7px;border-radius:999px;background:var(--surface-2);color:var(--dim);border:1.5px solid var(--stroke)}
+.store-category-tab.active .store-category-count{background:var(--surface);color:var(--ink)}
+.store-section-note{font-size:12.5px;color:var(--dim);line-height:1.7;margin:-4px 0 14px;padding:10px 13px;background:var(--surface-2);border:2px solid var(--stroke);border-radius:var(--r-sm)}
+.tag-service{background:var(--c3);color:var(--on3)}
+
+/* CARD SORT */
+.card-sort-block{background:var(--surface-2);border:2px solid var(--stroke);border-radius:var(--r-sm);padding:14px;margin-bottom:14px}
+.card-sort-title{font-size:13.5px;font-weight:900;margin-bottom:6px}
+.card-sort-note{font-size:12.5px;color:var(--dim);line-height:1.65;margin-bottom:10px;white-space:pre-wrap}
+.card-sort-label{font-size:11px;font-weight:900;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);margin-bottom:8px}
+.card-sort-members{display:flex;flex-direction:column;gap:6px}
+.member-rank-row{display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--surface);border:2px solid var(--stroke);border-radius:var(--r-sm);cursor:grab;user-select:none;transition:.12s;box-shadow:2px 2px 0 var(--hardc)}
+.member-rank-row:active{cursor:grabbing;opacity:.7}
+.member-rank-row.drag-over{border-color:var(--c1);box-shadow:2px 2px 0 var(--c1)}
+.member-rank-row.dimmed{opacity:.35}
+.member-rank-num{font-family:var(--disp);font-weight:900;font-size:16px;color:var(--c1);min-width:22px}
+.member-rank-name{flex:1;font-weight:800;font-size:13.5px}
+.member-rank-handle{color:var(--faint);font-size:16px}
+.card-count-line{font-family:var(--disp);font-size:17px;font-weight:900;color:var(--ink);margin-bottom:6px}
+.card-threshold-info{font-size:13px;color:var(--dim);margin-bottom:10px;padding:8px 12px;background:var(--surface);border:1.5px solid var(--stroke);border-radius:var(--r-sm)}
+.no-sort-btn{width:100%;margin-top:8px;padding:9px;border-radius:var(--r-sm);border:2px dashed var(--stroke);background:transparent;font-size:13px;font-weight:800;color:var(--dim);cursor:pointer;transition:.12s}
+.no-sort-btn:hover{background:var(--surface-2);color:var(--ink)}
+.no-sort-btn.active{background:var(--surface-2);color:var(--ink);border-style:solid;border-color:var(--stroke)}
+/* TOAST */
+#toast{position:fixed;bottom:72px;left:50%;transform:translateX(-50%) translateY(10px);background:var(--ink);color:var(--bg);border:2px solid var(--stroke);padding:11px 18px;border-radius:var(--r-sm);box-shadow:3px 3px 0 var(--c1);z-index:200;opacity:0;transition:.22s;font-weight:800;font-size:13px;pointer-events:none;white-space:nowrap}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* LOADING */
+.loading{display:flex;align-items:center;justify-content:center;padding:60px;color:var(--faint);gap:10px;font-weight:700;font-size:13px}
+.spin{width:18px;height:18px;border:2.5px solid var(--surface-3);border-top-color:var(--c1);border-radius:50%;animation:spin .7s linear infinite;flex-shrink:0}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+@media(max-width:600px){
+  .hdr-top{padding:12px 16px 0}
+  .hdr-tools{top:12px;right:16px}
+  .main{padding:18px 16px 100px}
+  .camp-row-thumb,.camp-row-thumb-empty{width:80px}
+}
+</style>
+</head>
+<body>
+
+<header class="hdr">
+  <div class="hdr-top">
+    <span class="brand" id="brandName">代購</span>
+    <div class="hdr-nav">
+      <div class="nav-tab active" data-tab="shop" onclick="switchTab('shop')">開團商品</div>
+      <div class="nav-tab" data-tab="instock" onclick="switchTab('instock')">現貨賣場</div>
+      <div class="nav-tab" data-tab="query" onclick="switchTab('query')">查詢訂單</div>
+    </div>
+    <div class="hdr-tools">
+      <button class="mode-btn" id="modeBtn" onclick="toggleMode()">☀️</button>
+    </div>
+  </div>
+</header>
+
+<main class="main">
+  <!-- 開團商品 tab -->
+  <div class="view active" id="view-shop">
+    <div class="store-banner" id="storeBanner"></div>
+    <div class="group-filter" id="groupFilter"></div>
+    <div class="camp-list" id="shopList"><div class="loading"><div class="spin"></div>載入中…</div></div>
+  </div>
+
+  <!-- 開團詳情頁（獨立頁面，點進去才看到） -->
+  <div class="detail-view" id="view-detail">
+    <button class="detail-back" onclick="goBack()">← 返回</button>
+    <div id="detailContent"></div>
+  </div>
+
+  <!-- 現貨賣場 tab -->
+  <div class="view" id="view-instock">
+    <div class="store-category-tabs" id="instockCategoryTabs"></div>
+    <div class="store-section-note" id="instockCategoryNote"></div>
+    <div class="camp-list" id="instockList"><div class="loading"><div class="spin"></div>載入中…</div></div>
+  </div>
+
+  <!-- 查詢訂單 tab -->
+  <div class="view" id="view-query">
+    <div class="q-wrap">
+      <div class="fld">
+        <label class="lbl">手機號碼 或 匯款後五碼</label>
+        <input class="inp" id="qInput" placeholder="0912345678 或 12345" maxlength="20"
+          onkeydown="if(event.key==='Enter')runQuery()">
+      </div>
+      <button class="q-btn" onclick="runQuery()">查詢</button>
+      <div class="q-result" id="qResult"></div>
+    </div>
+  </div>
+</main>
+
+<div class="cart-bar" id="cartBar">
+  <div class="cart-bar-inner">
+    <div class="cart-info" id="cartInfo"></div>
+    <button class="cart-btn" onclick="openModal()">填寫訂單 →</button>
+  </div>
+</div>
+
+<div class="overlay" id="overlay" onclick="if(event.target===this)closeModal()">
+  <div class="modal" id="modalBody"></div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const API_URL='https://script.google.com/macros/s/AKfycbzXIAq-_4-hG3f3iOub2NxZKRoyS_NtVEbuHdOif6xNZYEDrqL_DgNCd2jrn_3jWFWL/exec';
+const CUR={TWD:{s:'$',l:'TWD'},JPY:{s:'¥',l:'JPY'},KRW:{s:'₩',l:'KRW'},CNY:{s:'¥',l:'CNY'},USD:{s:'$',l:'USD'}};
+const LOGI_STEPS=['已結單','已下單','在途中','清關中','理貨中','出貨中'];
+const LS_KEY='twt-buyer-cache';
+
+let catalog=null, cart={}, activeId=null, prevTab='shop';
+let theme={mode:localStorage.getItem('twt-mode')||'light', palette:{}};
+
+// ── 先從快取套用品牌名 / 顏色，避免白屏閃爍 ──
+(function(){
+  const cached=localStorage.getItem(LS_KEY);
+  if(!cached)return;
+  try{
+    const d=JSON.parse(cached);
+    const brand=d.boardColumns?.brandName;
+    if(brand){document.getElementById('brandName').textContent=brand;document.title=brand;}
+    const t=d.boardColumns?.theme;
+    if(t){
+      const pal=Array.isArray(t.palette)?{c1:t.palette[0],c2:t.palette[1],c3:t.palette[2],c4:t.palette[3],c5:t.palette[4]}:(t.colors||{});
+      theme.palette=pal;
+    }
+    if(d.boardColumns?.tagColors) applyTagColors(d.boardColumns.tagColors);
+    if(d.boardColumns?.uiRoles) applyUiRoles(d.boardColumns.uiRoles);
+  }catch(e){}
+  applyTheme();
+})();
+
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function toast(m,d=2600){const el=document.getElementById('toast');el.textContent=m;el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),d);}
+
+function switchTab(t){
+  // 隱藏 detail view
+  document.getElementById('view-detail').classList.remove('active');
+  document.querySelectorAll('.nav-tab').forEach(n=>n.classList.toggle('active',n.dataset.tab===t));
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  document.getElementById('view-'+t).classList.add('active');
+  prevTab=t;
+}
+
+function openDetail(tourId){
+  const tour=(catalog?.appData?.tours||[]).find(t=>t.id===tourId);
+  if(!tour)return;
+  const st=String(tour.status||'open').toLowerCase();
+  if(st!=='open'&&!isBuyerStorePageTour(tour))return;
+  // 隱藏所有 tab view，顯示 detail
+  document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));
+  document.getElementById('view-detail').classList.add('active');
+  renderDetail(tour);
+  window.scrollTo(0,0);
+}
+
+function openStoreLink(tourId){
+  const tour=(catalog?.appData?.tours||[]).find(t=>t.id===tourId);
+  const link=String(tour?.sellLink||'').trim();
+  if(!link){toast('目前沒有設定賣場連結');return;}
+  window.open(link,'_blank','noopener');
+}
+
+function goBack(){
+  document.getElementById('view-detail').classList.remove('active');
+  document.getElementById('view-'+prevTab).classList.add('active');
+}
+
+function toggleMode(){theme.mode=theme.mode==='dark'?'light':'dark';localStorage.setItem('twt-mode',theme.mode);applyTheme();}
+
+function lum(h){const c=h.replace('#','');const[r,g,b]=[0,2,4].map(i=>parseInt(c.substr(i,2),16)/255);const f=v=>v<=.03928?v/12.92:Math.pow((v+.055)/1.055,2.4);return .2126*f(r)+.7152*f(g)+.0722*f(b);}
+function onC(h){return lum(h)>.5?'#0a0a0a':'#fff';}
+function toRgb(h){const c=h.replace('#','');return[0,2,4].map(i=>parseInt(c.substr(i,2),16));}
+function applyTheme(){
+  document.body.setAttribute('data-mode',theme.mode);
+  document.getElementById('modeBtn').textContent=theme.mode==='dark'?'🌙':'☀️';
+  const p=theme.palette,s=document.documentElement.style;
+  ['c1','c2','c3','c4','c5'].forEach(k=>{
+    if(!p[k])return;
+    const h=p[k],[r,g,b]=toRgb(h);
+    s.setProperty('--'+k,h);s.setProperty('--on'+k.slice(1),onC(h));
+    s.setProperty('--'+k+'-soft',`rgba(${r},${g},${b},.16)`);
+  });
+}
+function applyTagColors(tc){
+  if(!tc)return;
+  const s=document.documentElement.style;
+  const set=(varName,ck)=>{s.setProperty(varName+'-bg',`var(--${ck})`);s.setProperty(varName+'-fg',`var(--on${ck.slice(1)})`);};
+  set('--tag-open',   tc.open   ||'c1');
+  set('--tag-closed', tc.closed ||'c2');
+  set('--tag-sorting',tc.sorting||'c3');
+  set('--tag-instock',tc.instock||'c4');
+}
+function applyUiRoles(ur){
+  if(!ur)return;
+  const s=document.documentElement.style;
+  // 主要按鈕
+  const bp=ur.btnPrimary||'c1';
+  s.setProperty('--btn-bg',`var(--${bp})`);
+  s.setProperty('--btn-fg',`var(--on${bp.slice(1)})`);
+  // 副按鈕
+  const bs=ur.btnSecondary||'c2';
+  s.setProperty('--btn2-bg',`var(--${bs})`);
+  s.setProperty('--btn2-fg',`var(--on${bs.slice(1)})`);
+  // 品牌名
+  const br=ur.brand||'c1';
+  s.setProperty('--brand-c',`var(--${br})`);
+  // 團務進度
+  const la=ur.logiActive||'c2';
+  s.setProperty('--logi-active-c',`var(--${la})`);
+  // 標籤（uiRoles 優先，覆蓋 tagColors）
+  const set=(v,ck)=>{s.setProperty(v+'-bg',`var(--${ck})`);s.setProperty(v+'-fg',`var(--on${ck.slice(1)})`);};
+  if(ur.tagOpen)    set('--tag-open',   ur.tagOpen);
+  if(ur.tagClosed)  set('--tag-closed', ur.tagClosed);
+  if(ur.tagSorting) set('--tag-sorting',ur.tagSorting);
+  if(ur.tagInstock) set('--tag-instock',ur.tagInstock);
+}
+
+async function apiGet(a='',params={}){
+  const url=new URL(API_URL);
+  if(a)url.searchParams.set('action',a);
+  Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));
+  url.searchParams.set('_t',Date.now());
+  return (await fetch(url.toString())).json();
+}
+async function apiPost(a,p={}){
+  return (await fetch(API_URL,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:a,...p})})).json();
+}
+
+async function loadCatalog(){
+  try{
+    const d=await apiGet();
+    catalog=d;
+    localStorage.setItem(LS_KEY,JSON.stringify(d));
+    // 套用主題
+    const t=d.boardColumns?.theme;
+    if(t){
+      const pal=Array.isArray(t.palette)?{c1:t.palette[0],c2:t.palette[1],c3:t.palette[2],c4:t.palette[3],c5:t.palette[4]}:(t.colors||{});
+      theme.palette=pal;applyTheme();
+    }
+    applyTagColors(d.boardColumns?.tagColors);
+    applyUiRoles(d.boardColumns?.uiRoles);
+    const brand=d.boardColumns?.brandName||'代購';
+    document.getElementById('brandName').textContent=brand;
+    document.title=brand;
+    document.getElementById('storeBanner').textContent=d.boardColumns?.storeDescription||'';
+    const tours=d.appData?.tours||[];
+    renderList(tours.filter(t=>shouldShowInShopTab(t)),'shopList');
+    renderInstockCategories(tours.filter(t=>!isEndedTour(t)&&isBuyerStorePageTour(t)));
+  }catch(e){
+    document.getElementById('shopList').innerHTML='';
+    const catTabs=document.getElementById('instockCategoryTabs');
+    const catNote=document.getElementById('instockCategoryNote');
+    if(catTabs)catTabs.innerHTML='';
+    if(catNote)catNote.textContent='';
+    document.getElementById('instockList').innerHTML='';
+  }
+}
+
+function priceStr(item,currency){
+  const c=CUR[currency]||{s:'',l:currency||''};
+  if(item.twd)return `$ ${item.twd} TWD`;
+  if(item.original)return `${c.s}${item.original} ${c.l}`;
+  return '';
+}
+
+// ── 列表頁：一行一個開團，點擊進入詳情 ──
+let _allShopTours = [];
+let _activeGroup = null;
+let _allInstockTours = [];
+let _activeInstockCategory = 'stock';
+
+function renderList(tours, gridId){
+  const g = document.getElementById(gridId);
+  const isShop = gridId === 'shopList';
+
+  if(isShop){
+    _allShopTours = tours;
+    const groups = [...new Set(tours.map(t=>t.group).filter(Boolean))];
+    const filterWrap = document.getElementById('groupFilter');
+    if(filterWrap && groups.length){
+      filterWrap.innerHTML = groups.map(gr=>
+        `<button class="group-tag" onclick="filterGroup('${esc(gr)}')">${esc(gr)}</button>`
+      ).join('');
+    }
+  }
+  renderFilteredList(tours, gridId);
+}
+
+function filterGroup(gr){
+  _activeGroup = _activeGroup === gr ? null : gr;
+  document.querySelectorAll('.group-tag').forEach(b=>{
+    b.classList.toggle('active', b.textContent === gr && _activeGroup === gr);
+  });
+  const filtered = _activeGroup
+    ? _allShopTours.filter(t => t.group === _activeGroup)
+    : _allShopTours;
+  renderFilteredList(filtered, 'shopList');
+}
+
+
+function buyerTourStatus(tour){
+  return String((tour && tour.status) || 'open').toLowerCase();
+}
+function columnTitleForStatus(status){
+  const titleMap = catalog?.boardColumns?.columns || {};
+  const st = String(status || '').toLowerCase();
+  if(st === 'open') return String(titleMap.open || '開團中');
+  if(st === 'closed' || st === 'stopped') return String(titleMap.closed || titleMap.stopped || '停止收單');
+  if(st === 'sorting') return String(titleMap.sorting || '理貨中');
+  if(st === 'instock') return String(titleMap.instock || '現貨已有賣場');
+  if(st === 'ended') return String(titleMap.ended || '團務結束');
+  return '';
+}
+function isEndedTour(tour){
+  const status = buyerTourStatus(tour);
+  if(status === 'ended' || status === 'complete' || status === 'completed' || status === 'finished' || status === 'closedend') return true;
+  const title = columnTitleForStatus(status).trim();
+  return /團務結束|已結束|結束/.test(title);
+}
+function isBuyerStorePageTour(tour){
+  const status = buyerTourStatus(tour);
+  if(isEndedTour(tour)) return false;
+  // 前台賣場頁只看後台看板狀態。
+  // 只有拖到「現貨已有賣場」欄位，也就是 status=instock，才顯示在賣場頁。
+  // 停止收單 / 理貨中即使有賣貨便連結，仍留在開團商品頁。
+  return status === 'instock';
+}
+function shouldShowInShopTab(tour){
+  if(isEndedTour(tour)) return false;
+  return !isBuyerStorePageTour(tour);
+}
+function isBuyerClosedTour(tour){
+  const status = buyerTourStatus(tour);
+  return status !== 'instock' && status !== 'open';
+}
+function getBuyerLogiStep(tour){
+  const raw = tour && (tour.lStep ?? tour.logiStep ?? tour.logisticsStep ?? 0);
+  const n = Number(raw);
+  if(!Number.isFinite(n)) return 0;
+  return Math.max(0, Math.min(LOGI_STEPS.length - 1, Math.round(n)));
+}
+function renderBuyerLogiProgress(tour){
+  const lStep = getBuyerLogiStep(tour);
+  return `
+      <div class="logi-wrap">
+        <div class="logi-label">團務進度</div>
+        <div class="logi-steps">
+          ${LOGI_STEPS.map((name,i)=>`
+            <div class="logi-step ${i < lStep ? 'done' : ''} ${i === lStep ? 'active' : ''}">
+              <div class="logi-dot">${i+1}</div>
+              <div class="logi-name">${name}</div>
+            </div>`).join('')}
+        </div>
+      </div>`;
+}
+
+
+function getInstockCategory(tour){
+  if(isBuyerStorePageTour(tour) && buyerTourStatus(tour) !== 'instock') return 'group';
+  const raw = String(
+    tour?.storeCategory ||
+    tour?.instockCategory ||
+    tour?.marketCategory ||
+    tour?.marketType ||
+    tour?.storeType ||
+    tour?.orderType ||
+    ''
+  ).toLowerCase();
+  if(/group|service|order|團務|跟團|團購|下單/.test(raw)) return 'group';
+  if(/stock|instock|spot|現貨/.test(raw)) return 'stock';
+  // 目前後台還沒有獨立賣場類型欄位時：有設定所屬團體的現貨賣場，歸入「團務下單賣場」。
+  return String(tour?.group || '').trim() ? 'group' : 'stock';
+}
+function instockCategoryLabel(cat){
+  return cat === 'group' ? '團務下單賣場' : '現貨賣場';
+}
+function instockCategoryShortLabel(cat){
+  return cat === 'group' ? '團務下單' : '現貨';
+}
+function renderInstockCategories(tours){
+  _allInstockTours = tours || [];
+  const stockCount = _allInstockTours.filter(t=>getInstockCategory(t)==='stock').length;
+  const groupCount = _allInstockTours.filter(t=>getInstockCategory(t)==='group').length;
+  const tabs = document.getElementById('instockCategoryTabs');
+  if(tabs){
+    tabs.innerHTML = ['stock','group'].map(cat=>`
+      <button class="store-category-tab ${_activeInstockCategory===cat?'active':''}" onclick="setInstockCategory('${cat}')">
+        ${instockCategoryLabel(cat)} <span class="store-category-count">${cat==='stock'?stockCount:groupCount}</span>
+      </button>`).join('');
+  }
+  renderInstockFilteredList();
+}
+function setInstockCategory(cat){
+  _activeInstockCategory = cat;
+  renderInstockCategories(_allInstockTours);
+}
+function renderInstockFilteredList(){
+  const note = document.getElementById('instockCategoryNote');
+  if(note){
+    note.textContent = _activeInstockCategory === 'group'
+      ? '團務下單賣場：提供已跟團買家補款、下單或使用指定賣場連結。'
+      : '現貨賣場：非團購商品或一般現貨賣場。';
+  }
+  const filtered = _allInstockTours.filter(t=>getInstockCategory(t)===_activeInstockCategory);
+  renderFilteredList(filtered, 'instockList');
+}
+
+function renderFilteredList(tours, gridId){
+  const g = document.getElementById(gridId);
+  const isShop = gridId === 'shopList';
+  if(!tours.length){
+    const msg = isShop ? '目前沒有收單中的商品' : (_activeInstockCategory === 'group' ? '目前沒有團務下單賣場' : '目前沒有現貨賣場');
+    g.innerHTML = `<div class="empty"><div class="ico"></div>${msg}</div>`;
+    return;
+  }
+  g.innerHTML = '';
+  tours.forEach(tour=>{
+    const row = document.createElement('div');
+    row.className = 'camp-row';
+    const status = buyerTourStatus(tour);
+    const isStorePageItem = isBuyerStorePageTour(tour);
+    const isClosed = isBuyerClosedTour(tour) && !isStorePageItem;
+    row.onclick = ()=>{
+      if(isStorePageItem) openStoreLink(tour.id);
+      else openDetail(tour.id);
+    };
+    const thumb = tour.coverImages?.length
+      ? `<img class="camp-row-thumb" src="${esc(tour.coverImages[0])}" loading="lazy">`
+      : `<div class="camp-row-thumb-empty">·</div>`;
+    const instockCat = isStorePageItem ? getInstockCategory(tour) : '';
+    const tagHtml = isStorePageItem
+      ? `<span class="tag ${instockCat === 'group' ? 'tag-service' : 'tag-instock'}">${instockCategoryShortLabel(instockCat)}</span>`
+      : `<span class="tag tag-open">收單中</span>`;
+    const groupLabel = tour.group
+      ? `<span class="camp-group-label">${esc(tour.group)}</span>` : '';
+    const descHtml = tour.description
+      ? `<div class="camp-row-desc">${esc(tour.description)}</div>` : '';
+    // 買家前台只要不是「開團中 / open」，一律顯示已結單，不開放點進下單；團務進度仍讀取後台 lStep。
+    const logiHtml = isClosed ? renderBuyerLogiProgress(tour) : '';
+
+    if(isClosed){
+      row.classList.add('closed');
+      row.onclick = null;
+    }
+
+    row.innerHTML = `${thumb}
+      <div class="camp-row-body">
+        <div class="camp-row-name">${esc(tour.name)}</div>
+        <div class="camp-row-meta">${isClosed ? '<span class="tag tag-closed">已結單</span>' : tagHtml}${groupLabel}</div>
+        ${descHtml}
+        ${logiHtml}
+      </div>
+      ${isClosed ? '' : '<div class="camp-row-arrow">›</div>'}`;
+    g.appendChild(row);
+  });
+}
+
+// ── 詳情頁 ──
+function renderDetail(tour){
+  const wrap=document.getElementById('detailContent');
+  const c=CUR[tour.currency]||{s:'',l:tour.currency||''};
+  const isStorePageItem=isBuyerStorePageTour(tour);
+  const instockCat=isStorePageItem?getInstockCategory(tour):'';
+  const coverHtml=tour.coverImages?.length?`<img class="detail-cover" src="${esc(tour.coverImages[0])}" alt="${esc(tour.name)}">`:'';
+  const tagHtml=isStorePageItem?`<span class="tag ${instockCat === 'group' ? 'tag-service' : 'tag-instock'}">${instockCategoryLabel(instockCat)}</span>`:`<span class="tag tag-open">收單中</span>`;
+  const curTag='';
+  const linkHtml=tour.sellLink?`<a class="sell-link" href="${esc(tour.sellLink)}" target="_blank" rel="noopener"> 7-11 賣貨便 ↗</a>`:'';
+  const remitHtml=(!isStorePageItem&&tour.paymentInfo)?`<div class="remit">${esc(tour.paymentInfo)}</div>`:'';
+
+  let secHtml='';
+  if(!isStorePageItem&&tour.sections?.length){
+    secHtml=tour.sections.map(sec=>{
+      if(!sec.items?.length)return '';
+      const secTitle=sec.title||'';
+      const rows=sec.items.map(item=>{
+        const key=sec.id+'__'+item.id;
+        const qty=cart[tour.id]?.[key]||0;
+        const p=priceStr(item,tour.currency);
+        const displayName=secTitle?`${secTitle}・${item.name}`:item.name;
+        const thumb=item.image?`<img class="prod-thumb" src="${esc(item.image)}" loading="lazy">`:`<div class="prod-thumb-empty"></div>`;
+        return `<div class="prod-row">
+          ${thumb}
+          <div class="prod-info">
+            <div class="prod-name">${esc(displayName)}</div>
+            ${p?`<div class="prod-price">${esc(p)}</div>`:''}
+          </div>
+          <div class="qty-wrap">
+            <button class="qty-btn" onclick="chg('${esc(tour.id)}','${esc(key)}',-1)">−</button>
+            <span class="qty-num" id="q-${esc(tour.id)}-${esc(key)}">${qty}</span>
+            <button class="qty-btn" onclick="chg('${esc(tour.id)}','${esc(key)}',1)">＋</button>
+          </div>
+        </div>`;
+      }).join('');
+      return `<div class="sec-block">
+        ${sec.title?`<div class="sec-title">${esc(sec.title)}</div>`:''}
+        <div class="prod-list">${rows}</div>
+      </div>`;
+    }).join('');
+  }
+
+  wrap.innerHTML=`
+    ${coverHtml}
+    <div class="detail-name">${esc(tour.name)}</div>
+    <div class="detail-meta">${tagHtml}${curTag}</div>
+    <div class="detail-desc">${esc(tour.description||'')}</div>
+    ${linkHtml}
+    ${remitHtml}
+    ${secHtml}`;
+}
+
+// ── 購物車 ──
+function chg(tid,key,d){
+  if(activeId&&activeId!==tid&&d>0){toast('請先送出目前的訂單再選其他開團');return;}
+  if(!cart[tid])cart[tid]={};
+  const n=Math.max(0,(cart[tid][key]||0)+d);
+  if(n===0)delete cart[tid][key]; else cart[tid][key]=n;
+  if(!Object.keys(cart[tid]||{}).length)delete cart[tid];
+  activeId=Object.keys(cart)[0]||null;
+  const el=document.getElementById(`q-${tid}-${key}`);
+  if(el)el.textContent=n;
+  updateBar();
+}
+
+function cartInfo(tid){
+  const tour=(catalog?.appData?.tours||[]).find(t=>t.id===tid);
+  if(!tour)return{count:0,amount:0,origAmount:0,lines:[],tour:null};
+  let count=0,amount=0,origAmount=0,lines=[];
+  Object.entries(cart[tid]||{}).forEach(([key,qty])=>{
+    const[sid,iid]=key.split('__');
+    const sec=tour.sections?.find(s=>s.id===sid);
+    const item=sec?.items?.find(i=>i.id===iid);
+    if(!item||qty<=0)return;
+    count+=qty;
+    amount+=(item.twd||0)*qty;
+    origAmount+=(item.original||0)*qty;
+    const secT=sec.title?`【${sec.title}】 `:'';
+    lines.push(`${secT}${item.name} x${qty}`);
+  });
+  return{count,amount,origAmount,lines,tour};
+}
+
+function updateBar(){
+  const bar=document.getElementById('cartBar');
+  if(!activeId||!cart[activeId]){bar.classList.remove('show');return;}
+  const{count,amount}=cartInfo(activeId);
+  if(!count){bar.classList.remove('show');return;}
+  bar.classList.add('show');
+  document.getElementById('cartInfo').innerHTML=`<b>${count}</b> 件已選${amount?'・共 $'+amount+' TWD':''}`;
+}
+
+// ── 下單 Modal ──
+function openModal(){
+  if(!activeId)return;
+  const{count,amount,origAmount,lines,tour}=cartInfo(activeId);
+  if(!count){toast('請先選擇商品');return;}
+  // 匯款資訊
+  const remitBlock = tour.paymentInfo
+    ? `<div class="remit">${esc(tour.paymentInfo)}</div>` : '';
+  // 滿額卡排序
+  const members = (tour.cardMembers || []).filter(m=>!m.random);
+  const hasCard = members.length > 0;
+  const cardSortNote = tour.cardSortNote || '';
+  const threshold = Number(tour.threshold || 0);
+  // 自動計算張數：金額 ÷ 門檻，無條件捨去
+
+  window._noSort = false;
+  window._rankOrder = members.map((_,i)=>i);
+
+  const cur = (CUR[tour.currency]||{s:'',l:tour.currency||''});
+  // 無門檻 → 完全不顯示滿額卡
+  // 有門檻才計算張數
+  const cardCount = (threshold > 0 && origAmount >= threshold)
+    ? Math.floor(origAmount / threshold) : 0;
+
+  let cardBlock = '';
+  if(threshold > 0 && cardCount > 0){
+    if(members.length === 0){
+      // 有門檻、無成員 → 只顯示張數
+      cardBlock = `<div class="card-sort-block">
+        <div class="card-sort-title">滿額卡</div>
+        <div class="card-count-line">${cardCount} 張</div>
+        ${cardSortNote?`<div class="card-sort-note">${esc(cardSortNote)}</div>`:''}
+      </div>`;
+    } else {
+      // 有門檻、有成員 → 張數 + 拖曳排序 + 不排序選項
+      cardBlock = `<div class="card-sort-block">
+        <div class="card-sort-title">滿額卡</div>
+        <div class="card-count-line">${cardCount} 張</div>
+        ${cardSortNote?`<div class="card-sort-note">${esc(cardSortNote)}</div>`:''}
+        <div class="card-sort-label">拖曳調整您的成員順位：</div>
+        <div class="card-sort-members" id="cardSortMembers">
+          ${members.map((m,i)=>`
+            <div class="member-rank-row" draggable="true" data-idx="${i}" id="mr-${i}">
+              <span class="member-rank-num">#${i+1}</span>
+              <span class="member-rank-name">${esc(m.name)}</span>
+              <span class="member-rank-handle">≡</span>
+            </div>`).join('')}
+        </div>
+        <button type="button" class="no-sort-btn" id="noSortBtn" onclick="toggleNoSort()">隨機分配</button>
+      </div>`;
+    }
+  }
+  document.getElementById('modalBody').innerHTML=`
+    <div class="modal-head"><div class="modal-title">填寫訂單</div><button class="modal-x" onclick="closeModal()">✕</button></div>
+    <div class="order-lines">
+      <div style="font-weight:800;margin-bottom:6px">${esc(tour.name)}</div>
+      ${lines.map(l=>`<div style="color:var(--dim)">${esc(l)}</div>`).join('')}
+      ${amount?`<div class="order-total"><span>系統總計</span><b>$ ${amount} TWD</b></div>`:''}
+    </div>
+    ${remitBlock}
+    <div class="fld"><label class="lbl">社群帳號 *</label><input class="inp" id="fs" placeholder="@username"></div>
+    <div class="fld"><label class="lbl">個人主頁連結</label><input class="inp" id="fl" placeholder="https://... 選填"></div>
+    <div class="fld"><label class="lbl">手機號碼 *</label><input class="inp" id="fp" type="tel" placeholder="0912345678"></div>
+    <div class="fld"><label class="lbl">電子郵件</label><input class="inp" id="fe" type="email" placeholder="選填"></div>
+    <div class="fld"><label class="lbl">匯款後五碼 *</label><input class="inp" id="fb" type="text" inputmode="numeric" maxlength="5" placeholder="12345"></div>
+    <div class="fld"><label class="lbl">匯款金額 *</label><input class="inp" id="fm" type="text" inputmode="decimal" placeholder="實際匯款金額"></div>
+    ${cardBlock}
+    <div class="fld"><label class="lbl">備註</label><textarea class="txt" id="fr" placeholder="選填"></textarea></div>
+    <button class="sub-btn" id="subBtn" onclick="submitOrder()">確認送出</button>`;
+  document.getElementById('overlay').classList.add('show');
+  requestAnimationFrame(initDragSort);
+}
+
+function toggleNoSort(){
+  window._noSort = !window._noSort;
+  const btn = document.getElementById('noSortBtn');
+  const rows = document.querySelectorAll('.member-rank-row');
+  if(window._noSort){
+    btn.classList.add('active');
+    btn.textContent = '已選擇隨機分配';
+    rows.forEach(r=>{r.classList.add('dimmed');r.draggable=false;});
+  } else {
+    btn.classList.remove('active');
+    btn.textContent = '隨機分配';
+    rows.forEach(r=>{r.classList.remove('dimmed');r.draggable=true;});
+  }
+}
+function initDragSort(){
+  const wrap = document.getElementById('cardSortMembers');
+  if(!wrap){ window._rankOrder = []; return; }
+  window._rankOrder = [...wrap.querySelectorAll('.member-rank-row')].map(row=>+row.dataset.idx);
+  let dragIdx = null;
+  wrap.querySelectorAll('.member-rank-row').forEach(row=>{
+    row.addEventListener('dragstart', e=>{
+      if(window._noSort){e.preventDefault();return;}
+      dragIdx = +row.dataset.idx;
+      row.style.opacity='.4';
+    });
+    row.addEventListener('dragend', e=>{row.style.opacity='';});
+    row.addEventListener('dragover', e=>{e.preventDefault();row.classList.add('drag-over');});
+    row.addEventListener('dragleave', ()=>row.classList.remove('drag-over'));
+    row.addEventListener('drop', e=>{
+      e.preventDefault();row.classList.remove('drag-over');
+      if(window._noSort)return;
+      const toIdx = +row.dataset.idx;
+      if(dragIdx===null||dragIdx===toIdx)return;
+      const arr=window._rankOrder;
+      const from=arr.indexOf(dragIdx), to=arr.indexOf(toIdx);
+      arr.splice(from,1);arr.splice(to,0,dragIdx);
+      const rows=[...wrap.querySelectorAll('.member-rank-row')];
+      const sorted=arr.map(idx=>rows.find(r=>+r.dataset.idx===idx));
+      sorted.forEach((r,i)=>{r.querySelector('.member-rank-num').textContent='#'+(i+1);wrap.appendChild(r);});
+      dragIdx=null;
+    });
+  });
+}
+function closeModal(){window._rankOrder=[];window._noSort=false;document.getElementById('overlay').classList.remove('show');}
+
+async function submitOrder(){
+  const s=document.getElementById('fs')?.value.trim();
+  const sl=document.getElementById('fl')?.value.trim();
+  const p=document.getElementById('fp')?.value.trim();
+  const e=document.getElementById('fe')?.value.trim();
+  const fb=document.getElementById('fb')?.value.trim();
+  const fm=document.getElementById('fm')?.value.trim();
+  const r=document.getElementById('fr')?.value.trim();
+  if(!s){toast('請填寫社群帳號');return;}
+  if(!p){toast('請填寫手機號碼');return;}
+  if(!fb){toast('請填寫匯款後五碼');return;}
+  if(!fm){toast('請填寫匯款金額');return;}
+  const{amount,lines,tour}=cartInfo(activeId);
+  const btn=document.getElementById('subBtn');
+  btn.disabled=true;btn.textContent='送出中…';
+  try{
+    const members2=(tour?.cardMembers||[]).filter(m=>!m.random);
+    const rankOrder=window._rankOrder||[];
+    const origAmt2=Object.entries(cart[activeId]||{}).reduce((sum,[key,qty])=>{
+      const[sid,iid]=key.split('__');
+      const sec2=tour?.sections?.find(s=>s.id===sid);
+      const itm2=sec2?.items?.find(i=>i.id===iid);
+      return sum+(itm2?.original||0)*qty;
+    },0);
+    const threshold2=Number(tour?.threshold||0);
+    const cardCount2=threshold2>0?(Math.floor(origAmt2/threshold2)||0):0;
+    let cardSort='';
+    let cardSortMode='';
+    let priorityData='';
+    if(cardCount2>0){
+      if(window._noSort){
+        cardSortMode='隨機分配';
+        priorityData=`滿額卡 x${cardCount2} | 隨機分配`;
+      }else if(members2.length>0){
+        const safeOrder=(rankOrder&&rankOrder.length?rankOrder:members2.map((_,i)=>i));
+        const orderedNames=safeOrder.map(i=>members2[i]?.name||'').filter(Boolean);
+        cardSort=orderedNames.join(' > ');
+        cardSortMode='自選排序';
+        priorityData=`滿額卡 x${cardCount2} | 順位：${cardSort}`;
+      }else{
+        priorityData=`滿額卡 x${cardCount2}`;
+      }
+    }
+    const res=await apiPost('createNewOrder',{
+      campaignName:tour.name,
+      socialName:s,
+      socialLink:sl,
+      phone:p,
+      email:e,
+      orderDetails:lines.join('\n'),
+      totalAmount:amount,
+      originalAmount:origAmt2,
+      currency:tour.currency||'',
+      cardCount:cardCount2,
+      cardSort,
+      cardSortMode,
+      priorityData,
+      remitAmount:fm?Number(fm):0,
+      bank5:fb,
+      remark:r,
+      payStatus:'pending'
+    });
+    if(res?.ok){
+      delete cart[activeId];activeId=null;updateBar();
+      document.querySelectorAll('.qty-num').forEach(el=>el.textContent='0');
+      document.getElementById('modalBody').innerHTML=`
+        <div class="success">
+          <div class="ico"></div>
+          <h3>訂單已送出！</h3>
+          <p>訂單編號：${esc(res.orderId||'')}<br>請依照匯款說明完成付款，謝謝 </p>
+        </div>
+        <button class="sub-btn" onclick="closeModal()">關閉</button>`;
+    }else throw new Error(res?.error||'送出失敗');
+  }catch(err){toast(''+err.message);btn.disabled=false;btn.textContent='確認送出';}
+}
+
+// ── 查詢 ──
+function firstFilled(obj,keys){
+  for(const k of keys){
+    if(obj&&obj[k]!==undefined&&obj[k]!==null&&String(obj[k]).trim()!=='')return obj[k];
+  }
+  return '';
+}
+function cleanMoneyValue(v){
+  if(v===undefined||v===null||String(v).trim()==='')return '';
+  const raw=String(v).replace(/,/g,'').replace(/[^0-9.\-]/g,'');
+  if(!raw||raw==='-'||raw==='.')return '';
+  const n=Number(raw);
+  return Number.isFinite(n)?n:'';
+}
+function moneyTwd(v){
+  const n=cleanMoneyValue(v);
+  if(n==='')return '';
+  return `$ ${Math.round(n)} TWD`;
+}
+function orderCampaignName(o){return firstFilled(o,['campaignName','tourName','campaign','tour','開團名稱']);}
+function findTourForOrder(o){
+  const name=String(orderCampaignName(o)||'').trim();
+  return (catalog?.appData?.tours||[]).find(t=>String(t.name||'').trim()===name)||null;
+}
+function orderSecondInfo(o){
+  const weight=firstFilled(o,['weight','secondWeight','totalWeight','kg','重量','總重量']);
+  const intl=firstFilled(o,['intlShipping','internationalShipping','internationalFee','intlFee','shippingFee','freight','國際運費','國際運費分攤']);
+  const pack=firstFilled(o,['packagingFee','packFee','packageFee','packingFee','materialFee','包材費']);
+  let total=firstFilled(o,['secondPayment','secondTotal','secondPaymentTotal','secondTotalAmount','secondAmount','secondPayAmount','secondTotalFee','二補總計','二補金額']);
+  const status=firstFilled(o,['secondPayStatus','secondPaymentStatus','secondStatus','secondPaidStatus','二補收款狀態','收款狀態']);
+  if((total===''||total===null||total===undefined)&&(cleanMoneyValue(intl)!==''||cleanMoneyValue(pack)!=='')){
+    total=(Number(cleanMoneyValue(intl)||0)+Number(cleanMoneyValue(pack)||0));
+  }
+  const has=String(weight||'').trim()!==''||cleanMoneyValue(intl)!==''||cleanMoneyValue(pack)!==''||cleanMoneyValue(total)!==''||String(status||'').trim()!=='';
+  return {weight,intl,pack,total,status,has};
+}
+function renderOrderSecondInfo(o){
+  const info=orderSecondInfo(o);
+  if(cleanMoneyValue(info.total)==='')return '';
+  return `<div class="second-query-block"><div class="second-query-line"><b>二補總計：</b>${esc(moneyTwd(info.total))}</div></div>`;
+}
+function renderOrderSellLink(o,tour){
+  const info=orderSecondInfo(o);
+  const link=String(firstFilled(o,['sellLink','storeLink','marketLink','sevenLink','sevenElevenLink','賣貨便連結'])||tour?.sellLink||'').trim();
+  if(!link)return '';
+  const step=tour?getBuyerLogiStep(tour):0;
+  if(tour&&step<4&&!info.has)return '';
+  return `<a class="query-sell-link" href="${esc(link)}" target="_blank" rel="noopener">7-11 賣貨便連結 ↗</a>`;
+}
+
+async function runQuery(){
+  const q=document.getElementById('qInput').value.trim();
+  if(!q){toast('請輸入手機號碼或後五碼');return;}
+  const wrap=document.getElementById('qResult');
+  wrap.innerHTML=`<div class="loading"><div class="spin"></div>查詢中…</div>`;
+  try{
+    const clean=q.replace(/\D/g,'');
+    const res=await apiGet('queryOrders',{q:clean});
+    const matched=Array.isArray(res)?res:(res.orders||[]);
+    const visibleMatched=matched.filter(o=>{
+      const tour=findTourForOrder(o);
+      return !(tour&&isEndedTour(tour));
+    });
+    if(!visibleMatched.length){wrap.innerHTML=`<div class="no-res">找不到符合的訂單</div>`;return;}
+    wrap.innerHTML=visibleMatched.map(o=>{
+      const paid=String(o.payStatus||'').toLowerCase()==='paid'||o.payStatus==='已付款';
+      const tour=findTourForOrder(o);
+      const campaignName=orderCampaignName(o);
+      const socialName=firstFilled(o,['socialName','social','account','buyerName','社群帳號']);
+      const orderDetails=firstFilled(o,['orderDetails','details','items','購買明細','訂單明細']);
+      const totalAmount=firstFilled(o,['totalAmount','systemTotal','total','系統總計金額','商品金額']);
+      const logiHtml=tour&&isBuyerClosedTour(tour)?renderBuyerLogiProgress(tour):'';
+      const secondHtml=renderOrderSecondInfo(o);
+      const sellLinkHtml=renderOrderSellLink(o,tour);
+      return `<div class="o-card">
+        <div class="o-head"><div class="o-name">${esc(campaignName||'')}</div><span class="badge ${paid?'badge-paid':'badge-pend'}">${paid?'已付款':'待付款'}</span></div>
+        <div class="o-row"><b>帳號：</b>${esc(socialName||'')}</div>
+        <div class="o-row"><b>明細：</b>${esc(orderDetails||'')}</div>
+        ${totalAmount?`<div class="o-row"><b>金額：</b>$ ${esc(totalAmount)} TWD</div>`:''}
+        ${secondHtml}
+        ${sellLinkHtml}
+        ${logiHtml}
+        ${o.orderId?`<div class="o-row" style="color:var(--faint);font-size:12px;margin-top:8px">編號：${esc(o.orderId)}</div>`:''}
+      </div>`;
+    }).join('');
+  }catch(e){wrap.innerHTML=`<div class="no-res">查詢失敗，請重試</div>`;}
+}
+
+loadCatalog();
+</script>
+</body>
+</html>
