@@ -179,10 +179,10 @@ input,textarea,select{font-family:inherit;font-size:14px;color:var(--ink)}
 .preview .card-steps{margin:12px 0 18px;padding:2px 0 0}.preview .card-step{cursor:default;pointer-events:none}
 
 /* KANBAN photocards */
-.board{display:grid;grid-template-columns:repeat(5,1fr);gap:16px}
-@media(max-width:1100px){.board{grid-template-columns:repeat(2,1fr)}}
+.board{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px}
+@media(max-width:1100px){.board{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:620px){.board{grid-template-columns:1fr}}
-.col{background:var(--surface);border:2px solid var(--colc,var(--stroke));border-radius:var(--r);padding:0 12px 12px;min-height:160px;display:flex;flex-direction:column;box-shadow:4px 4px 0 var(--colc,var(--stroke));transition:.1s}
+.col{background:var(--surface);border:2px solid var(--colc,var(--stroke));border-radius:var(--r);padding:0 12px 12px;min-height:160px;min-width:0;display:flex;flex-direction:column;box-shadow:4px 4px 0 var(--colc,var(--stroke));transition:.1s}
 .col.dragover{transform:translate(-1px,-1px);box-shadow:6px 6px 0 var(--colc,var(--stroke))}
 .col-head{display:flex;align-items:center;gap:9px;margin:0 -12px 14px;padding:10px 13px;background:var(--colc,var(--surface-2));color:var(--conc,var(--ink));border-bottom:2px solid var(--stroke);border-radius:9px 9px 0 0}
 .col-dot{display:none}
@@ -254,7 +254,7 @@ input,textarea,select{font-family:inherit;font-size:14px;color:var(--ink)}
 .mini:hover{color:var(--ink);background:var(--surface-3)}
 .mini.del:hover{color:var(--danger)}
 .sm-row{display:flex;align-items:center;gap:9px;padding:9px 12px;background:var(--surface);border:2px solid var(--stroke);border-radius:var(--r-sm);margin-bottom:6px}
-.sm-row .num{font-family:var(--disp);font-weight:900;color:var(--c2);font-size:18px;line-height:1;min-width:54px}.sm-row .nm{flex:1;font-weight:800;font-size:18px;line-height:1}
+.sm-row .num{font-family:var(--disp);font-weight:900;color:var(--card-rank-c,var(--c2));font-size:18px;line-height:1;min-width:54px}.sm-row .nm{flex:1;font-weight:800;font-size:18px;line-height:1}
 .logi{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
 .lstep{padding:8px 13px;border-radius:7px;background:var(--surface);border:2px solid var(--stroke);font-size:12.5px;font-weight:800;color:var(--dim);transition:.1s}
 .lstep:hover{color:var(--ink)}
@@ -654,6 +654,12 @@ input[type=number]{
 .second-weight-empty{padding:28px 12px;text-align:center;color:var(--dim);font-weight:800}
 @media(max-width:760px){.second-stepbar,.second-weight-toolbar,.second-weight-apply{grid-template-columns:1fr}.second-step{border-right:0;border-bottom:2px solid var(--stroke)}.second-step:last-child{border-bottom:0}.second-weight-grid{grid-template-columns:32px 1fr 120px}.second-hero{align-items:stretch}.second-hero-copy h2{font-size:26px}.second-hero-controls{width:100%;min-width:0;margin-left:0}.second-outside-bar{align-items:stretch}.second-inline-tools{width:100%;justify-content:stretch;margin-left:0}.second-inline-tools .btn{flex:1;justify-content:center}.second-batch-tools{grid-template-columns:1fr}.second-batch-tools .btn{width:100%}}
 
+/* Board layout final fix: the board has 4 active columns, not 5. */
+#view-board .board{grid-template-columns:repeat(4,minmax(0,1fr));width:100%;max-width:100%;align-items:start}
+#view-board .col,#view-board .pc,#view-board .pc-body,#view-board .col-head,#view-board .col-title{min-width:0}
+@media(max-width:1100px){#view-board .board{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:620px){#view-board .board{grid-template-columns:1fr}}
+
 </style>
 </head>
 <body data-mode="light">
@@ -962,7 +968,7 @@ input[type=number]{
 <script>
 const LOCAL_PW='880818';
 // 正式部署時把 GAS Web App /exec URL 填在這裡，頁面會自動讀取，不必每次手動輸入。
-const ADMIN_API_URL='https://script.google.com/macros/s/AKfycbytW50peqYntAmsYtMkzC19gLIbHaoB2evMc1hq-rqLcx0Iy4VCTXPxk3FHhd9FSTkd/exec';
+const ADMIN_API_URL='https://script.google.com/macros/s/AKfycbz140zUZtPZ2J-Q0s9BTKaAzdKcDrHFFc9Beh_drRJ073wdy43Go17oQa1MEiENpNoN/exec';
 const CURRENCY_META={TWD:{code:'TWD',symbol:'$',label:'$ TWD'},JPY:{code:'JPY',symbol:'¥',label:'¥ JPY'},KRW:{code:'KRW',symbol:'₩',label:'₩ KRW'},CNY:{code:'CNY',symbol:'¥',label:'¥ CNY'},USD:{code:'USD',symbol:'$',label:'$ USD'}};
 const CURRENCIES=Object.keys(CURRENCY_META);
 const LOGI_STEPS=['已結單','已下單','在途中','清關中','理貨中','出貨中'];
@@ -1025,6 +1031,9 @@ function applyUiRoles(){
   // 物流進度
   const la=ur.logiActive||'c2';
   s.setProperty('--logi-active-c',`var(--${la})`);
+  // 滿額卡順位編號
+  const cr=ur.cardRankNum||'c2';
+  s.setProperty('--card-rank-c',`var(--${cr})`);
   // 團務下單標籤 + 付款徽章（買家前台元素，後台一併寫入變數）
   setPair('--tag-service',ur.tagService||'c3');
   setPair('--badge-paid', ur.badgePaid||'c1');
@@ -1084,6 +1093,9 @@ const UI_ROLE_GROUPS=[
   {g:'買家前台 · 品牌與進度',roles:[
     {k:'brand',     label:'店名顏色',   desc:'左上角店名文字顏色',def:'c1'},
     {k:'logiActive',label:'團務進度條', desc:'物流進度條已完成步驟的顏色',def:'c2'},
+  ]},
+  {g:'滿額卡排序',roles:[
+    {k:'cardRankNum',label:'順位編號顏色',desc:'後台排序成員清單的順位編號（#1、#2…）顏色',def:'c2'},
   ]},
 ];
 // 攤平給 apply / 預設使用
