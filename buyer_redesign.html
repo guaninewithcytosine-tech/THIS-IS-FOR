@@ -869,9 +869,9 @@ async function submitOrder(){
   const r=document.getElementById('fr')?.value.trim();
   if(!s){toast('請填寫社群帳號');return;}
   if(!p){toast('請填寫手機號碼');return;}
-  if(!fb){toast('請填寫匯款後五碼');return;}
+  if(!/^\d{5}$/.test(fb||'')){toast('匯款後五碼需為 5 位數字');return;}
   if(!fm){toast('請填寫匯款金額');return;}
-  const{amount,lines,tour}=cartInfo(activeId);
+  const{tour}=cartInfo(activeId);
   const btn=document.getElementById('subBtn');
   btn.disabled=true;btn.textContent='送出中…';
   try{
@@ -887,39 +887,34 @@ async function submitOrder(){
     const cardCount2=threshold2>0?(Math.floor(origAmt2/threshold2)||0):0;
     let cardSort='';
     let cardSortMode='';
-    let priorityData='';
     if(cardCount2>0){
       if(window._noSort){
         cardSortMode='隨機分配';
-        priorityData=`滿額卡 x${cardCount2} | 隨機分配`;
       }else if(members2.length>0){
         const safeOrder=(rankOrder&&rankOrder.length?rankOrder:members2.map((_,i)=>i));
         const orderedNames=safeOrder.map(i=>members2[i]?.name||'').filter(Boolean);
         cardSort=orderedNames.join(' > ');
         cardSortMode='自選排序';
-        priorityData=`滿額卡 x${cardCount2} | 順位：${cardSort}`;
-      }else{
-        priorityData=`滿額卡 x${cardCount2}`;
       }
     }
+    // 金額、明細與滿額卡張數由伺服器依商品目錄重新計算，這裡只送商品 id 與數量。
+    const items=Object.entries(cart[activeId]||{}).map(([key,qty])=>{
+      const[sectionId,itemId]=key.split('__');
+      return{sectionId,itemId,qty};
+    });
     const res=await apiPost('createNewOrder',{
+      tourId:tour.id,
       campaignName:tour.name,
+      items,
       socialName:s,
       socialLink:sl,
       phone:p,
       email:e,
-      orderDetails:lines.join('\n'),
-      totalAmount:amount,
-      originalAmount:origAmt2,
-      currency:tour.currency||'',
-      cardCount:cardCount2,
       cardSort,
       cardSortMode,
-      priorityData,
-      remitAmount:fm?Number(fm):0,
+      remitAmount:fm,
       bank5:fb,
-      remark:r,
-      payStatus:'pending'
+      remark:r
     });
     if(res?.ok){
       delete cart[activeId];activeId=null;updateBar();

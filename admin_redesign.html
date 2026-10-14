@@ -966,7 +966,6 @@ input[type=number]{
 <div id="toast"></div>
 
 <script>
-const LOCAL_PW='880818';
 // 正式部署時把 GAS Web App /exec URL 填在這裡，頁面會自動讀取，不必每次手動輸入。
 const ADMIN_API_URL='https://script.google.com/macros/s/AKfycbz140zUZtPZ2J-Q0s9BTKaAzdKcDrHFFc9Beh_drRJ073wdy43Go17oQa1MEiENpNoN/exec';
 const CURRENCY_META={TWD:{code:'TWD',symbol:'$',label:'$ TWD'},JPY:{code:'JPY',symbol:'¥',label:'¥ JPY'},KRW:{code:'KRW',symbol:'₩',label:'₩ KRW'},CNY:{code:'CNY',symbol:'¥',label:'¥ CNY'},USD:{code:'USD',symbol:'$',label:'$ USD'}};
@@ -1219,8 +1218,10 @@ function normalizeState(){
   state.boardColumns.brandName=normalizeBrandName(state.boardColumns.brandName||localStorage.getItem('twt-brand')||'TWT');
   state.appData.campaigns.forEach(c=>{c.id=c.id||('c'+Date.now()+Math.random().toString(36).slice(2,6));c.status=c.status==='closed'?'stopped':(c.status||'open');if(c.status==='ended'&&endKeyForMigratingEnded)c.status=endKeyForMigratingEnded;c.covers=Array.isArray(c.covers)?c.covers:[];c.sections=Array.isArray(c.sections)?c.sections:[];c.sortMembers=(Array.isArray(c.sortMembers)?c.sortMembers:[]).map((m,i)=>normalizeSortMember(m,i));c.sortRandom=!!(c.sortRandom||(c.sortMembers||[]).some(m=>m&&m.random));c.sortMembers.forEach(m=>m.random=false);c.currency=CURRENCY_META[c.currency]?c.currency:'JPY';c.lStep=Number.isFinite(Number(c.lStep))?Number(c.lStep):(c.status==='instock'?-1:0);c.storeCategory=c.status==='instock'?(c.storeCategory||c.instockCategory||c.marketCategory||(c.groupId?'group':'stock')):(c.storeCategory||'');c.sections.forEach(s=>{s.defaultPrice=Number(s.defaultPrice||0);s.defaultOrig=Number(s.defaultOrig||0);s.defaultWeight=Number(s.defaultWeight||0);s.products=Array.isArray(s.products)?s.products:[];s.products.forEach(p=>{p.price=Number(p.price||0);p.orig=Number(p.orig||0);p.weight=Number(p.weight||0);});});});
 }
-async function gasGet(a,params={}){const u=apiUrl();if(!u)throw new Error('no url');const url=new URL(u);if(a)url.searchParams.set('action',a);Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));url.searchParams.set('_t',Date.now());const r=await fetch(url.toString());const j=await r.json();if(j&&j.ok===false)throw new Error(j.error||'API failed');return j;}
-async function gasPost(a,p={}){const u=apiUrl();if(!u)throw new Error('no url');const r=await fetch(u,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:a,...p})});const j=await r.json();if(j&&j.ok===false)throw new Error(j.error||'API failed');return j;}
+function authToken(){return sessionStorage.getItem('twt-token')||'';}
+function checkAuth(j){if(j&&j.unauthorized){sessionStorage.removeItem('twt-token');document.getElementById('app').style.display='none';document.getElementById('login').style.display='flex';document.getElementById('loginMsg').textContent='登入已過期，請重新登入';throw new Error('登入已過期');}if(j&&j.ok===false)throw new Error(j.error||'API failed');return j;}
+async function gasGet(a,params={}){const u=apiUrl();if(!u)throw new Error('no url');const url=new URL(u);if(a)url.searchParams.set('action',a);Object.entries(params).forEach(([k,v])=>url.searchParams.set(k,v));if(a)url.searchParams.set('token',authToken());url.searchParams.set('_t',Date.now());const r=await fetch(url.toString());return checkAuth(await r.json());}
+async function gasPost(a,p={}){const u=apiUrl();if(!u)throw new Error('no url');const r=await fetch(u,{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:a,...p,token:authToken()})});return checkAuth(await r.json());}
 function adminToStandard(){normalizeState();const groupName=id=>{const g=state.boardColumns.groups.find(x=>x.id===id||x.name===id);return g?g.name:(id||'未分組')};
   return {appData:{tours:state.appData.campaigns.map(c=>{const _isEnd=c.status!=='instock'&&(isEndColumnTitle(state.boardColumns.titles[c.status]||'')||c.status==='ended');return {id:c.id,type:(c.status==='instock'&&!_isEnd)?'instock':'group',status:_isEnd?'ended':(c.status==='stopped'?'closed':c.status),storeCategory:_isEnd?'':(c.storeCategory||(c.status==='instock'?(c.groupId?'group':'stock'):'')),name:c.name||'未命名',group:groupName(c.groupId),coverImages:c.covers||[],description:c.desc||'',paymentInfo:c.remitDesc||'',currency:c.currency||'JPY',threshold:Number(c.threshold||0),sellLink:c.link||'',cardSortNote:c.sortDesc||'',cardMembers:(c.sortMembers||[]).map((m,i)=>{const mm=normalizeSortMember(m,i);return{id:mm.id,name:mm.name,random:!!mm.random};}),sections:(c.sections||[]).map(s=>({id:s.id,title:s.name||'未命名區塊',image:s.img||'',defaultTwd:Number(s.defaultPrice||0),defaultOriginal:Number(s.defaultOrig||0),defaultWeight:Number(s.defaultWeight||0),items:(s.products||[]).map(p=>({id:p.id,name:p.name||'',twd:Number(p.price||0),original:Number(p.orig||0),image:p.img||'',weight:Number(p.weight||0)}))})),lStep:Math.max(0,Number(c.lStep||0))};})},boardColumns:{columns:{open:state.boardColumns.titles.open||'開團中',closed:state.boardColumns.titles.stopped||'停止收單',sorting:state.boardColumns.titles.sorting||'團務結束',instock:state.boardColumns.titles.instock||'現貨已有賣場',ended:state.boardColumns.titles.ended||'團務結束'},groups:(state.boardColumns.groups||[]).map(g=>g.name||g),storeDescription:state.boardColumns.storeDescription||'',brandName:state.boardColumns.brandName||'TWT',tagColors:{open:(state.boardColumns.uiRoles||{}).tagOpen||'c1',closed:(state.boardColumns.uiRoles||{}).tagClosed||'c2',sorting:(state.boardColumns.uiRoles||{}).tagSorting||'c3',instock:(state.boardColumns.uiRoles||{}).tagInstock||'c4',ended:(state.boardColumns.uiRoles||{}).tagEnded||'c5'},uiRoles:state.boardColumns.uiRoles||{},theme:{preset:'merch-zine',palette:[theme.palette.c1,theme.palette.c2,theme.palette.c3,theme.palette.c4,theme.palette.c5],colors:{...theme.palette},mode:theme.mode}}};}
 function standardToAdmin(cat){const groups=(cat.boardColumns?.groups||[]).map((g,i)=>typeof g==='string'?{id:'g'+i,name:g}:g);const gid=name=>{let g=groups.find(x=>x.name===name||x.id===name);if(!g&&name){g={id:'g'+Date.now()+Math.random().toString(36).slice(2,5),name};groups.push(g);}return g?g.id:null;};
@@ -1246,10 +1247,14 @@ async function forceCreateSheets(){if(!apiUrl())return toast('請先設定 API �
   catch(e){setConn(false);toast('⚠️ 建表失敗：'+e.message);}}
 function setConn(ok){const c=document.getElementById('conn');c.className='conn'+(ok?' on':'');document.getElementById('connText').textContent=ok?'已連線':'未連線';}
 
-async function doLogin(){const pw=document.getElementById('pw').value,msg=document.getElementById('loginMsg');let ok=pw===LOCAL_PW;
-  if(!ok&&apiUrl()){try{const r=await gasGet('verifyPassword',{pwd:pw,password:pw});ok=r&&(r.ok||r.success);}catch(e){}}
-  if(ok){sessionStorage.setItem('twt-auth','1');document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';boot();}
-  else msg.textContent='密碼錯誤';}
+async function doLogin(){const pw=document.getElementById('pw').value,msg=document.getElementById('loginMsg');
+  if(!apiUrl()){msg.textContent='尚未設定 API 網址';return;}
+  msg.textContent='登入中…';
+  try{const r=await fetch(apiUrl(),{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({action:'login',password:pw})});const j=await r.json();
+    if(!j||!j.ok||!j.token){msg.textContent=(j&&j.error)||'密碼錯誤';return;}
+    sessionStorage.setItem('twt-token',j.token);document.getElementById('pw').value='';msg.textContent='';
+    document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';boot();}
+  catch(e){msg.textContent='無法連線，請稍後再試';}}
 
 document.querySelectorAll('.tab').forEach(n=>n.onclick=()=>showView(n.dataset.view));
 function showView(v){document.querySelectorAll('.tab').forEach(n=>n.classList.toggle('active',n.dataset.view===v));
@@ -1944,19 +1949,17 @@ function closeOverlay(){document.getElementById('overlay').classList.remove('sho
 function renderAll(){normalizeState();document.getElementById('storeDesc').value=state.boardColumns.storeDescription||'';document.getElementById('apiUrl').value=apiUrl();renderBrand();renderRoles();renderBoard();renderEras();renderReconOptions();renderSecondOptions();renderSecondWeightOptions();renderSecondWeightEditor();renderAllocOptions();renderUiRoles();}
 function boot(){loadLocal();const tRaw=localStorage.getItem('twt-theme');if(tRaw){try{theme=Object.assign(theme,JSON.parse(tRaw));}catch(e){}}
   if(state.boardColumns.theme)theme.palette={...theme.palette,...state.boardColumns.theme};applyTheme();renderAll();
-  const dz=document.getElementById('dropzone');
-  if(dz){
-    ['dragenter','dragover'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.add('drag');}));
-    ['dragleave','drop'].forEach(ev=>dz.addEventListener(ev,e=>{e.preventDefault();dz.classList.remove('drag');}));
-    dz.addEventListener('drop',e=>{e.preventDefault();const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];if(f)handleImage(f);});
+  // 重新登入時 boot() 會再跑一次，事件只註冊一次。dropzone 的拖放由 HTML 上的 ondrop 處理。
+  if(!window.__twtListeners){
+    window.__twtListeners=true;
+    window.addEventListener('dragover',e=>e.preventDefault());
+    window.addEventListener('drop',e=>{if(!e.target.closest||!e.target.closest('#dropzone'))e.preventDefault();setTimeout(cleanupSectionDrag,0);});
+    window.addEventListener('dragend',cleanupSectionDrag);
   }
-  window.addEventListener('dragover',e=>e.preventDefault());
-  window.addEventListener('drop',e=>{if(!e.target.closest||!e.target.closest('#dropzone'))e.preventDefault();setTimeout(cleanupSectionDrag,0);});
-  window.addEventListener('dragend',cleanupSectionDrag);
   if(apiUrl()){testConnection();loadCloud();loadOrders();}}
 window.addEventListener('load',()=>{const tRaw=localStorage.getItem('twt-theme');if(tRaw){try{theme=Object.assign(theme,JSON.parse(tRaw));}catch(e){}}applyTheme();
   const a=document.getElementById('apiUrl');if(a)a.value=apiUrl();
-  if(sessionStorage.getItem('twt-auth')==='1'){document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';boot();}});
+  if(authToken()){document.getElementById('login').style.display='none';document.getElementById('app').style.display='block';boot();}});
 </script>
 </body>
 </html>
