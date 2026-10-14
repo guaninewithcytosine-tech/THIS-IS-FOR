@@ -201,18 +201,17 @@ img{display:block}
 .card-sort-note{font-size:12.5px;color:var(--dim);line-height:1.65;margin-bottom:10px;white-space:pre-wrap}
 .card-sort-label{font-size:11px;font-weight:900;letter-spacing:.04em;text-transform:uppercase;color:var(--faint);margin-bottom:8px}
 .card-sort-members{display:flex;flex-direction:column;gap:6px}
-.member-rank-row{display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--surface);border:2px solid var(--stroke);border-radius:var(--r-sm);cursor:grab;user-select:none;transition:.12s;box-shadow:2px 2px 0 var(--hardc)}
-.member-rank-row:active{cursor:grabbing;opacity:.7}
-.member-rank-row.drag-over{border-color:var(--c1);box-shadow:2px 2px 0 var(--c1)}
+.member-rank-row{display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--surface);border:2px solid var(--stroke);border-radius:var(--r-sm);cursor:grab;user-select:none;-webkit-user-select:none;transition:box-shadow .12s,border-color .12s;box-shadow:2px 2px 0 var(--hardc)}
+.member-rank-row.dragging{cursor:grabbing;border-color:var(--c1);box-shadow:4px 4px 0 var(--c1);position:relative;z-index:1}
 .member-rank-row.dimmed{opacity:.35}
 .member-rank-num{font-family:var(--disp);font-weight:900;font-size:16px;color:var(--c1);min-width:22px}
 .member-rank-name{flex:1;font-weight:800;font-size:13.5px}
-.member-rank-handle{color:var(--faint);font-size:16px}
+.member-rank-handle{width:34px;height:34px;flex-shrink:0;display:flex;align-items:center;justify-content:center;border-radius:7px;color:var(--dim);font-size:20px;cursor:grab;touch-action:none;-webkit-touch-callout:none}
+.member-rank-row.dimmed .member-rank-handle{pointer-events:none}
 .rank-move{width:34px;height:34px;border-radius:7px;border:2px solid var(--stroke);background:var(--surface-2);font-size:12px;font-weight:900;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:.1s;line-height:1}
 .rank-move:hover{background:var(--surface-3)}
 .rank-move:disabled{opacity:.3;cursor:default}
 .member-rank-row.dimmed .rank-move{pointer-events:none}
-@media(hover:none){.member-rank-handle{display:none}}
 .card-count-line{font-family:var(--disp);font-size:17px;font-weight:900;color:var(--ink);margin-bottom:6px}
 .card-threshold-info{font-size:13px;color:var(--dim);margin-bottom:10px;padding:8px 12px;background:var(--surface);border:1.5px solid var(--stroke);border-radius:var(--r-sm)}
 .no-sort-btn{width:100%;margin-top:8px;padding:9px;border-radius:var(--r-sm);border:2px dashed var(--stroke);background:transparent;font-size:13px;font-weight:800;color:var(--dim);cursor:pointer;transition:.12s}
@@ -790,15 +789,15 @@ function openModal(){
         <div class="card-sort-title">滿額卡</div>
         <div class="card-count-line">${cardCount} 張</div>
         ${cardSortNote?`<div class="card-sort-note">${esc(cardSortNote)}</div>`:''}
-        <div class="card-sort-label">按 ▲▼ 或拖曳調整您的成員順位：</div>
+        <div class="card-sort-label">按住 ≡ 拖曳，或按 ▲▼ 調整您的成員順位：</div>
         <div class="card-sort-members" id="cardSortMembers">
           ${members.map((m,i)=>`
-            <div class="member-rank-row" draggable="true" data-idx="${i}" id="mr-${i}">
+            <div class="member-rank-row" data-idx="${i}" id="mr-${i}">
               <span class="member-rank-num">#${i+1}</span>
               <span class="member-rank-name">${esc(m.name)}</span>
               <button type="button" class="rank-move" data-dir="-1" onclick="moveRank(${i},-1)" aria-label="往上移">▲</button>
               <button type="button" class="rank-move" data-dir="1" onclick="moveRank(${i},1)" aria-label="往下移">▼</button>
-              <span class="member-rank-handle">≡</span>
+              <span class="member-rank-handle" aria-hidden="true">≡</span>
             </div>`).join('')}
         </div>
         <button type="button" class="no-sort-btn" id="noSortBtn" onclick="toggleNoSort()">隨機分配</button>
@@ -833,11 +832,11 @@ function toggleNoSort(){
   if(window._noSort){
     btn.classList.add('active');
     btn.textContent = '已選擇隨機分配';
-    rows.forEach(r=>{r.classList.add('dimmed');r.draggable=false;});
+    rows.forEach(r=>r.classList.add('dimmed'));
   } else {
     btn.classList.remove('active');
     btn.textContent = '隨機分配';
-    rows.forEach(r=>{r.classList.remove('dimmed');r.draggable=true;});
+    rows.forEach(r=>r.classList.remove('dimmed'));
   }
 }
 // 依 window._rankOrder 重新排列成員列、更新序號，並停用最上面的 ▲ 與最下面的 ▼。
@@ -853,7 +852,7 @@ function renderRankRows(){
     wrap.appendChild(r);
   });
 }
-// 手機無法拖曳，用 ▲▼ 按鈕移動一格。
+// ▲▼ 按鈕：移動一格。
 function moveRank(idx,delta){
   if(window._noSort)return;
   const arr=window._rankOrder||[];
@@ -862,33 +861,55 @@ function moveRank(idx,delta){
   [arr[from],arr[to]]=[arr[to],arr[from]];
   renderRankRows();
 }
+// 拖曳排序用 Pointer Events，手指和滑鼠都能用（瀏覽器內建的 draggable 拖放在手機上大多不支援）。
+// 觸控只能從 ≡ 開始拖（≡ 設了 touch-action:none，拖的時候頁面不會跟著捲動；其他地方照常可以滑動捲動）；
+// 滑鼠可以從整列任何位置拖，按鈕除外。
 function initDragSort(){
   const wrap = document.getElementById('cardSortMembers');
   if(!wrap){ window._rankOrder = []; return; }
   window._rankOrder = [...wrap.querySelectorAll('.member-rank-row')].map(row=>+row.dataset.idx);
   renderRankRows();
-  let dragIdx = null;
-  wrap.querySelectorAll('.member-rank-row').forEach(row=>{
-    row.addEventListener('dragstart', e=>{
-      if(window._noSort){e.preventDefault();return;}
-      dragIdx = +row.dataset.idx;
-      row.style.opacity='.4';
-    });
-    row.addEventListener('dragend', e=>{row.style.opacity='';});
-    row.addEventListener('dragover', e=>{e.preventDefault();row.classList.add('drag-over');});
-    row.addEventListener('dragleave', ()=>row.classList.remove('drag-over'));
-    row.addEventListener('drop', e=>{
-      e.preventDefault();row.classList.remove('drag-over');
-      if(window._noSort)return;
-      const toIdx = +row.dataset.idx;
-      if(dragIdx===null||dragIdx===toIdx)return;
-      const arr=window._rankOrder;
-      const from=arr.indexOf(dragIdx), to=arr.indexOf(toIdx);
-      arr.splice(from,1);arr.splice(to,0,dragIdx);
-      renderRankRows();
-      dragIdx=null;
-    });
+  let drag = null;
+  wrap.addEventListener('pointerdown', e=>{
+    if(window._noSort || drag || (e.pointerType==='mouse' && e.button!==0))return;
+    const row = e.target.closest('.member-rank-row');
+    if(!row || e.target.closest('button'))return;
+    if(e.pointerType!=='mouse' && !e.target.closest('.member-rank-handle'))return;
+    e.preventDefault();
+    drag = {row, idx:+row.dataset.idx, id:e.pointerId};
+    row.classList.add('dragging');
+    // 鎖定在不會被搬動的外層容器，列重新排序時才不會中斷拖曳
+    try{ wrap.setPointerCapture(e.pointerId); }catch(_){}
   });
+  wrap.addEventListener('pointermove', e=>{
+    if(!drag || e.pointerId!==drag.id)return;
+    e.preventDefault();
+    const y = e.clientY;
+    // 手指拖到清單可視範圍邊緣時，自動捲動訂單視窗
+    const modal = document.getElementById('modalBody');
+    if(modal){
+      const mr = modal.getBoundingClientRect();
+      if(y < mr.top + 48) modal.scrollTop -= 12;
+      else if(y > mr.bottom - 48) modal.scrollTop += 12;
+    }
+    // 目標位置 = 中線在手指上方的其他列數量
+    const others = [...wrap.querySelectorAll('.member-rank-row')].filter(r=>r!==drag.row);
+    let target = 0;
+    others.forEach(r=>{ const b=r.getBoundingClientRect(); if(y > b.top + b.height/2) target++; });
+    const arr = window._rankOrder;
+    const from = arr.indexOf(drag.idx);
+    if(from<0 || from===target)return;
+    arr.splice(from,1); arr.splice(target,0,drag.idx);
+    renderRankRows();
+  });
+  const end = e=>{
+    if(!drag || e.pointerId!==drag.id)return;
+    drag.row.classList.remove('dragging');
+    try{ wrap.releasePointerCapture(e.pointerId); }catch(_){}
+    drag = null;
+  };
+  wrap.addEventListener('pointerup', end);
+  wrap.addEventListener('pointercancel', end);
 }
 function closeModal(){window._rankOrder=[];window._noSort=false;document.getElementById('overlay').classList.remove('show');}
 
