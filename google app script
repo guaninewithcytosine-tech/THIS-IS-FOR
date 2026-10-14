@@ -1,0 +1,1919 @@
+// ══════════════════════════════════════════
+// TWT 代購平台 · Google Apps Script 後端（orderId + 自動建團表版）
+// 適配目前賣家後台：catalog、登入、訂單讀取、對帳、二補、圖片上傳/回收
+// saveCatalog 會自動為每個非現貨開團建立獨立 Google Sheet，並在主控表建立「開團表單索引」
+// ══════════════════════════════════════════
+ 
+var LOCAL_FALLBACK_PASSWORD = '880818';
+var SETTING_SHEET = '系統設定';
+var ORDER_SHEET = '訂單明細';
+var ITEM_SHEET = '品項統計';
+var SECOND_SHEET = '匯率與二補';
+var SECOND_TOTAL_HEADER = '二補總計(國際運費+包材)';
+var CAMPAIGN_INDEX_SHEET = '開團表單索引';
+var CAMPAIGN_FOLDER_KEY = '__CAMPAIGN_FOLDER__';
+ 
+var ORDER_HEADERS = [
+  '時間戳記','開團名稱','社群帳號','個人主頁連結','電子郵件','手機號碼','訂單明細',
+  '系統總計金額','買家匯款金額','匯款後五碼','原幣總金額','滿額卡張數','滿額卡排序',
+  '付款狀態','訂單編號','備註'
+];
+ 
+var SECOND_HEADERS = [
+  '社群帳號','手機號碼','購買明細','一補已付金額','商品重量(kg)',
+  '國際運費分攤','包材費',SECOND_TOTAL_HEADER,'二補收款狀態','訂單編號'
+];
+ 
+// ── 工具函式 ──
+function getHeaderMap(headers) {
+  var map = {};
+  headers.forEach(function(h, i) { if (h !== '' && h !== null && h !== undefined) map[String(h).trim()] = i; });
+  return map;
+}
+ 
+function getVal(row, hMap, col, fallback) {
+  var idx = hMap[col];
+  return idx !== undefined && row[idx] !== undefined && row[idx] !== null ? row[idx] : (fallback != null ? fallback : '');
+}
+ 
+function getRealLastRow(sheet) {
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return 1;
+  var lastCol = Math.max(1, sheet.getLastColumn());
+  var vals = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  for (var i = vals.length - 1; i >= 0; i--) {
+    if (vals[i].some(function(c) { return c !== '' && c !== null; })) return i + 1;
+  }
+  return 1;
+}
+ 
+function colToLetter(idx) {
+  var letter = '';
+  while (idx >= 0) {
+    letter = String.fromCharCode(65 + (idx % 26)) + letter;
+    idx = Math.floor(idx / 26) - 1;
+  }
+  return letter;
+}
+ 
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+ 
+function ensureColumns(sheet, headers, colNames) {
+  colNames.forEach(function(name) {
+    if (headers.indexOf(name) < 0) {
+      sheet.getRange(1, headers.length + 1).setValue(name).setFontWeight('bold').setBackground('#e5e7eb');
+      headers.push(name);
+    }
+  });
+  return headers;
+}
+ 
+function ensureHeaderRow(sheet, headers) {
+  if (sheet.getLastRow() < 1 || sheet.getLastColumn() < 1 || !sheet.getRange(1, 1).getValue()) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#e5e7eb');
+    return headers.slice();
+  }
+  var current = sheet.getRange(1, 1, 1, Math.max(1, sheet.getLastColumn())).getValues()[0];
+  return ensureColumns(sheet, current, headers);
+}
+ 
+function normalizeOrderSheetColumns(sheet) {
+  if (!sheet) return ORDER_HEADERS.slice();
+ 
+  var realLastRow = getRealLastRow(sheet);
+  var lastCol = Math.max(1, sheet.getLastColumn(), ORDER_HEADERS.length);
+ 
+  if (realLastRow <= 1 && !sheet.getRange(1, 1).getValue()) {
+    sheet.getRange(1, 1, 1, ORDER_HEADERS.length).setValues([ORDER_HEADERS]).setFontWeight('bold').setBackground('#e5e7eb');
+    applyOrderTextFormats(sheet, getHeaderMap(ORDER_HEADERS));
+    return ORDER_HEADERS.slice();
+  }
+ 
+  var values = sheet.getRange(1, 1, realLastRow, lastCol).getValues();
+  var oldHeaders = values[0].map(function(h) { return String(h || '').trim(); });
+  var oldMap = getHeaderMap(oldHeaders);
+  var mustReorder = oldHeaders.length !== ORDER_HEADERS.length || oldMap['滿額卡分配方式'] !== undefined;
+  if (!mustReorder) {
+    for (var hi = 0; hi < ORDER_HEADERS.length; hi++) {
+      if (oldHeaders[hi] !== ORDER_HEADERS[hi]) { mustReorder = true; break; }
+    }
+  }
+ 
+  if (!mustReorder) {
+    sheet.getRange(1, 1, 1, ORDER_HEADERS.length).setValues([ORDER_HEADERS]).setFontWeight('bold').setBackground('#e5e7eb');
+    applyOrderTextFormats(sheet, getHeaderMap(ORDER_HEADERS));
+    return ORDER_HEADERS.slice();
+  }
+ 
+  var out = [ORDER_HEADERS.slice()];
+  for (var r = 1; r < values.length; r++) {
+    var oldRow = values[r];
+    if (!oldRow.some(function(c) { return c !== '' && c !== null; })) continue;
+    var newRow = new Array(ORDER_HEADERS.length).fill('');
+ 
+    ORDER_HEADERS.forEach(function(header, idx) {
+      if (header === '滿額卡排序') {
+        var oldSort = getVal(oldRow, oldMap, '滿額卡排序');
+        var oldMode = getVal(oldRow, oldMap, '滿額卡分配方式');
+        newRow[idx] = normalizeCardSortForSheet(oldSort, oldMode, oldSort || oldMode);
+      } else if (header === '滿額卡張數') {
+        var oldCount = getVal(oldRow, oldMap, '滿額卡張數');
+        if (oldCount === '' || oldCount === null) oldCount = parseCardCount(getVal(oldRow, oldMap, '滿額卡排序'));
+        newRow[idx] = oldCount;
+      } else {
+        newRow[idx] = getVal(oldRow, oldMap, header);
+      }
+    });
+    out.push(newRow);
+  }
+ 
+  sheet.clearContents();
+  sheet.getRange(1, 1, out.length, ORDER_HEADERS.length).setValues(out);
+  sheet.getRange(1, 1, 1, ORDER_HEADERS.length).setFontWeight('bold').setBackground('#e5e7eb');
+  applyOrderTextFormats(sheet, getHeaderMap(ORDER_HEADERS));
+  return ORDER_HEADERS.slice();
+}
+ 
+function makeOrderId(ts) {
+  var base = (ts instanceof Date ? ts.getTime() : Date.now());
+  return 'O' + base.toString(36) + Math.random().toString(36).slice(2, 7);
+}
+ 
+function propKeyCampaign(name) {
+  return String(name || '').trim();
+}
+ 
+function isInternalPropKey(k) {
+  return String(k).indexOf('__') === 0;
+}
+ 
+function normalizeSecondStatus(s) {
+  s = String(s || '').trim();
+  if (!s || s === '未通知' || s === 'pending' || s === '未付款' || s === '未收款') return '未收款';
+  if (s === 'paid' || s === '已付款' || s === '已收款') return '已收款';
+  return s;
+}
+ 
+function parseCardCount(priorityData) {
+  var s = String(priorityData || '');
+  var m = s.match(/滿額(?:卡|禮)\s*[x×＊*]\s*(\d+)/i) || s.match(/(\d+)\s*張/);
+  return m ? Number(m[1]) : 0;
+}
+ 
+function isRandomCardSortText(value) {
+  return /隨機|random|不排序/i.test(String(value || ''));
+}
+ 
+function extractCardSortOnly(priorityData) {
+  var s = String(priorityData || '').trim();
+  if (!s) return '';
+  if (isRandomCardSortText(s)) return '隨機';
+  var m = s.match(/順位\s*[:：]\s*(.+)$/i);
+  if (m) return m[1].trim().replace(/\s*>\s*/g, ' > ');
+  s = s.replace(/滿額(?:卡|禮)\s*[x×＊*]\s*\d+/ig, '');
+  s = s.replace(/^\s*[|｜]\s*/, '').trim();
+  s = s.replace(/^順位\s*[:：]\s*/i, '').trim();
+  return s.replace(/\s*>\s*/g, ' > ');
+}
+ 
+function extractCardSortMode(priorityData) {
+  var s = String(priorityData || '').trim();
+  if (!s) return '';
+  if (isRandomCardSortText(s)) return '隨機分配';
+  if (/順位|>/.test(s)) return '自選排序';
+  return '';
+}
+ 
+function normalizeCardSortForSheet(cardSort, cardSortMode, priorityData) {
+  if (isRandomCardSortText(cardSort) || isRandomCardSortText(cardSortMode) || isRandomCardSortText(priorityData)) return '隨機';
+  return extractCardSortOnly(cardSort) || extractCardSortOnly(priorityData) || '';
+}
+ 
+function buildPriorityDataText(cardSort, cardSortMode, cardCount) {
+  cardCount = Number(cardCount || 0) || 0;
+  var parts = [];
+  if (cardCount > 0) parts.push('滿額卡 x' + cardCount);
+  var sort = normalizeCardSortForSheet(cardSort, cardSortMode, cardSort);
+  if (sort === '隨機') parts.push('隨機');
+  else if (sort) parts.push('順位：' + sort);
+  return parts.join(' | ');
+}
+ 
+// ── doGet ──
+function doGet(e) {
+  try {
+    var action = (e.parameter && e.parameter.action) || '';
+ 
+    if (action === 'verifyPassword') {
+      var pwd = e.parameter.pwd || e.parameter.password || '';
+      var ss = SpreadsheetApp.getActiveSpreadsheet();
+      var settingSheet = ss.getSheetByName(SETTING_SHEET);
+      var adminPwd = LOCAL_FALLBACK_PASSWORD;
+      if (settingSheet) {
+        var savedPwd = settingSheet.getRange('B1').getValue();
+        if (savedPwd) adminPwd = String(savedPwd);
+      }
+      var ok = String(pwd) === String(adminPwd);
+      return jsonResponse({ ok: ok, success: ok });
+    }
+ 
+    if (action === 'getAllOrders') {
+      var orders = getAllOrders();
+      return jsonResponse({ ok: true, orders: orders, secondPayments: buildSecondPaymentsFromOrders(orders) });
+    }
+ 
+    // 買家查詢專用：只回傳「符合手機末碼或匯款後五碼」的訂單，且僅含買家需要的欄位。
+    // 避免像 getAllOrders 那樣把所有買家的訂單（含手機、明細）全部送到查詢者的瀏覽器。
+    if (action === 'queryOrders') {
+      var q = String(e.parameter.q || '').replace(/\D/g, '');
+      var matched = [];
+      if (q) {
+        getAllOrders().forEach(function(o) {
+          var ph = String(o.phone || '').replace(/\D/g, '');
+          var b5 = String(o.bank5 || '').replace(/\D/g, '').slice(-5);
+          var hit = (q.length >= 6 && ph.slice(-q.length) === q) || (q.length === 5 && b5 === q);
+          if (hit) {
+            matched.push({
+              orderId: o.orderId,
+              campaignName: o.campaignName,
+              socialName: o.socialName,
+              phone: o.phone,
+              bank5: o.bank5,
+              orderDetails: o.orderDetails,
+              totalAmount: o.totalAmount,
+              payStatus: o.payStatus,
+              secondPayment: o.secondPayment,
+              secondPayStatus: o.secondPayStatus
+            });
+          }
+        });
+      }
+      return jsonResponse({ ok: true, orders: matched });
+    }
+ 
+    // 手動強制建立所有開團表單。可在瀏覽器開：API_URL?action=createCampaignSheets
+    if (action === 'createCampaignSheets') {
+      var catalogForCreate = readCatalogFromSettings();
+      var reportForCreate = ensureCampaignSheetsFromCatalog(catalogForCreate);
+      writeCampaignIndex(reportForCreate);
+      SpreadsheetApp.flush();
+      return jsonResponse({ ok: true, status: 'success', autoCreate: reportForCreate });
+    }
+ 
+    // 重新整理所有開團的品項統計。可在瀏覽器開：API_URL?action=rebuildItemSummaries
+    if (action === 'rebuildItemSummaries') {
+      var rebuildReport = rebuildAllItemSummaries();
+      SpreadsheetApp.flush();
+      return jsonResponse({ ok: true, status: 'success', report: rebuildReport });
+    }
+ 
+    // 補齊舊訂單的原幣總金額與滿額卡張數。可在瀏覽器開：API_URL?action=backfillOrderCardFields
+    if (action === 'backfillOrderCardFields') {
+      var cardReport = backfillOrderCardFields();
+      SpreadsheetApp.flush();
+      return jsonResponse({ ok: true, status: 'success', report: cardReport });
+    }
+ 
+    // 重新整理所有既有開團表的訂單欄位順序。可在瀏覽器開：API_URL?action=normalizeOrderSheets
+    if (action === 'normalizeOrderSheets') {
+      var normalizeReport = normalizeAllOrderSheets();
+      SpreadsheetApp.flush();
+      return jsonResponse({ ok: true, status: 'success', report: normalizeReport });
+    }
+ 
+    // 除錯用。可在瀏覽器開：API_URL?action=debugCatalog
+    if (action === 'debugCatalog') {
+      return jsonResponse(debugCatalogAutoCreate());
+    }
+ 
+ 
+    // ── 全面診斷：API_URL?action=diagnose ──
+    // 一鍵回傳所有可能出錯的資訊，方便直接在瀏覽器確認問題點。
+    if (action === 'diagnose') {
+      var diag = { ok: true, steps: [] };
+      // Step 1: 確認 GAS 是 bound script（不是 standalone）
+      try {
+        var mainDiagSS = SpreadsheetApp.getActiveSpreadsheet();
+        diag.steps.push({ step: '1_bound_script', ok: true, value: mainDiagSS.getName() + ' (' + mainDiagSS.getId() + ')' });
+      } catch (e) {
+        diag.steps.push({ step: '1_bound_script', ok: false, error: '⛔ 這是 standalone GAS！請從 Google Sheet 的「擴充功能 → Apps Script」進入，不能用獨立 Apps Script。錯誤：' + e.message });
+        diag.ok = false;
+        return jsonResponse(diag);
+      }
+      // Step 2: 讀取 A1 設定，確認 tours 資料存在
+      try {
+        var diagSetting = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SETTING_SHEET);
+        if (!diagSetting) {
+          diag.steps.push({ step: '2_setting_sheet', ok: false, error: '⛔ 找不到「' + SETTING_SHEET + '」工作表。請先在後台按「☁️ 儲存」。' });
+          diag.ok = false;
+        } else {
+          var diagRaw = diagSetting.getRange('A1').getValue();
+          if (!diagRaw) {
+            diag.steps.push({ step: '2_setting_sheet', ok: false, error: '⛔ 系統設定 A1 是空白。請先在後台按「☁️ 儲存」，再開此網址。' });
+            diag.ok = false;
+          } else {
+            var diagCatalog = JSON.parse(diagRaw);
+            var diagTours = (diagCatalog && diagCatalog.appData && diagCatalog.appData.tours) || [];
+            diag.steps.push({ step: '2_setting_sheet', ok: true, tourCount: diagTours.length, tours: diagTours.map(function(t) { return { name: t.name, status: t.status, type: t.type, shouldCreate: shouldCreateSheetForTour(t) }; }) });
+            if (diagTours.length === 0) {
+              diag.steps.push({ step: '2_tours_empty', ok: false, error: '⛔ tours 陣列是空的。後台可能沒有任何開團，或儲存格式錯誤。' });
+              diag.ok = false;
+            }
+          }
+        }
+      } catch (e) {
+        diag.steps.push({ step: '2_setting_sheet', ok: false, error: e.message });
+        diag.ok = false;
+      }
+      // Step 3: 確認 DriveApp 有權限（嘗試建立測試資料夾）
+      try {
+        var testFolder = DriveApp.getRootFolder();
+        diag.steps.push({ step: '3_drive_permission', ok: true, value: 'Drive 根目錄可存取：' + testFolder.getName() });
+      } catch (e) {
+        diag.steps.push({ step: '3_drive_permission', ok: false, error: '⛔ 沒有 Drive 權限：' + e.message + '。請重新部署並在授權對話框勾選所有權限。' });
+        diag.ok = false;
+      }
+      // Step 4: 確認 ScriptProperties 可讀寫
+      try {
+        var diagProps = PropertiesService.getScriptProperties();
+        diagProps.setProperty('__diag_test__', 'ok');
+        var testRead = diagProps.getProperty('__diag_test__');
+        diagProps.deleteProperty('__diag_test__');
+        diag.steps.push({ step: '4_script_props', ok: testRead === 'ok', value: testRead });
+      } catch (e) {
+        diag.steps.push({ step: '4_script_props', ok: false, error: '⛔ ScriptProperties 無法讀寫：' + e.message });
+        diag.ok = false;
+      }
+      // Step 5: 列出目前已記錄的開團表單 ID
+      try {
+        var allP = PropertiesService.getScriptProperties().getProperties();
+        var campEntries = [];
+        Object.keys(allP).forEach(function(k) { if (!isInternalPropKey(k)) campEntries.push({ name: k, id: allP[k] }); });
+        diag.steps.push({ step: '5_stored_campaign_ids', ok: true, count: campEntries.length, campaigns: campEntries });
+      } catch (e) {
+        diag.steps.push({ step: '5_stored_campaign_ids', ok: false, error: e.message });
+      }
+      return jsonResponse(diag);
+    }
+ 
+
+    // 清空測試資料工具。預設只做 dry run，不會刪除。
+    // 預覽：API_URL?action=clearTestData
+    // 正式清空：API_URL?action=clearTestData&confirm=DELETE_TEST_DATA
+    // 如也要清空圖片資料夾：&includeImages=1
+    if (action === 'clearTestData') {
+      var cleanupDryRun = String(e.parameter.confirm || '') !== 'DELETE_TEST_DATA';
+      var cleanupIncludeImages = String(e.parameter.includeImages || '') === '1' || String(e.parameter.includeImages || '').toLowerCase() === 'true';
+      var cleanupReport = clearTestData({ dryRun: cleanupDryRun, includeImages: cleanupIncludeImages });
+      SpreadsheetApp.flush();
+      return jsonResponse(cleanupReport);
+    }
+
+    // 指定單一團務永久刪除工具。預設 dry run，不會刪除。
+    // 預覽：API_URL?action=deleteCampaignCompletely&campaignName=TWICE
+    // 正式刪除：API_URL?action=deleteCampaignCompletely&campaignName=TWICE&confirm=DELETE_CAMPAIGN
+    // 如也要清該團 Drive 圖片：&includeImages=1
+    if (action === 'deleteCampaignCompletely') {
+      var deleteDryRun = String(e.parameter.confirm || '') !== 'DELETE_CAMPAIGN';
+      var deleteIncludeImages = String(e.parameter.includeImages || '') === '1' || String(e.parameter.includeImages || '').toLowerCase() === 'true';
+      var deleteReport = deleteCampaignCompletely({
+        campaignName: e.parameter.campaignName || e.parameter.tourName || e.parameter.name || '',
+        dryRun: deleteDryRun,
+        includeImages: deleteIncludeImages
+      });
+      SpreadsheetApp.flush();
+      return jsonResponse(deleteReport);
+    }
+
+    // 列出所有開團 Google Sheet：Script Properties 裡所有「團名 → Spreadsheet ID」對應。
+    // 可在後台「設定 → Google Sheet 表單清理」使用。
+    if (action === 'listCampaignSpreadsheets') {
+      return jsonResponse(listCampaignSpreadsheets({ includeActive: true }));
+    }
+
+    // 舊版相容：只列殘留表單，或加 includeActive=1 時列全部。
+    if (action === 'listResidualCampaignSpreadsheets') {
+      var includeActiveResidualList = String(e.parameter.includeActive || '') === '1' || String(e.parameter.includeActive || '').toLowerCase() === 'true';
+      return jsonResponse(listCampaignSpreadsheets({ includeActive: includeActiveResidualList }));
+    }
+
+    // 手動補齊所有開團表的二補公式，不影響 saveCatalog 速度。
+    if (action === 'upgradeFormulas') {
+      upgradeArrayFormulas();
+      SpreadsheetApp.flush();
+      return jsonResponse({ ok: true, status: 'success', message: '所有開團表公式已補齊' });
+    }
+ 
+    var mainSS = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = mainSS.getSheetByName(SETTING_SHEET);
+    var catalogData = { appData: { tours: [] }, boardColumns: { columns: { open: '開團中', closed: '停止收單', sorting: '理貨中', instock: '現貨已有賣場' }, groups: [], storeDescription: '' } };
+    if (sheet) {
+      var saved = sheet.getRange('A1').getValue();
+      if (saved) {
+        try { catalogData = JSON.parse(saved); } catch (ignore) {}
+      }
+    }
+    return jsonResponse(catalogData);
+  } catch (err) {
+    return jsonResponse({ ok: false, error: err && err.stack ? err.stack : String(err) });
+  }
+}
+ 
+// ── doPost ──
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  lock.tryLock(15000);
+  try {
+    var data = JSON.parse(e.postData.contents || '{}');
+    switch (data.action || '') {
+      case 'updatePayStatus':
+        updatePayStatus(data.campaignName || data.tourName, data.orderId, data.status || data.payStatus, data.bank5 || data.last5);
+        return jsonResponse({ ok: true, status: 'success' });
+      case 'batchUpdatePayStatus':
+        (data.updates || []).forEach(function(u) {
+          updatePayStatus(u.campaignName || u.tourName, u.orderId, u.status || u.payStatus || 'paid', u.bank5 || u.last5);
+        });
+        return jsonResponse({ ok: true, status: 'success', count: (data.updates || []).length });
+      case 'batchUpdateSecondPayment':
+        (data.updates || []).forEach(function(u) {
+          updateSecondPaymentLogic(u.campaignName || u.tourName, u.orderId, u.weight, u.intlShipping, u.packageFee != null ? u.packageFee : u.packagingFee, u.bank5 || u.last5, u.secondPayStatus);
+        });
+        SpreadsheetApp.flush();
+        return jsonResponse({ ok: true, status: 'success', count: (data.updates || []).length });
+      case 'uploadImage':
+        return uploadImage(data);
+      case 'trashImages':
+        return trashImages(data);
+      case 'clearTestData':
+        return jsonResponse(clearTestData({
+          dryRun: String(data.confirm || '') !== 'DELETE_TEST_DATA',
+          includeImages: data.includeImages === true || data.includeImages === 1 || String(data.includeImages || '').toLowerCase() === 'true'
+        }));
+      case 'deleteCampaignCompletely':
+        return jsonResponse(deleteCampaignCompletely({
+          campaignName: data.campaignName || data.tourName || data.name || '',
+          dryRun: String(data.confirm || '') !== 'DELETE_CAMPAIGN',
+          includeImages: data.includeImages === true || data.includeImages === 1 || String(data.includeImages || '').toLowerCase() === 'true'
+        }));
+      case 'listCampaignSpreadsheets':
+        return jsonResponse(listCampaignSpreadsheets({ includeActive: true }));
+      case 'listResidualCampaignSpreadsheets':
+        return jsonResponse(listCampaignSpreadsheets({
+          includeActive: data.includeActive === true || data.includeActive === 1 || String(data.includeActive || '').toLowerCase() === 'true'
+        }));
+      case 'saveCatalog':
+        return saveCatalog(data);
+      case 'createNewOrder':
+        return createNewOrder(data);
+      default:
+        if (data.campaignName) return createNewOrder(data);
+        return jsonResponse({ ok: false, error: 'unknown action: ' + (data.action || '') });
+    }
+  } catch (error) {
+    return jsonResponse({ ok: false, error: error && error.stack ? error.stack : String(error) });
+  } finally {
+    try { lock.releaseLock(); } catch (ignore) {}
+  }
+}
+ 
+
+
+// ── 開團 Google Sheet 表單掃描 ──
+// 列出 Script Properties 裡所有「團名 → Spreadsheet ID」對應。
+// inCatalog = 目前 catalog 的 appData.tours 仍有該團；residual = 後台一般刪除後殘留的表單。
+function listCampaignSpreadsheets(options) {
+  options = options || {};
+  var includeActive = options.includeActive === true;
+  var props = PropertiesService.getScriptProperties().getProperties();
+  var activeNames = {};
+  var catalogInfo = { found: false, tourCount: 0, parseError: '' };
+
+  try {
+    var catalog = readCatalogFromSettings();
+    catalogInfo.found = true;
+    var tours = getCatalogTours(catalog);
+    catalogInfo.tourCount = tours.length;
+    tours.forEach(function(t) {
+      var name = getCatalogTourName(t);
+      if (name) activeNames[propKeyCampaign(name)] = true;
+    });
+  } catch (e) {
+    catalogInfo.parseError = e.message;
+  }
+
+  var items = [];
+  Object.keys(props).forEach(function(k) {
+    if (isInternalPropKey(k)) return;
+    var id = props[k];
+    var inCatalog = !!activeNames[propKeyCampaign(k)];
+    if (!includeActive && inCatalog) return;
+
+    var item = {
+      name: k,
+      id: id,
+      url: '',
+      fileName: '',
+      inCatalog: inCatalog,
+      residual: !inCatalog,
+      wouldTrash: !inCatalog,
+      error: ''
+    };
+    try {
+      var file = DriveApp.getFileById(id);
+      item.fileName = file.getName();
+      item.url = file.getUrl();
+    } catch (e2) {
+      item.error = '表單不存在或無法存取：' + e2.message;
+    }
+    items.push(item);
+  });
+
+  items.sort(function(a, b) {
+    if (a.residual !== b.residual) return a.residual ? -1 : 1;
+    return String(a.name || '').localeCompare(String(b.name || ''), 'zh-Hant');
+  });
+
+  return {
+    ok: true,
+    includeActive: includeActive,
+    catalog: catalogInfo,
+    count: items.length,
+    residualCount: items.filter(function(x) { return x.residual; }).length,
+    activeCount: items.filter(function(x) { return !x.residual; }).length,
+    items: items,
+    message: items.length ? '已列出開團 Google Sheet 表單。' : '目前沒有開團 Google Sheet 表單。'
+  };
+}
+
+// 舊版函式名稱相容。
+function listResidualCampaignSpreadsheets(options) {
+  return listCampaignSpreadsheets(options);
+}
+
+// ── 清空測試資料工具 ──
+// 安全設計：
+// 1. 沒有 confirm=DELETE_TEST_DATA 時，只會 dry run，不會真的刪除。
+// 2. 只清「開團資料」與「開團試算表」，保留系統設定 sheet、B1 密碼、店名、主題、賣場說明。
+// 3. DriveApp 只能移到垃圾桶，確認無誤後請到 Google Drive 垃圾桶手動永久刪除。
+function clearTestData(options) {
+  options = options || {};
+  var dryRun = options.dryRun !== false;
+  var includeImages = options.includeImages === true;
+  var ss = getMainSpreadsheetOrThrow();
+  var props = PropertiesService.getScriptProperties();
+  var allProps = props.getProperties();
+  var report = {
+    ok: true,
+    dryRun: dryRun,
+    includeImages: includeImages,
+    message: dryRun ? 'DRY RUN：尚未刪除任何資料。正式清空請加 confirm=DELETE_TEST_DATA。' : '已清空測試資料。',
+    catalog: { found: false, tourCountBefore: 0, cleared: false, parseError: '' },
+    campaignSpreadsheets: { count: 0, items: [], trashed: 0, propertyDeleted: 0, errors: [] },
+    campaignIndex: { cleared: false },
+    images: { attempted: false, folderId: '', trashed: 0, errors: [] },
+    nextSteps: [
+      '後台重新整理後按「從雲端載入」或直接重開頁面。',
+      '買家前台重新整理。若仍看到舊資料，清除瀏覽器 localStorage 的 twt-data 類快取。',
+      '確認無誤後，到 Google Drive 垃圾桶永久刪除舊測試開團試算表。'
+    ]
+  };
+
+  // 1) 清 catalog 裡的 tours / campaigns，但保留 boardColumns、店名、主題、說明、groups 等設定。
+  var settingSheet = ss.getSheetByName(SETTING_SHEET);
+  if (settingSheet) {
+    var raw = settingSheet.getRange('A1').getValue();
+    var catalog = null;
+    if (raw) {
+      report.catalog.found = true;
+      try {
+        catalog = JSON.parse(raw);
+      } catch (e) {
+        report.catalog.parseError = e.message;
+        catalog = { appData: { tours: [] }, boardColumns: {} };
+      }
+    } else {
+      catalog = { appData: { tours: [] }, boardColumns: {} };
+    }
+    if (!catalog.appData) catalog.appData = {};
+    report.catalog.tourCountBefore = getCatalogTours(catalog).length;
+    catalog.appData.tours = [];
+    // 相容舊版或本機格式，避免前端讀到 campaigns 殘留。
+    if (Array.isArray(catalog.appData.campaigns)) catalog.appData.campaigns = [];
+    if (!dryRun) {
+      settingSheet.getRange('A1').setValue(JSON.stringify(catalog));
+      report.catalog.cleared = true;
+    }
+  }
+
+  // 2) 移除所有開團 spreadsheet，並刪掉 ScriptProperties 的團名→Spreadsheet ID 對應。
+  Object.keys(allProps).forEach(function(k) {
+    if (isInternalPropKey(k)) return;
+    var id = allProps[k];
+    var item = { name: k, id: id, url: '', fileName: '', wouldTrash: true, trashed: false, propertyDeleted: false, error: '' };
+    report.campaignSpreadsheets.count++;
+    try {
+      var file = DriveApp.getFileById(id);
+      item.fileName = file.getName();
+      item.url = file.getUrl();
+      if (!dryRun) {
+        file.setTrashed(true);
+        item.trashed = true;
+        report.campaignSpreadsheets.trashed++;
+      }
+    } catch (e) {
+      item.error = '開團試算表不存在或無法存取：' + e.message;
+      report.campaignSpreadsheets.errors.push({ name: k, id: id, error: item.error });
+    }
+    try {
+      if (!dryRun) {
+        props.deleteProperty(k);
+        item.propertyDeleted = true;
+        report.campaignSpreadsheets.propertyDeleted++;
+      }
+    } catch (e2) {
+      report.campaignSpreadsheets.errors.push({ name: k, id: id, error: '刪除 ScriptProperties 失敗：' + e2.message });
+    }
+    report.campaignSpreadsheets.items.push(item);
+  });
+
+  // 3) 清主控表的開團表單索引，不留下測試團列。
+  var indexSheet = ss.getSheetByName(CAMPAIGN_INDEX_SHEET);
+  if (!dryRun) {
+    if (!indexSheet) indexSheet = ss.insertSheet(CAMPAIGN_INDEX_SHEET);
+    resetCampaignIndexSheet(indexSheet);
+    report.campaignIndex.cleared = true;
+  }
+
+  // 4) 可選：清空圖片資料夾。預設不做，避免誤刪正式封面圖。
+  if (includeImages) {
+    report.images.attempted = true;
+    var imageFolderId = allProps['__IMAGE_FOLDER__'] || '';
+    report.images.folderId = imageFolderId;
+    if (imageFolderId) {
+      try {
+        var folder = DriveApp.getFolderById(imageFolderId);
+        var files = folder.getFiles();
+        while (files.hasNext()) {
+          var f = files.next();
+          if (!dryRun) {
+            try { f.setTrashed(true); report.images.trashed++; }
+            catch (ie) { report.images.errors.push({ id: f.getId(), name: f.getName(), error: ie.message }); }
+          } else {
+            report.images.trashed++;
+          }
+        }
+        if (dryRun) report.images.note = 'dryRun 下 images.trashed 代表將會移到垃圾桶的圖片數量。';
+      } catch (e3) {
+        report.images.errors.push({ error: e3.message });
+      }
+    }
+  }
+
+  return report;
+}
+
+function resetCampaignIndexSheet(sheet) {
+  var headers = ['更新時間','狀態','開團名稱','Spreadsheet ID','連結','備註'];
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#e5e7eb');
+  sheet.autoResizeColumns(1, headers.length);
+}
+
+// ── 指定單一團務永久刪除工具 ──
+// 安全設計：
+// 1. 沒有 confirm=DELETE_CAMPAIGN 時，只做 dry run。
+// 2. 只刪指定團，不會刪 boardColumns.groups、店名、主題、賣場說明。
+// 3. Google Sheet 和圖片只會移到 Drive 垃圾桶，不會永久刪除。
+function deleteCampaignCompletely(options) {
+  options = options || {};
+  var dryRun = options.dryRun !== false;
+  var includeImages = options.includeImages === true;
+  var campaignName = String(options.campaignName || '').trim();
+  var ss = getMainSpreadsheetOrThrow();
+  var props = PropertiesService.getScriptProperties();
+  var report = {
+    ok: true,
+    dryRun: dryRun,
+    includeImages: includeImages,
+    campaignName: campaignName,
+    message: dryRun ? 'DRY RUN：尚未刪除任何資料。正式刪除請加 confirm=DELETE_CAMPAIGN。' : '已永久刪除指定團務。',
+    catalog: { found: false, removedTours: 0, tourCountBefore: 0, tourCountAfter: 0, parseError: '' },
+    campaignSpreadsheet: { propertyFound: false, id: '', url: '', fileName: '', wouldTrash: false, trashed: false, propertyDeleted: false, error: '' },
+    campaignIndex: { removedRows: 0 },
+    images: { attempted: includeImages, ids: [], wouldTrash: 0, trashed: 0, errors: [] },
+    nextSteps: [
+      '後台重新整理後按「從雲端載入」或直接重開頁面。',
+      '買家前台重新整理。若仍看到舊資料，清除瀏覽器 localStorage 的 twt-data 類快取。',
+      '確認無誤後，到 Google Drive 垃圾桶永久刪除該團 Google Sheet 與圖片。'
+    ]
+  };
+
+  if (!campaignName) {
+    report.ok = false;
+    report.message = '缺少 campaignName。';
+    return report;
+  }
+
+  // 1) 從 catalog 移除指定團，保留 groups / storeDescription / theme / uiRoles。
+  var settingSheet = ss.getSheetByName(SETTING_SHEET);
+  var removedTours = [];
+  if (settingSheet) {
+    var raw = settingSheet.getRange('A1').getValue();
+    var catalog = null;
+    if (raw) {
+      report.catalog.found = true;
+      try {
+        catalog = JSON.parse(raw);
+      } catch (e) {
+        report.catalog.parseError = e.message;
+        catalog = { appData: { tours: [] }, boardColumns: {} };
+      }
+    } else {
+      catalog = { appData: { tours: [] }, boardColumns: {} };
+    }
+    if (!catalog.appData) catalog.appData = {};
+    var tours = getCatalogTours(catalog).slice();
+    report.catalog.tourCountBefore = tours.length;
+    var keptTours = [];
+    tours.forEach(function(t) {
+      if (String(getCatalogTourName(t) || '').trim() === campaignName) removedTours.push(t);
+      else keptTours.push(t);
+    });
+    report.catalog.removedTours = removedTours.length;
+    report.catalog.tourCountAfter = keptTours.length;
+    if (includeImages) report.images.ids = collectTourImageIds(removedTours);
+    if (!dryRun) {
+      catalog.appData.tours = keptTours;
+      if (Array.isArray(catalog.appData.campaigns)) {
+        catalog.appData.campaigns = catalog.appData.campaigns.filter(function(c) {
+          return String((c && (c.name || c.title || c.campaignName)) || '').trim() !== campaignName;
+        });
+      }
+      settingSheet.getRange('A1').setValue(JSON.stringify(catalog));
+    }
+  }
+
+  // 2) 該團 Google Sheet 移到垃圾桶，並刪 Script Properties 團名對應。
+  var propKey = propKeyCampaign(campaignName);
+  var ssId = props.getProperty(propKey);
+  if (ssId) {
+    report.campaignSpreadsheet.propertyFound = true;
+    report.campaignSpreadsheet.id = ssId;
+    report.campaignSpreadsheet.wouldTrash = true;
+    try {
+      var file = DriveApp.getFileById(ssId);
+      report.campaignSpreadsheet.fileName = file.getName();
+      report.campaignSpreadsheet.url = file.getUrl();
+      if (!dryRun) {
+        file.setTrashed(true);
+        report.campaignSpreadsheet.trashed = true;
+      }
+    } catch (e2) {
+      report.campaignSpreadsheet.error = '開團試算表不存在或無法存取：' + e2.message;
+    }
+    try {
+      if (!dryRun) {
+        props.deleteProperty(propKey);
+        report.campaignSpreadsheet.propertyDeleted = true;
+      }
+    } catch (e3) {
+      report.campaignSpreadsheet.error = report.campaignSpreadsheet.error ? (report.campaignSpreadsheet.error + '；刪除 ScriptProperties 失敗：' + e3.message) : ('刪除 ScriptProperties 失敗：' + e3.message);
+    }
+  }
+
+  // 3) 從開團表單索引移除該團列。
+  if (!dryRun) {
+    report.campaignIndex.removedRows = removeCampaignFromIndex(campaignName);
+  } else {
+    report.campaignIndex.removedRows = countCampaignIndexRows(campaignName);
+  }
+
+  // 4) 可選：回收該團圖片。
+  if (includeImages) {
+    report.images.ids.forEach(function(id) {
+      try {
+        if (!dryRun) {
+          DriveApp.getFileById(id).setTrashed(true);
+          report.images.trashed++;
+        } else {
+          report.images.wouldTrash++;
+        }
+      } catch (ie) {
+        report.images.errors.push({ id: id, error: ie.message });
+      }
+    });
+  }
+
+  return report;
+}
+
+function collectTourImageIds(tours) {
+  var ids = [];
+  var seen = {};
+  function pushUrl(u) {
+    var id = extractDriveId(u);
+    if (id && !seen[id]) { seen[id] = true; ids.push(id); }
+  }
+  (tours || []).forEach(function(t) {
+    (t.coverImages || t.covers || []).forEach(pushUrl);
+    (t.sections || []).forEach(function(sec) {
+      pushUrl(sec.image || sec.img || '');
+      (sec.items || sec.products || []).forEach(function(item) {
+        pushUrl((item && (item.image || item.img)) || '');
+      });
+    });
+  });
+  return ids;
+}
+
+function countCampaignIndexRows(campaignName) {
+  var ss = getMainSpreadsheetOrThrow();
+  var sheet = ss.getSheetByName(CAMPAIGN_INDEX_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+  var rows = sheet.getDataRange().getValues();
+  var hMap = getHeaderMap(rows[0]);
+  var nameCol = hMap['開團名稱'] !== undefined ? hMap['開團名稱'] : 2;
+  var count = 0;
+  for (var i = 1; i < rows.length; i++) {
+    if (String(rows[i][nameCol] || '').trim() === campaignName) count++;
+  }
+  return count;
+}
+
+function removeCampaignFromIndex(campaignName) {
+  var ss = getMainSpreadsheetOrThrow();
+  var sheet = ss.getSheetByName(CAMPAIGN_INDEX_SHEET);
+  if (!sheet || sheet.getLastRow() < 2) return 0;
+  var rows = sheet.getDataRange().getValues();
+  var hMap = getHeaderMap(rows[0]);
+  var nameCol = hMap['開團名稱'] !== undefined ? hMap['開團名稱'] : 2;
+  var removed = 0;
+  for (var r = rows.length - 1; r >= 1; r--) {
+    if (String(rows[r][nameCol] || '').trim() === campaignName) {
+      sheet.deleteRow(r + 1);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+// ── saveCatalog ──
+function saveCatalog(data) {
+  var ss = getMainSpreadsheetOrThrow();
+  var settingSheet = ss.getSheetByName(SETTING_SHEET);
+  if (!settingSheet) settingSheet = ss.insertSheet(SETTING_SHEET);
+ 
+  var catalog = { appData: data.appData || {}, boardColumns: data.boardColumns || {} };
+
+  // 在覆寫 A1 前先讀「上一版 catalog」，比對相同 id 但團名不同的團，
+  // 自動把舊的 Google Sheet 更名（檔名＋訂單明細「開團名稱」欄＋Script Properties 鍵），而不是新建表。
+  var renameReport = reconcileCampaignRenames(readCatalogRawFromSheet(settingSheet), catalog);
+ 
+  // 診斷：確認收到的 tours 數量，若為 0 直接回傳警告（設定仍會寫入）
+  var receivedTours = getCatalogTours(catalog);
+  if (receivedTours.length === 0) {
+    settingSheet.getRange('A1').setValue(JSON.stringify(catalog));
+    SpreadsheetApp.flush();
+    return jsonResponse({
+      ok: true,
+      status: 'success',
+      warning: 'tours_empty',
+      message: '⚠️ 收到的開團列表是空的（tours.length === 0），沒有任何 Sheet 需要建立。請確認後台有開團資料再儲存。',
+      createdSheets: [],
+      existingSheets: [],
+      skippedSheets: [],
+      renamedSheets: renameReport,
+      autoCreate: { tourCount: 0, created: [], existing: [], skipped: [], errors: [] }
+    });
+  }
+ 
+  settingSheet.getRange('A1').setValue(JSON.stringify(catalog));
+ 
+  // 現貨賣場 instock 不建訂單表
+  var report = ensureCampaignSheetsFromCatalog(catalog);
+  writeCampaignIndex(report);
+ 
+  SpreadsheetApp.flush();
+  return jsonResponse({
+    ok: true,
+    status: 'success',
+    tourCount: receivedTours.length,
+    createdSheets: report.created.map(function(x) { return x.name; }),
+    existingSheets: report.existing.map(function(x) { return x.name; }),
+    skippedSheets: report.skipped.map(function(x) { return x.name; }),
+    renamedSheets: renameReport,
+    autoCreate: report
+  });
+}
+ 
+function readCatalogRawFromSheet(settingSheet) {
+  try {
+    if (!settingSheet) return null;
+    var raw = settingSheet.getRange('A1').getValue();
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+// 比對「上一版」與「這次」catalog，找出相同 id 但團名改變的團，
+// 把對應的 Google Sheet 更名、搬移 Script Properties 鍵、更新訂單明細的「開團名稱」欄。
+// 沒有舊資料或沒有改名時回傳空陣列（一般儲存幾乎是 no-op，不影響速度）。
+function reconcileCampaignRenames(oldCatalog, newCatalog) {
+  var report = [];
+  if (!oldCatalog) return report;
+  var props = PropertiesService.getScriptProperties();
+
+  var oldNameById = {};
+  getCatalogTours(oldCatalog).forEach(function(t) {
+    if (t && t.id) oldNameById[String(t.id)] = getCatalogTourName(t);
+  });
+
+  getCatalogTours(newCatalog).forEach(function(t) {
+    if (!t || !t.id) return;
+    var id = String(t.id);
+    var newName = getCatalogTourName(t);
+    var oldName = oldNameById[id];
+    if (!oldName || !newName || oldName === newName) return;
+
+    var oldKey = propKeyCampaign(oldName);
+    var newKey = propKeyCampaign(newName);
+    var ssId = props.getProperty(oldKey);
+
+    // 舊團名沒有對應表單（例如現貨團或從未建表）→ 沒東西可搬，交給後面 ensureCampaignSheets 處理。
+    if (!ssId) return;
+
+    // 防呆：若新團名已對應另一張不同的表單，不覆寫以免搞丟資料，改記錄衝突。
+    var existingNewId = props.getProperty(newKey);
+    if (existingNewId && existingNewId !== ssId) {
+      report.push({ id: id, from: oldName, to: newName, ok: false, error: '新團名已對應另一張表單，未更名以免衝突。' });
+      return;
+    }
+
+    var item = { id: id, from: oldName, to: newName, ok: true, error: '' };
+    try {
+      // 1) 搬移 Script Properties 鍵：新團名 → 同一個 spreadsheet id。
+      props.setProperty(newKey, ssId);
+      if (oldKey !== newKey) props.deleteProperty(oldKey);
+
+      // 2) 更名 Google Sheet 檔案本身。
+      var campSs = SpreadsheetApp.openById(ssId);
+      campSs.rename(newName);
+
+      // 3) 更新訂單明細「開團名稱」欄，讓後台對帳與買家查詢的歸戶一致。
+      var orderSheet = campSs.getSheetByName(ORDER_SHEET);
+      if (orderSheet) {
+        var lastRow = getRealLastRow(orderSheet);
+        if (lastRow > 1) {
+          var headers = orderSheet.getRange(1, 1, 1, Math.max(1, orderSheet.getLastColumn())).getValues()[0];
+          var nameCol = getHeaderMap(headers)['開團名稱'];
+          if (nameCol !== undefined) {
+            var col = [];
+            for (var r = 2; r <= lastRow; r++) col.push([newName]);
+            orderSheet.getRange(2, nameCol + 1, col.length, 1).setValues(col);
+          }
+        }
+      }
+    } catch (e) {
+      item.ok = false;
+      item.error = (e && e.message) ? e.message : String(e);
+    }
+    report.push(item);
+  });
+
+  return report;
+}
+
+function getMainSpreadsheetOrThrow() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) {
+    throw new Error('找不到主控試算表。請從 Google Sheet 的「擴充功能 → Apps Script」建立此 GAS，不要使用 standalone Apps Script。');
+  }
+  return ss;
+}
+ 
+function readCatalogFromSettings() {
+  var ss = getMainSpreadsheetOrThrow();
+  var settingSheet = ss.getSheetByName(SETTING_SHEET);
+  if (!settingSheet) return { appData: { tours: [] }, boardColumns: {} };
+  var saved = settingSheet.getRange('A1').getValue();
+  if (!saved) return { appData: { tours: [] }, boardColumns: {} };
+  try {
+    return JSON.parse(saved);
+  } catch (e) {
+    throw new Error('系統設定 A1 的 catalog JSON 解析失敗：' + e.message);
+  }
+}
+ 
+function ensureCampaignSheetsFromCatalog(catalog) {
+  var tours = getCatalogTours(catalog);
+  var report = {
+    tourCount: tours.length,
+    created: [],
+    existing: [],
+    skipped: [],
+    errors: [],
+    folderUrl: ''
+  };
+ 
+  try {
+    report.folderUrl = getCampaignFolder().getUrl();
+  } catch (e) {
+    report.errors.push({ name: '__folder__', error: '建立或讀取開團資料夾失敗：' + e.message });
+  }
+ 
+  tours.forEach(function(tour) {
+    var name = getCatalogTourName(tour);
+    var status = String((tour && tour.status) || '').toLowerCase();
+    var type = String((tour && tour.type) || '').toLowerCase();
+ 
+    if (!name) {
+      report.skipped.push({ name: '(未命名)', status: status, type: type, reason: 'missing name' });
+      return;
+    }
+    if (!shouldCreateSheetForTour(tour)) {
+      report.skipped.push({ name: name, status: status, type: type, reason: 'instock / market' });
+      return;
+    }
+ 
+    try {
+      var ss = ensureCampaignSpreadsheet(name);
+      setupCampaignSpreadsheet(ss, tour, name);
+      var item = { name: name, id: ss.getId(), url: ss.getUrl(), status: status, type: type };
+      if (ss.__twtCreatedNow) report.created.push(item);
+      else report.existing.push(item);
+    } catch (e) {
+      report.errors.push({ name: name, status: status, type: type, error: e && e.stack ? e.stack : String(e) });
+    }
+  });
+ 
+  return report;
+}
+ 
+// BUG FIX: 移除 campaigns 相容路徑（死碼）。
+// 前台 adminToStandard() 固定送出 appData.tours 格式，campaigns 路徑永遠不會被走到。
+function getCatalogTours(catalog) {
+  if (!catalog || !catalog.appData) return [];
+  if (Array.isArray(catalog.appData.tours)) return catalog.appData.tours;
+  return [];
+}
+ 
+function shouldCreateSheetForTour(tour) {
+  if (!tour) return false;
+  var status = String(tour.status || '').toLowerCase();
+  var type = String(tour.type || '').toLowerCase();
+  if (status === 'instock' || type === 'instock' || type === 'market' || type === 'store') return false;
+  return true;
+}
+ 
+function getCatalogTourName(tour) {
+  return String((tour && (tour.name || tour.title || tour.campaignName)) || '').trim();
+}
+ 
+function ensureCampaignSpreadsheet(campaignName) {
+  var props = PropertiesService.getScriptProperties();
+  var key = propKeyCampaign(campaignName);
+  var ssId = props.getProperty(key);
+  var ss;
+ 
+  if (ssId) {
+    try {
+      ss = SpreadsheetApp.openById(ssId);
+      ss.__twtCreatedNow = false;
+      tryMoveCampaignSpreadsheetToFolder(ss.getId());
+      return ss;
+    } catch (ignore) {
+      // 如果 property 裡的 ID 失效，下面會重新建立。
+    }
+  }
+ 
+  ss = SpreadsheetApp.create(campaignName);
+  ss.__twtCreatedNow = true;
+  props.setProperty(key, ss.getId());
+  tryMoveCampaignSpreadsheetToFolder(ss.getId());
+  return ss;
+}
+ 
+function getCampaignFolder() {
+  var props = PropertiesService.getScriptProperties();
+  var saved = props.getProperty(CAMPAIGN_FOLDER_KEY);
+  if (saved) {
+    try { return DriveApp.getFolderById(saved); } catch (ignore) {}
+  }
+  var folder = DriveApp.createFolder('TWT_開團表單');
+  props.setProperty(CAMPAIGN_FOLDER_KEY, folder.getId());
+  return folder;
+}
+ 
+function tryMoveCampaignSpreadsheetToFolder(fileId) {
+  try {
+    var folder = getCampaignFolder();
+    var file = DriveApp.getFileById(fileId);
+    file.moveTo(folder);
+  } catch (ignore) {
+    // 不讓移動資料夾失敗阻斷建表。沒有 Drive 權限時至少仍會在 Drive 根目錄建立檔案。
+  }
+}
+ 
+function setupCampaignSpreadsheet(ss, tour, campaignName) {
+  var orderSheet = ss.getSheetByName(ORDER_SHEET);
+  if (!orderSheet) orderSheet = ss.insertSheet(ORDER_SHEET, 0);
+  var orderHeaders = normalizeOrderSheetColumns(orderSheet);
+  applyOrderTextFormats(orderSheet, getHeaderMap(orderHeaders));
+ 
+  var itemSheet = ss.getSheetByName(ITEM_SHEET);
+  if (!itemSheet) itemSheet = ss.insertSheet(ITEM_SHEET);
+  ensureItemSummaryHeader(itemSheet);
+  seedOrRefreshItemSummary(itemSheet, tour);
+  var existingOrderSheet = ss.getSheetByName(ORDER_SHEET);
+  if (existingOrderSheet && existingOrderSheet.getLastRow() > 1) {
+    updateItemSummary(ss, {}, campaignName);
+  }
+ 
+  var secondSheet = ss.getSheetByName(SECOND_SHEET);
+  if (!secondSheet) secondSheet = ss.insertSheet(SECOND_SHEET);
+  var secondHeaders = ensureSecondHeaders(secondSheet);
+  applySecondTextFormats(secondSheet, getHeaderMap(secondHeaders));
+  ensureSecPayFormula(secondSheet, getHeaderMap(secondHeaders));
+ 
+  // SpreadsheetApp.create 預設會有一張空白「工作表 1」。如果仍然是空白，就清掉。
+  removeDefaultBlankSheet(ss);
+}
+ 
+function seedOrRefreshItemSummary(sheet, tour) {
+  var catalogNames = getCatalogItemRows(tour || {});
+  if (!catalogNames.length) return;
+ 
+  var existing = {};
+  var data = sheet.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][0]) existing[String(data[i][0])] = Number(data[i][1] || 0);
+  }
+ 
+  var out = [];
+  var used = {};
+  catalogNames.forEach(function(name) {
+    out.push([name, existing[name] != null ? existing[name] : 0]);
+    used[name] = true;
+  });
+  Object.keys(existing).forEach(function(name) {
+    if (!used[name]) out.push([name, existing[name]]);
+  });
+ 
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, 2).clearContent();
+  if (out.length) sheet.getRange(2, 1, out.length, 2).setValues(out);
+}
+ 
+// BUG FIX: 刪除原本在此處的兩個 seedItemSummaryIfEmpty 定義。
+// 第一個（shim）和第二個（舊實作）都已無人呼叫，且後者邏輯有誤（只補空表）。
+// setupCampaignSpreadsheet 已直接呼叫 seedOrRefreshItemSummary。
+ 
+function writeCampaignIndex(report) {
+  var ss = getMainSpreadsheetOrThrow();
+  var sheet = ss.getSheetByName(CAMPAIGN_INDEX_SHEET);
+  if (!sheet) sheet = ss.insertSheet(CAMPAIGN_INDEX_SHEET);
+ 
+  var headers = ['更新時間','狀態','開團名稱','Spreadsheet ID','連結','備註'];
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#e5e7eb');
+ 
+  var now = new Date();
+  var rows = [];
+  (report.created || []).forEach(function(x) {
+    rows.push([now, '新建', x.name, x.id, x.url, '已建立獨立 Google Sheet']);
+  });
+  (report.existing || []).forEach(function(x) {
+    rows.push([now, '已存在', x.name, x.id, x.url, '已確認欄位與公式']);
+  });
+  (report.skipped || []).forEach(function(x) {
+    rows.push([now, '略過', x.name, '', '', x.reason || '']);
+  });
+  (report.errors || []).forEach(function(x) {
+    rows.push([now, '錯誤', x.name, '', '', x.error || '']);
+  });
+ 
+  if (rows.length) sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+  sheet.autoResizeColumns(1, headers.length);
+}
+ 
+function debugCatalogAutoCreate() {
+  var catalog;
+  try {
+    catalog = readCatalogFromSettings();
+  } catch (e) {
+    return { ok: false, error: e.message };
+  }
+  var tours = getCatalogTours(catalog);
+  var props = PropertiesService.getScriptProperties().getProperties();
+  var campaignProps = [];
+  Object.keys(props).forEach(function(k) {
+    if (!isInternalPropKey(k)) campaignProps.push({ name: k, id: props[k] });
+  });
+  return {
+    ok: true,
+    activeSpreadsheetName: getMainSpreadsheetOrThrow().getName(),
+    tourCount: tours.length,
+    tours: tours.map(function(t) { return { name: getCatalogTourName(t), status: t.status || '', type: t.type || '', shouldCreate: shouldCreateSheetForTour(t) }; }),
+    campaignProps: campaignProps,
+    hint: '如果 tourCount 是 0，代表後台尚未把開團資料存進系統設定 A1。請在後台按「☁️ 儲存」。如果 shouldCreate 是 true 但沒有表，請開 ?action=createCampaignSheets。'
+  };
+}
+ 
+// 手動補齊所有舊開團表的二補公式（從 saveCatalog 中移出，避免 timeout）
+// 觸發方式：瀏覽器開 API_URL?action=upgradeFormulas
+function upgradeArrayFormulas() {
+  var allProps = PropertiesService.getScriptProperties().getProperties();
+  for (var campName in allProps) {
+    if (isInternalPropKey(campName)) continue;
+    try {
+      var ssCamp = SpreadsheetApp.openById(allProps[campName]);
+      var secSheet = ssCamp.getSheetByName(SECOND_SHEET);
+      if (!secSheet) continue;
+      var headers = ensureSecondHeaders(secSheet);
+      ensureSecPayFormula(secSheet, getHeaderMap(headers));
+    } catch (ignore) {}
+  }
+}
+ 
+function applyOrderTextFormats(sheet, hMap) {
+  if (hMap['時間戳記'] !== undefined) {
+    sheet.getRange(1, hMap['時間戳記'] + 1, sheet.getMaxRows(), 1).setNumberFormat('yyyy/MM/dd HH:mm');
+  }
+  ['開團名稱','社群帳號','個人主頁連結','電子郵件','手機號碼','訂單明細','匯款後五碼','備註','滿額卡排序','付款狀態','訂單編號'].forEach(function(col) {
+    if (hMap[col] !== undefined) sheet.getRange(1, hMap[col] + 1, sheet.getMaxRows(), 1).setNumberFormat('@');
+  });
+}
+ 
+function applySecondTextFormats(sheet, hMap) {
+  ['社群帳號','手機號碼','購買明細','二補收款狀態','訂單編號'].forEach(function(col) {
+    if (hMap[col] !== undefined) sheet.getRange(1, hMap[col] + 1, sheet.getMaxRows(), 1).setNumberFormat('@');
+  });
+}
+ 
+function ensureItemSummaryHeader(sheet) {
+  if (sheet.getLastRow() < 1 || sheet.getLastColumn() < 1 || !sheet.getRange(1, 1).getValue()) {
+    sheet.getRange('A1:B1').setValues([['商品名稱', '目前總下單數量']]).setFontWeight('bold').setBackground('#fef08a');
+    return;
+  }
+  var headers = sheet.getRange(1, 1, 1, Math.max(2, sheet.getLastColumn())).getValues()[0];
+  if (!headers[0]) sheet.getRange(1, 1).setValue('商品名稱').setFontWeight('bold').setBackground('#fef08a');
+  if (!headers[1]) sheet.getRange(1, 2).setValue('目前總下單數量').setFontWeight('bold').setBackground('#fef08a');
+}
+ 
+function makeItemKey(sectionName, itemName) {
+  sectionName = String(sectionName || '').trim();
+  itemName = String(itemName || '').trim();
+  return sectionName ? ('【' + sectionName + '】 ' + itemName) : itemName;
+}
+ 
+function normalizeItemText(s) {
+  return String(s || '')
+    .replace(/[【】\[\]（）()]/g, ' ')
+    .replace(/[·・･\-－—–:：|｜]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+ 
+function getCatalogItemObjects(tour) {
+  var out = [];
+  var seen = {};
+  (tour && tour.sections || []).forEach(function(sec, si) {
+    var secTitle = String(sec.title || sec.name || '').trim();
+    (sec.items || sec.products || []).forEach(function(item, ii) {
+      var itemName = item && item.name ? String(item.name).trim() : '';
+      if (!itemName) return;
+      var key = makeItemKey(secTitle, itemName);
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push({
+        key: key,
+        section: secTitle,
+        name: itemName,
+        normSection: normalizeItemText(secTitle),
+        normName: normalizeItemText(itemName),
+        normFull: normalizeItemText(secTitle + ' ' + itemName),
+        original: Number(item.original || item.defaultOriginal || 0),
+        twd: Number(item.twd || item.defaultTwd || 0),
+        order: si * 10000 + ii
+      });
+    });
+  });
+  return out;
+}
+ 
+function getCatalogItemRows(tour) {
+  return getCatalogItemObjects(tour || {}).map(function(x) { return x.key; });
+}
+ 
+function findCatalogTourByName(campaignName) {
+  try {
+    var catalog = readCatalogFromSettings();
+    var tours = getCatalogTours(catalog);
+    campaignName = String(campaignName || '').trim();
+    for (var i = 0; i < tours.length; i++) {
+      if (String(getCatalogTourName(tours[i]) || '').trim() === campaignName) return tours[i];
+    }
+  } catch (ignore) {}
+  return null;
+}
+ 
+function parseOrderItemsFromDetails(details) {
+  var out = [];
+  String(details || '').split(/\r?\n/).forEach(function(line) {
+    line = String(line || '').trim();
+    if (!line) return;
+    if (line.indexOf('📝') === 0 || line.indexOf('【滿額卡排序】') === 0 || line.indexOf('🎲') === 0) return;
+    if (/滿額卡/i.test(line) || line.indexOf('張 |') >= 0) return;
+    var m = line.match(/^(.+?)\s*x\s*(\d+)\s*$/i);
+    if (!m) return;
+    var name = String(m[1] || '').trim();
+    var qty = parseInt(m[2], 10) || 0;
+    if (name && qty > 0) out.push({ name: name, qty: qty });
+  });
+  return out;
+}
+ 
+function canonicalizeOrderItemName(rawName, catalogItems) {
+  rawName = String(rawName || '').trim();
+  var rawNorm = normalizeItemText(rawName);
+  if (!rawNorm) return rawName;
+ 
+  for (var i = 0; i < catalogItems.length; i++) {
+    if (catalogItems[i].normFull === rawNorm || normalizeItemText(catalogItems[i].key) === rawNorm) return catalogItems[i].key;
+  }
+ 
+  // 前台常見格式：區塊 · 商品、區塊 - 商品。轉成 catalog 中的「【區塊】 商品」。
+  var best = null;
+  for (var j = 0; j < catalogItems.length; j++) {
+    var it = catalogItems[j];
+    if (it.normSection && it.normName && rawNorm === normalizeItemText(it.normSection + ' ' + it.normName)) return it.key;
+    if (it.normSection && it.normName && rawNorm.indexOf(it.normSection) >= 0 && rawNorm.indexOf(it.normName) >= 0) {
+      best = best || it;
+    }
+  }
+  if (best) return best.key;
+ 
+  // 如果訂單明細只剩商品名，且 catalog 內沒有重名，就可對應。
+  var sameName = catalogItems.filter(function(it) { return it.normName === rawNorm; });
+  if (sameName.length === 1) return sameName[0].key;
+ 
+  return rawName;
+}
+ 
+function removeDefaultBlankSheet(ss) {
+  var sheets = ss.getSheets();
+  if (sheets.length <= 1) return;
+  sheets.forEach(function(sh) {
+    var n = sh.getName();
+    if ((n === '工作表1' || n === '工作表 1' || n === 'Sheet1') && sh.getLastRow() <= 1 && sh.getLastColumn() <= 1 && !sh.getRange(1, 1).getValue()) {
+      try { ss.deleteSheet(sh); } catch (ignore) {}
+    }
+  });
+}
+ 
+function ensureSecondHeaders(sheet) {
+  var headers = ensureHeaderRow(sheet, SECOND_HEADERS);
+  var hMap = getHeaderMap(headers);
+  // 舊版曾誤寫成「包手」，這裡直接改回「包材」。
+  if (hMap['二補總計(國際運費+包手)'] !== undefined && hMap[SECOND_TOTAL_HEADER] === undefined) {
+    sheet.getRange(1, hMap['二補總計(國際運費+包手)'] + 1).setValue(SECOND_TOTAL_HEADER);
+    headers[hMap['二補總計(國際運費+包手)']] = SECOND_TOTAL_HEADER;
+  }
+  headers = ensureColumns(sheet, headers, ['包材費', SECOND_TOTAL_HEADER, '二補收款狀態', '訂單編號']);
+  return headers;
+}
+ 
+// ── getAllOrders ──
+function getAllOrders() {
+  var allProps = PropertiesService.getScriptProperties().getProperties();
+  var result = [];
+  for (var campName in allProps) {
+    if (isInternalPropKey(campName)) continue;
+    try {
+      var ssId = allProps[campName];
+      var ss = SpreadsheetApp.openById(ssId);
+      var sheet = ss.getSheetByName(ORDER_SHEET);
+      if (!sheet) continue;
+      var rows = sheet.getDataRange().getValues();
+      if (rows.length <= 1) continue;
+      var hMap = getHeaderMap(rows[0]);
+      var secMaps = loadSecondPayDataMap(ss);
+ 
+      for (var i = 1; i < rows.length; i++) {
+        var row = rows[i];
+        if (!row.some(function(c) { return c !== '' && c !== null; })) continue;
+        var phoneVal = String(getVal(row, hMap, '手機號碼')).replace(/\D/g, '');
+        var orderId = String(getVal(row, hMap, '訂單編號'));
+        var secInfo = (orderId && secMaps.byId[orderId]) || secMaps.byPhone[phoneVal] || { weight: '', intlShipping: '', packagingFee: '', secondPayment: '', secondPayStatus: '未收款' };
+        var rawCardSortText = getVal(row, hMap, '滿額卡排序');
+        var cardSortMode = getVal(row, hMap, '滿額卡分配方式') || extractCardSortMode(rawCardSortText);
+        var cardSortText = normalizeCardSortForSheet(rawCardSortText, cardSortMode, rawCardSortText);
+        var priorityData = buildPriorityDataText(cardSortText, cardSortMode, getVal(row, hMap, '滿額卡張數', 0));
+        var originalAmount = Number(getVal(row, hMap, '原幣總金額', 0)) || 0;
+        var storedCardCount = Number(getVal(row, hMap, '滿額卡張數', 0)) || parseCardCount(priorityData);
+        result.push({
+          rowIndex: i + 1,
+          spreadsheetId: ssId,
+          orderId: orderId,
+          campaignName: getVal(row, hMap, '開團名稱', campName),
+          timestamp: hMap['時間戳記'] !== undefined && row[hMap['時間戳記']] ? new Date(row[hMap['時間戳記']]).toISOString() : '',
+          socialName: getVal(row, hMap, '社群帳號'),
+          socialLink: getVal(row, hMap, '個人主頁連結'),
+          phone: phoneVal,
+          orderDetails: getVal(row, hMap, '訂單明細'),
+          totalAmount: Number(getVal(row, hMap, '系統總計金額', 0)) || 0,
+          remitAmount: Number(getVal(row, hMap, '買家匯款金額', 0)) || 0,
+          originalAmount: originalAmount,
+          bank5: String(getVal(row, hMap, '匯款後五碼')).replace(/\D/g, '').slice(-5),
+          remark: getVal(row, hMap, '備註'),
+          priorityData: priorityData,
+          cardSort: cardSortText,
+          cardSortMode: cardSortMode,
+          cardCount: storedCardCount,
+          payStatus: getVal(row, hMap, '付款狀態', 'pending'),
+          weight: secInfo.weight,
+          intlShipping: secInfo.intlShipping,
+          packagingFee: secInfo.packagingFee,
+          secondPayment: secInfo.secondPayment,
+          secondPayStatus: normalizeSecondStatus(secInfo.secondPayStatus)
+        });
+      }
+    } catch (ignore) {}
+  }
+  return result;
+}
+ 
+function buildSecondPaymentsFromOrders(orders) {
+  return (orders || []).map(function(o) {
+    return {
+      orderId: o.orderId,
+      campaignName: o.campaignName,
+      tourName: o.campaignName,
+      social: o.socialName,
+      phone: o.phone,
+      details: o.orderDetails,
+      firstAmount: o.totalAmount,
+      weight: o.weight,
+      intlShipping: o.intlShipping,
+      packageFee: o.packagingFee,
+      secondPayment: o.secondPayment,
+      secondPayStatus: o.secondPayStatus
+    };
+  });
+}
+ 
+function loadSecondPayDataMap(ss) {
+  var byId = {}, byPhone = {};
+  var secSheet = ss.getSheetByName(SECOND_SHEET);
+  if (!secSheet) return { byId: byId, byPhone: byPhone };
+  var secRows = secSheet.getDataRange().getValues();
+  if (secRows.length <= 1) return { byId: byId, byPhone: byPhone };
+  var hMap = getHeaderMap(secRows[0]);
+  for (var j = 1; j < secRows.length; j++) {
+    var info = {
+      weight: hMap['商品重量(kg)'] !== undefined ? secRows[j][hMap['商品重量(kg)']] : '',
+      intlShipping: hMap['國際運費分攤'] !== undefined ? secRows[j][hMap['國際運費分攤']] : '',
+      packagingFee: hMap['包材費'] !== undefined ? secRows[j][hMap['包材費']] : '',
+      secondPayment: hMap[SECOND_TOTAL_HEADER] !== undefined ? secRows[j][hMap[SECOND_TOTAL_HEADER]] : '',
+      secondPayStatus: hMap['二補收款狀態'] !== undefined ? secRows[j][hMap['二補收款狀態']] : '未收款'
+    };
+    var id = hMap['訂單編號'] !== undefined ? String(secRows[j][hMap['訂單編號']] || '') : '';
+    var phone = String(secRows[j][1] || '').replace(/\D/g, '');
+    if (id) byId[id] = info;
+    if (phone) byPhone[phone] = info;
+  }
+  return { byId: byId, byPhone: byPhone };
+}
+ 
+// ── updatePayStatus ──
+function updatePayStatus(campaignName, orderId, status, bank5) {
+  campaignName = propKeyCampaign(campaignName);
+  var ssId = PropertiesService.getScriptProperties().getProperty(campaignName);
+  if (!ssId) return;
+  var ss = SpreadsheetApp.openById(ssId);
+  var sheet = ss.getSheetByName(ORDER_SHEET);
+  if (!sheet) return;
+  var rows = sheet.getDataRange().getValues();
+  var headers = rows[0];
+  var hMap = getHeaderMap(headers);
+  headers = ensureColumns(sheet, headers, ['付款狀態', '訂單編號']);
+  hMap = getHeaderMap(headers);
+  var idCol = hMap['訂單編號'], payCol = hMap['付款狀態'];
+  var bank5Str = String(bank5 || '').replace(/\D/g, '').slice(-5);
+  var target = -1;
+  if (orderId && idCol !== undefined) {
+    for (var i = 1; i < rows.length; i++) {
+      if (String(rows[i][idCol] || '') === String(orderId)) { target = i; break; }
+    }
+  }
+  if (target < 0 && bank5Str) {
+    for (var j = 1; j < rows.length; j++) {
+      var rb = String(getVal(rows[j], hMap, '匯款後五碼')).replace(/\D/g, '').slice(-5);
+      if (rb === bank5Str) { target = j; break; }
+    }
+  }
+  if (target < 0 || payCol === undefined) return;
+  sheet.getRange(target + 1, payCol + 1).setValue(status || 'pending');
+}
+ 
+// ── updateSecondPaymentLogic ──
+function updateSecondPaymentLogic(campaignName, orderId, weight, intlShipping, packagingFee, bank5, secondPayStatus) {
+  campaignName = propKeyCampaign(campaignName);
+  var ssId = PropertiesService.getScriptProperties().getProperty(campaignName);
+  if (!ssId) return;
+  var ss = SpreadsheetApp.openById(ssId);
+  var orderSheet = ss.getSheetByName(ORDER_SHEET);
+  var secSheet = ss.getSheetByName(SECOND_SHEET);
+  if (!secSheet) return;
+ 
+  var secHeaders = ensureSecondHeaders(secSheet);
+  var secHMap = getHeaderMap(secHeaders);
+  ensureSecPayFormula(secSheet, secHMap);
+ 
+  var targetPhone = null;
+  if ((!orderId || secHMap['訂單編號'] === undefined) && orderSheet) {
+    var orderRows = orderSheet.getDataRange().getValues();
+    var oM = getHeaderMap(orderRows[0]);
+    var b = String(bank5 || '').replace(/\D/g, '').slice(-5);
+    for (var i = 1; i < orderRows.length; i++) {
+      var rb = String(getVal(orderRows[i], oM, '匯款後五碼')).replace(/\D/g, '').slice(-5);
+      if (b && rb === b) {
+        targetPhone = String(getVal(orderRows[i], oM, '手機號碼')).replace(/\D/g, '');
+        break;
+      }
+    }
+  }
+ 
+  var secRows = secSheet.getDataRange().getValues();
+  var idCol = secHMap['訂單編號'];
+  for (var j = 1; j < secRows.length; j++) {
+    var idMatch = orderId && idCol !== undefined && String(secRows[j][idCol] || '') === String(orderId);
+    var phoneMatch = !idMatch && targetPhone && String(secRows[j][1] || '').replace(/\D/g, '') === targetPhone;
+    if (idMatch || phoneMatch) {
+      var r = j + 1;
+      if (secHMap['商品重量(kg)'] !== undefined) secSheet.getRange(r, secHMap['商品重量(kg)'] + 1).setValue(weight);
+      if (secHMap['國際運費分攤'] !== undefined) secSheet.getRange(r, secHMap['國際運費分攤'] + 1).setValue(intlShipping);
+      if (secHMap['包材費'] !== undefined) secSheet.getRange(r, secHMap['包材費'] + 1).setValue(packagingFee);
+      if (secHMap['二補收款狀態'] !== undefined) secSheet.getRange(r, secHMap['二補收款狀態'] + 1).setValue(normalizeSecondStatus(secondPayStatus));
+      break;
+    }
+  }
+}
+ 
+function ensureSecPayFormula(secSheet, hMap) {
+  var spCol = hMap[SECOND_TOTAL_HEADER];
+  var intlCol = hMap['國際運費分攤'];
+  var packCol = hMap['包材費'];
+  if (spCol === undefined || intlCol === undefined || packCol === undefined) return;
+  var intlLetter = colToLetter(intlCol);
+  var packLetter = colToLetter(packCol);
+  var maxRows = secSheet.getMaxRows();
+  if (maxRows > 1) secSheet.getRange(2, spCol + 1, maxRows - 1).clearContent();
+  secSheet.getRange(1, spCol + 1).setFormula(
+    '={"' + SECOND_TOTAL_HEADER + '"; ARRAYFORMULA(IF(A2:A="", "", IFERROR(' + intlLetter + '2:' + intlLetter + '*1, 0) + IFERROR(' + packLetter + '2:' + packLetter + '*1, 0)))}'
+  );
+}
+ 
+// ── createNewOrder ──
+function createNewOrder(data) {
+  var timestamp = new Date();
+  var campaignName = data.campaignName || '';
+  // 優先用團的固定 id 解析出「現行團名」。即使買家頁面快取了舊團名，
+  // 只要帶了 id，就會對到改名後的正確表單，不會誤建新表。
+  var campaignId = data.tourId || data.campaignId || data.id || '';
+  if (campaignId) {
+    var resolvedName = findCatalogTourNameById(campaignId);
+    if (resolvedName) campaignName = resolvedName;
+  }
+  if (!campaignName) throw new Error('缺少開團名稱');
+  var orderId = data.orderId || makeOrderId(timestamp);
+ 
+  var ss = ensureCampaignSpreadsheet(campaignName);
+  setupCampaignSpreadsheet(ss, null, campaignName);
+ 
+  writeOrderDetail(ss, data, timestamp, campaignName, orderId);
+  updateItemSummary(ss, data, campaignName);
+  writeSecondPayEntry(ss, data, orderId);
+  return jsonResponse({ ok: true, status: 'success', orderId: orderId });
+}
+
+// 用團的固定 id 從目前 catalog 找出現行團名；找不到回空字串（交回呼叫端用 campaignName 後援）。
+function findCatalogTourNameById(id) {
+  id = String(id || '').trim();
+  if (!id) return '';
+  try {
+    var tours = getCatalogTours(readCatalogFromSettings());
+    for (var i = 0; i < tours.length; i++) {
+      if (String((tours[i] && tours[i].id) || '').trim() === id) return getCatalogTourName(tours[i]);
+    }
+  } catch (ignore) {}
+  return '';
+}
+ 
+function writeOrderDetail(ss, data, timestamp, campaignName, orderId) {
+  var sheet = ss.getSheetByName(ORDER_SHEET);
+  if (!sheet) sheet = ss.insertSheet(ORDER_SHEET, 0);
+  var headers = normalizeOrderSheetColumns(sheet);
+  var hMap = getHeaderMap(headers);
+ 
+  applyOrderTextFormats(sheet, hMap);
+ 
+  var row = new Array(headers.length).fill('');
+  row[hMap['時間戳記']] = timestamp;
+  row[hMap['開團名稱']] = campaignName;
+  row[hMap['社群帳號']] = data.socialName || data.social || '';
+  row[hMap['個人主頁連結']] = data.socialLink || '';
+  row[hMap['電子郵件']] = data.email || '';
+  row[hMap['手機號碼']] = data.phone || '';
+  row[hMap['訂單明細']] = data.orderDetails || data.details || '';
+  row[hMap['系統總計金額']] = Number(data.totalAmount || data.systemTotal || 0);
+  if (hMap['原幣總金額'] !== undefined) row[hMap['原幣總金額']] = Number(data.originalAmount || data.origAmount || data.currencyTotal || data.originalTotal || 0);
+  row[hMap['買家匯款金額']] = Number(data.remitAmount || data.buyerPaid || 0);
+  row[hMap['匯款後五碼']] = String(data.bank5 || data.last5 || '').replace(/\D/g, '').slice(-5);
+  row[hMap['備註']] = data.remark || '';
+  var cardSortText = String(data.cardSort || data.cardPriority || '').trim();
+  var cardSortMode = String(data.cardSortMode || data.fullGiftMode || '').trim();
+  var priorityText = data.priorityData || buildPriorityDataText(cardSortText, cardSortMode, data.cardCount || data.fullGiftCount || 0);
+  if (!cardSortMode && priorityText) cardSortMode = extractCardSortMode(priorityText);
+  cardSortText = normalizeCardSortForSheet(cardSortText, cardSortMode, priorityText);
+  if (hMap['滿額卡張數'] !== undefined) row[hMap['滿額卡張數']] = Number(data.cardCount || data.fullGiftCount || parseCardCount(priorityText) || 0);
+  if (hMap['滿額卡排序'] !== undefined) row[hMap['滿額卡排序']] = cardSortText;
+  row[hMap['付款狀態']] = data.payStatus || 'pending';
+  row[hMap['訂單編號']] = orderId;
+  sheet.getRange(getRealLastRow(sheet) + 1, 1, 1, row.length).setValues([row]);
+}
+ 
+ 
+ 
+function estimateOriginalAmountFromDetails(details, catalogItems) {
+  var originalMap = {};
+  (catalogItems || []).forEach(function(it) { originalMap[it.key] = Number(it.original || 0); });
+  var total = 0;
+  parseOrderItemsFromDetails(details).forEach(function(item) {
+    var key = canonicalizeOrderItemName(item.name, catalogItems || []);
+    total += (Number(originalMap[key] || 0) * Number(item.qty || 0));
+  });
+  return total;
+}
+ 
+function normalizeAllOrderSheets() {
+  var allProps = PropertiesService.getScriptProperties().getProperties();
+  var updated = [], skipped = [], errors = [];
+  for (var campName in allProps) {
+    if (isInternalPropKey(campName)) continue;
+    try {
+      var ss = SpreadsheetApp.openById(allProps[campName]);
+      var sheet = ss.getSheetByName(ORDER_SHEET);
+      if (!sheet) {
+        skipped.push({ name: campName, reason: 'no order sheet' });
+        continue;
+      }
+      normalizeOrderSheetColumns(sheet);
+      updated.push({ name: campName, id: allProps[campName] });
+    } catch (e) {
+      errors.push({ name: campName, error: e && e.stack ? e.stack : String(e) });
+    }
+  }
+  return { updated: updated, skipped: skipped, errors: errors };
+}
+ 
+function backfillOrderCardFields() {
+  var catalog = readCatalogFromSettings();
+  var tours = getCatalogTours(catalog);
+  var props = PropertiesService.getScriptProperties();
+  var updated = [], skipped = [], errors = [];
+  tours.forEach(function(tour) {
+    var name = getCatalogTourName(tour);
+    if (!name || !shouldCreateSheetForTour(tour)) {
+      skipped.push({ name: name || '(未命名)', reason: 'instock / missing name' });
+      return;
+    }
+    var ssId = props.getProperty(propKeyCampaign(name));
+    if (!ssId) {
+      skipped.push({ name: name, reason: 'no spreadsheet id' });
+      return;
+    }
+    try {
+      var ss = SpreadsheetApp.openById(ssId);
+      var sheet = ss.getSheetByName(ORDER_SHEET);
+      if (!sheet) {
+        skipped.push({ name: name, reason: 'no order sheet' });
+        return;
+      }
+      var headers = normalizeOrderSheetColumns(sheet);
+      var hMap = getHeaderMap(headers);
+      var rows = sheet.getDataRange().getValues();
+      if (rows.length <= 1) {
+        skipped.push({ name: name, reason: 'no orders' });
+        return;
+      }
+      var detailCol = hMap['訂單明細'];
+      var originalCol = hMap['原幣總金額'];
+      var cardCountCol = hMap['滿額卡張數'];
+      var priorityCol = hMap['滿額卡排序'];
+      var catalogItems = getCatalogItemObjects(tour || {});
+      var threshold = Number(tour.threshold || 0);
+      var changed = 0;
+      for (var i = 1; i < rows.length; i++) {
+        if (!rows[i].some(function(c) { return c !== '' && c !== null; })) continue;
+        var detail = detailCol !== undefined ? rows[i][detailCol] : '';
+        var priority = priorityCol !== undefined ? rows[i][priorityCol] : '';
+        var original = originalCol !== undefined ? Number(rows[i][originalCol] || 0) : 0;
+        if (!original) original = estimateOriginalAmountFromDetails(detail, catalogItems);
+        var cardCount = cardCountCol !== undefined ? Number(rows[i][cardCountCol] || 0) : 0;
+        if (!cardCount) cardCount = parseCardCount(priority);
+        if (!cardCount && threshold > 0 && original > 0) cardCount = Math.floor(original / threshold) || 0;
+        var extractedSort = normalizeCardSortForSheet(priority, '', priority);
+        var r = i + 1;
+        if (originalCol !== undefined && Number(rows[i][originalCol] || 0) !== original) {
+          sheet.getRange(r, originalCol + 1).setValue(original);
+          changed++;
+        }
+        if (cardCountCol !== undefined && Number(rows[i][cardCountCol] || 0) !== cardCount) {
+          sheet.getRange(r, cardCountCol + 1).setValue(cardCount);
+          changed++;
+        }
+        if (priorityCol !== undefined && extractedSort && String(rows[i][priorityCol] || '') !== extractedSort) {
+          sheet.getRange(r, priorityCol + 1).setValue(extractedSort);
+          changed++;
+        }
+      }
+      updated.push({ name: name, id: ssId, changedCells: changed });
+    } catch (e) {
+      errors.push({ name: name, error: e && e.stack ? e.stack : String(e) });
+    }
+  });
+  return { updated: updated, skipped: skipped, errors: errors };
+}
+ 
+function rebuildAllItemSummaries() {
+  var catalog = readCatalogFromSettings();
+  var tours = getCatalogTours(catalog);
+  var props = PropertiesService.getScriptProperties();
+  var updated = [], skipped = [], errors = [];
+  tours.forEach(function(tour) {
+    var name = getCatalogTourName(tour);
+    if (!name || !shouldCreateSheetForTour(tour)) {
+      skipped.push({ name: name || '(未命名)', reason: 'instock / missing name' });
+      return;
+    }
+    var ssId = props.getProperty(propKeyCampaign(name));
+    if (!ssId) {
+      skipped.push({ name: name, reason: 'no spreadsheet id' });
+      return;
+    }
+    try {
+      var ss = SpreadsheetApp.openById(ssId);
+      updateItemSummary(ss, {}, name);
+      updated.push({ name: name, id: ssId });
+    } catch (e) {
+      errors.push({ name: name, error: e && e.stack ? e.stack : String(e) });
+    }
+  });
+  return { updated: updated, skipped: skipped, errors: errors };
+}
+ 
+function updateItemSummary(ss, data, campaignName) {
+  var sheet = ss.getSheetByName(ITEM_SHEET);
+  if (!sheet) {
+    sheet = ss.insertSheet(ITEM_SHEET);
+  }
+  ensureItemSummaryHeader(sheet);
+ 
+  // 不再用 append 增加統計列。每次新訂單寫入後，依「訂單明細」整張重算，避免
+  // 【區塊】 商品 和 區塊 - 商品 兩種 key 同時存在，造成統計表跑版。
+  var tour = findCatalogTourByName(campaignName);
+  var catalogItems = getCatalogItemObjects(tour || {});
+  var catalogOrder = catalogItems.map(function(x) { return x.key; });
+ 
+  var orderSheet = ss.getSheetByName(ORDER_SHEET);
+  if (!orderSheet) return;
+  var rows = orderSheet.getDataRange().getValues();
+  if (rows.length <= 1) return;
+  var hMap = getHeaderMap(rows[0]);
+  var detailCol = hMap['訂單明細'];
+  if (detailCol === undefined) return;
+ 
+  var totals = {};
+  for (var i = 1; i < rows.length; i++) {
+    if (!rows[i].some(function(c) { return c !== '' && c !== null; })) continue;
+    parseOrderItemsFromDetails(rows[i][detailCol]).forEach(function(item) {
+      var key = canonicalizeOrderItemName(item.name, catalogItems);
+      totals[key] = (totals[key] || 0) + item.qty;
+    });
+  }
+ 
+  var orderedNames = [];
+  catalogOrder.forEach(function(name) {
+    if (orderedNames.indexOf(name) < 0) orderedNames.push(name);
+  });
+  Object.keys(totals).forEach(function(name) {
+    if (orderedNames.indexOf(name) < 0) orderedNames.push(name);
+  });
+ 
+  var out = orderedNames.map(function(name) { return [name, totals[name] || 0]; });
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, 2).clearContent();
+  if (out.length) sheet.getRange(2, 1, out.length, 2).setValues(out);
+}
+ 
+function writeSecondPayEntry(ss, data, orderId) {
+  var sheet = ss.getSheetByName(SECOND_SHEET);
+  if (!sheet) sheet = ss.insertSheet(SECOND_SHEET);
+  var headers = ensureSecondHeaders(sheet);
+  var hMap = getHeaderMap(headers);
+ 
+  ['社群帳號','手機號碼','購買明細','二補收款狀態','訂單編號'].forEach(function(col) {
+    if (hMap[col] !== undefined) sheet.getRange(1, hMap[col] + 1, sheet.getMaxRows(), 1).setNumberFormat('@');
+  });
+ 
+  // BUG FIX: 二補總計欄是整欄 ARRAYFORMULA。寫入新列時不要碰那一欄，否則寫進去的空字串
+  // 會卡住公式展開（#REF! Array result was not expanded）。先寫入除了總計欄以外的資料，
+  // 再於最後重設一次公式讓它重新展開到新列。
+  var spCol = hMap[SECOND_TOTAL_HEADER];
+  var row = new Array(headers.length).fill('');
+  row[hMap['社群帳號']] = data.socialName || data.social || '';
+  row[hMap['手機號碼']] = data.phone || '';
+  row[hMap['購買明細']] = data.orderDetails || data.details || '';
+  row[hMap['一補已付金額']] = Number(data.totalAmount || data.systemTotal || 0);
+  if (hMap['商品重量(kg)'] !== undefined) row[hMap['商品重量(kg)']] = '';
+  if (hMap['國際運費分攤'] !== undefined) row[hMap['國際運費分攤']] = '';
+  if (hMap['包材費'] !== undefined) row[hMap['包材費']] = '';
+  if (hMap['二補收款狀態'] !== undefined) row[hMap['二補收款狀態']] = '未收款';
+  if (hMap['訂單編號'] !== undefined) row[hMap['訂單編號']] = orderId;
+ 
+  var targetRow = getRealLastRow(sheet) + 1;
+  if (spCol === undefined) {
+    sheet.getRange(targetRow, 1, 1, row.length).setValues([row]);
+  } else {
+    // 分兩段寫入，跳過總計欄，避免覆蓋 ARRAYFORMULA 的展開範圍。
+    if (spCol > 0) sheet.getRange(targetRow, 1, 1, spCol).setValues([row.slice(0, spCol)]);
+    if (spCol < row.length - 1) sheet.getRange(targetRow, spCol + 2, 1, row.length - spCol - 1).setValues([row.slice(spCol + 1)]);
+  }
+ 
+  // 寫完資料列後重設公式，使其涵蓋新列並修復任何先前被卡住的狀態。
+  ensureSecPayFormula(sheet, hMap);
+}
+ 
+// ── 圖片上傳到 Google Drive ──
+function getImageFolder() {
+  var props = PropertiesService.getScriptProperties();
+  var key = '__IMAGE_FOLDER__';
+  var saved = props.getProperty(key);
+  if (saved) {
+    try { return DriveApp.getFolderById(saved); } catch (ignore) {}
+  }
+  var folder = DriveApp.createFolder('TWT_代購平台_圖片');
+  props.setProperty(key, folder.getId());
+  return folder;
+}
+ 
+function uploadImage(data) {
+  var base64 = data.base64 || '';
+  var mime = data.mimeType || 'image/jpeg';
+  if (data.dataUrl) {
+    var m = String(data.dataUrl).match(/^data:([^;]+);base64,(.*)$/);
+    if (m) { mime = m[1]; base64 = m[2]; }
+  }
+  if (!base64) return jsonResponse({ ok: false, error: 'no image data' });
+ 
+  var bytes = Utilities.base64Decode(base64);
+  var ext = (String(mime).split('/')[1] || 'jpg').replace('jpeg', 'jpg');
+  var safe = data.name ? String(data.name).replace(/[^\w.\-]/g, '_') : ('img_' + Date.now());
+  var blob = Utilities.newBlob(bytes, mime, safe + '.' + ext);
+ 
+  var folder = getImageFolder();
+  var file = folder.createFile(blob);
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  var id = file.getId();
+  return jsonResponse({
+    ok: true,
+    status: 'success',
+    id: id,
+    url: 'https://drive.google.com/thumbnail?id=' + id + '&sz=w1000',
+    viewUrl: 'https://drive.google.com/file/d/' + id + '/view'
+  });
+}
+ 
+function trashImages(data) {
+  var ids = (data.ids || []).slice();
+  if ((!ids || !ids.length) && data.urls) ids = (data.urls || []).map(extractDriveId).filter(Boolean);
+  var trashed = 0;
+  (ids || []).forEach(function(id) {
+    try { DriveApp.getFileById(id).setTrashed(true); trashed++; } catch (ignore) {}
+  });
+  return jsonResponse({ ok: true, status: 'success', trashed: trashed });
+}
+ 
+function extractDriveId(u) {
+  if (!u) return '';
+  u = String(u);
+  var m = u.match(/[?&]id=([\w-]+)/); if (m) return m[1];
+  m = u.match(/\/d\/([\w-]+)/); if (m) return m[1];
+  return '';
+}
