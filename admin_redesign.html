@@ -943,7 +943,7 @@ input[type=number]{
         <div class="residual-cleanup-head">
           <div>
             <div class="ptitle">Google Sheet 表單清理</div>
-            <p class="hint">列出所有已建立 Google Sheet 訂單表的團。後台刪除的團在「儲存到雲端」時就會自動刪除訂單表，這裡用來手動處理個別表單。</p>
+            <p class="hint">列出所有團務的 Google Sheet。後台刪除的團會標示「已結束」並保留表單；需要完全移除時，可以在這裡永久刪除。</p>
           </div>
           <button class="btn ghost" style="flex:0 0 auto" onclick="scanResidualCampaignSheets()">掃描所有表單</button>
         </div>
@@ -1232,10 +1232,10 @@ function standardToAdmin(cat){const groups=(cat.boardColumns?.groups||[]).map((g
 async function saveCloud(){persistTheme();saveLocal();if(!apiUrl()){toast('已存到本機（未設定雲端）');return;}toast('儲存中…');
   try{const cat=adminToStandard();const saveRes=await gasPost('saveCatalog',{appData:cat.appData,boardColumns:cat.boardColumns});setConn(true);
     const created=(saveRes&&saveRes.createdSheets)||[];const existing=(saveRes&&saveRes.existingSheets)||[];const errs=(saveRes&&saveRes.autoCreate&&saveRes.autoCreate.errors)||[];
-    const removed=(saveRes&&saveRes.removedSheets)||[];const removedNote=removed.length?' · 刪除 '+removed.length+' 個已刪團的訂單表':'';
+    const ended=(saveRes&&saveRes.endedTours)||[];const removedNote=ended.length?' · '+ended.length+' 個團改為已結束':'';
     const pend=getPendingTrash();
     if(pend.length){try{const r=await gasPost('trashImages',{ids:pend});setPendingTrash([]);toast('✅ 已儲存 · 新建 '+created.length+' 表 · 已有 '+existing.length+' 表'+removedNote+' · 回收 '+((r&&r.trashed!=null)?r.trashed:pend.length)+' 張圖');}catch(e){toast('✅ 已儲存 · 新建 '+created.length+' 表 · 已有 '+existing.length+' 表'+removedNote+'（圖片回收下次再試）');}}
-    else if(errs.length)toast('⚠️ 已儲存，但建表有 '+errs.length+' 個錯誤，請看主控表「開團表單索引」');
+    else if(errs.length)toast('⚠️ 已儲存，但建表有 '+errs.length+' 個錯誤，請看主控表「團務索引表單」');
     else toast('✅ 已儲存到雲端 · 新建 '+created.length+' 表 · 已有 '+existing.length+' 表'+removedNote);}
   catch(e){toast('⚠️ 雲端失敗：'+e.message);setConn(false);}}
 async function loadCloud(){if(!apiUrl())return toast('請先設定 API 網址');toast('載入中…');
@@ -1245,7 +1245,7 @@ async function testConnection(){if(!apiUrl())return toast('請先輸入 API 網�
   try{await gasGet('');setConn(true);toast('✅ 連線成功');}catch(e){setConn(false);toast('⚠️ 連線失敗');}}
 async function forceCreateSheets(){if(!apiUrl())return toast('請先設定 API 網址');toast('建立開團表單中…');
   try{const r=await gasGet('createCampaignSheets');const ac=r.autoCreate||{};const c=(ac.created||[]).length,e=(ac.existing||[]).length,s=(ac.skipped||[]).length,err=(ac.errors||[]).length;setConn(true);
-    if(err)toast('⚠️ 建表完成但有 '+err+' 個錯誤，請看主控表「開團表單索引」');else toast('✅ 建表完成 · 新建 '+c+' · 已存在 '+e+' · 略過 '+s);}
+    if(err)toast('⚠️ 建表完成但有 '+err+' 個錯誤，請看主控表「團務索引表單」');else toast('✅ 建表完成 · 新建 '+c+' · 已存在 '+e+' · 略過 '+s);}
   catch(e){setConn(false);toast('⚠️ 建表失敗：'+e.message);}}
 function setConn(ok){const c=document.getElementById('conn');c.className='conn'+(ok?' on':'');document.getElementById('connText').textContent=ok?'已連線':'未連線';}
 
@@ -1333,10 +1333,10 @@ function campaignImageIds(c){const ids=[];const push=u=>{const id=driveIdFromUrl
 function getPendingTrash(){try{return JSON.parse(localStorage.getItem('twt-trash')||'[]');}catch(_){return [];}}
 function setPendingTrash(a){localStorage.setItem('twt-trash',JSON.stringify(a||[]));}
 function queueTrash(ids){if(!ids||!ids.length)return;const cur=getPendingTrash();ids.forEach(id=>{if(id&&cur.indexOf(id)<0)cur.push(id);});setPendingTrash(cur);}
-function deleteCampaign(){if(!confirm('確定刪除此開團？\n按「☁️ 儲存到雲端」後，這個團的開團資料、Google Sheet 訂單表與圖片都會一起刪除（移到 Google Drive 垃圾桶，30 天內可救回）。'))return;
+function deleteCampaign(){if(!confirm('確定刪除此團務？\n按「☁️ 儲存到雲端」後，後台和買家頁面不再顯示這個團，圖片會刪除；「團務資料」裡標記為「已結束」，這個團的 Google Sheet（訂單、商品清單）會保留。'))return;
   const c=state.appData.campaigns.find(x=>x.id===editingId);if(c)queueTrash(campaignImageIds(c));
   state.appData.campaigns=state.appData.campaigns.filter(x=>x.id!==editingId);saveLocal();showView('board');
-  toast('已刪除（按「☁️ 儲存到雲端」後才會刪除雲端資料與訂單表）');}
+  toast('已刪除（按「☁️ 儲存到雲端」後生效）');}
 function openPermanentDeleteCampaign(){
   const c=C();if(!c)return;
   const name=String(c.name||'未命名');
@@ -1399,7 +1399,7 @@ function renderResidualCampaignSheets(res){
     box.innerHTML='<div class="empty">目前沒有 Google Sheet 表單</div>';
     return;
   }
-  box.innerHTML=`<p class="hint">找到 ${res.count||rows.length} 個 Google Sheet 表單，其中 ${res.activeCount||0} 個仍在開團資料中、${res.residualCount||0} 個已不在開團資料中（下次儲存到雲端時會自動刪除）。這裡會處理 Google Sheet 與 Script Properties；仍在開團資料中的團也會同步從 catalog 移除。</p>
+  box.innerHTML=`<p class="hint">找到 ${res.count||rows.length} 個 Google Sheet 表單，其中 ${res.activeCount||0} 個還在網站上、${res.residualCount||0} 個已結束（表單保留）。永久刪除會把該團的 Google Sheet 移到垃圾桶，並從「團務資料」移除。</p>
     <div class="residual-list">${rows.map((it,i)=>`<div class="residual-card">
       <div>
         <div class="residual-name">${esc(it.name||'未命名')}</div>
@@ -1407,7 +1407,7 @@ function renderResidualCampaignSheets(res){
         ${it.error?`<div class="residual-meta" style="color:var(--danger)">${esc(it.error)}</div>`:''}
       </div>
       <div class="residual-actions">
-        <span class="residual-badge ${it.inCatalog?'active':''}">${it.inCatalog?'目前開團':'已刪除（待清除）'}</span>
+        <span class="residual-badge ${it.inCatalog?'active':''}">${it.inCatalog?'目前開團':'已結束'}</span>
         ${it.url?`<a class="btn ghost sm" href="${esc(it.url)}" target="_blank" rel="noopener">開啟 Sheet</a>`:''}
         <button class="btn danger sm" onclick="openResidualDeleteCampaign(${i})">永久刪除</button>
       </div>
@@ -1418,12 +1418,12 @@ function openResidualDeleteCampaign(i){
   residualDeleteTarget=it;
   const name=String(it.name||'');
   modal(`<h3>永久刪除 Google Sheet 表單</h3>
-    <p class="hint">這會把 <b>${esc(name)}</b> 對應的 Google Sheet 移到垃圾桶，刪除 Script Properties 裡的團名對應；如果這個團目前仍在開團資料中，也會同步從 catalog 移除。團體分類名稱不會被刪除。</p>
+    <p class="hint">這會把 <b>${esc(name)}</b> 對應的 Google Sheet 移到垃圾桶，刪除 Script Properties 裡的團名對應，並從「團務資料」移除；如果這個團目前還在網站上，也會一起拿掉。團體分類名稱不會被刪除。</p>
     <div class="perm-confirm-box">
       <label class="lbl">輸入團名確認</label>
       <input class="inp" id="residualDeleteInput" placeholder="${esc(name)}" oninput="checkResidualDeleteInput()">
       <label class="sort-random-row" style="margin-top:10px;margin-bottom:0"><input type="checkbox" id="residualDeleteImages" ${it.inCatalog?'checked':''}> 同時回收 catalog 內這個團使用的圖片</label>
-      <p class="hint" style="margin-top:8px">必須完整輸入「${esc(name)}」才可執行。若這個團已不在開團資料中，圖片可能無法由團名反推。</p>
+      <p class="hint" style="margin-top:8px">必須完整輸入「${esc(name)}」才可執行。已結束的團圖片已經刪除過。</p>
     </div>
     <div class="row" style="margin-top:14px">
       <button class="btn ghost" onclick="closeOverlay()" style="justify-content:center">取消</button>
