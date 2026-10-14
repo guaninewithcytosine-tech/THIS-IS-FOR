@@ -4,8 +4,11 @@
 // saveCatalog 會自動為每個非現貨開團建立獨立 Google Sheet，並在主控表建立「開團表單索引」
 // ══════════════════════════════════════════
  
-var LOCAL_FALLBACK_PASSWORD = '880818';
+// 後台密碼只從「系統設定」B1 讀取，不再有寫死的預設密碼。
 var SETTING_SHEET = '系統設定';
+var AUTH_TOKEN_TTL = 21600; // 登入 token 有效秒數（CacheService 上限 6 小時）
+var LOGIN_FAIL_LIMIT = 20;  // 15 分鐘內密碼錯誤超過此次數，暫停登入
+var LOGIN_FAIL_WINDOW = 900;
 var ORDER_SHEET = '訂單明細';
 var ITEM_SHEET = '品項統計';
 var SECOND_SHEET = '匯率與二補';
@@ -59,6 +62,66 @@ function colToLetter(idx) {
 function jsonResponse(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
+
+// 只回傳錯誤訊息，不把 stack trace（內部程式細節）送給呼叫端。
+function errorResponse(err) {
+  return jsonResponse({ ok: false, error: err && err.message ? err.message : String(err) });
+}
+
+// ── 後台登入驗證 ──
+// 買家公開可用：讀 catalog、queryOrders、createNewOrder、login。其他動作都必須帶有效 token。
+function getAdminPassword() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var settingSheet = ss && ss.getSheetByName(SETTING_SHEET);
+  return settingSheet ? String(settingSheet.getRange('B1').getValue() || '') : '';
+}
+
+function login(password) {
+  var cache = CacheService.getScriptCache();
+  var fails = Number(cache.get('login_fail') || 0);
+  if (fails >= LOGIN_FAIL_LIMIT) return { ok: false, error: '嘗試次數過多，請 15 分鐘後再試' };
+  var adminPwd = getAdminPassword();
+  if (!adminPwd) return { ok: false, error: '尚未設定後台密碼，請在主控表「' + SETTING_SHEET + '」B1 填入密碼' };
+  if (String(password || '') !== adminPwd) {
+    cache.put('login_fail', String(fails + 1), LOGIN_FAIL_WINDOW);
+    Utilities.sleep(800);
+    return { ok: false, error: '密碼錯誤' };
+  }
+  var token = Utilities.getUuid() + Utilities.getUuid().replace(/-/g, '');
+  cache.put('tok_' + token, '1', AUTH_TOKEN_TTL);
+  return { ok: true, token: token, expiresIn: AUTH_TOKEN_TTL };
+}
+
+function isValidToken(token) {
+  token = String(token || '');
+  if (token.length < 30) return false;
+  var cache = CacheService.getScriptCache();
+  if (cache.get('tok_' + token) !== '1') return false;
+  cache.put('tok_' + token, '1', AUTH_TOKEN_TTL); // 有在使用就延長有效期
+  return true;
+}
+
+function logout(token) {
+  token = String(token || '');
+  if (token) CacheService.getScriptCache().remove('tok_' + token);
+}
+
+function unauthorizedResponse() {
+  return jsonResponse({ ok: false, error: 'unauthorized', unauthorized: true });
+}
+
+// 會寫入資料的動作一律排隊執行，避免同時寫入同一列。
+function withScriptLock(fn) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) {
+    return jsonResponse({ ok: false, error: '系統忙碌中，請稍後再試' });
+  }
+  try {
+    return fn();
+  } finally {
+    try { lock.releaseLock(); } catch (ignore) {}
+  }
+}
  
 function ensureColumns(sheet, headers, colNames) {
   colNames.forEach(function(name) {
@@ -94,26 +157,25 @@ function normalizeOrderSheetColumns(sheet) {
   var values = sheet.getRange(1, 1, realLastRow, lastCol).getValues();
   var oldHeaders = values[0].map(function(h) { return String(h || '').trim(); });
   var oldMap = getHeaderMap(oldHeaders);
-  var mustReorder = oldHeaders.length !== ORDER_HEADERS.length || oldMap['滿額卡分配方式'] !== undefined;
-  if (!mustReorder) {
-    for (var hi = 0; hi < ORDER_HEADERS.length; hi++) {
-      if (oldHeaders[hi] !== ORDER_HEADERS[hi]) { mustReorder = true; break; }
-    }
+  // 賣家自己加在表上的欄位要保留，排在標準欄位後面，不可在重排時被清掉。
+  var extraHeaders = oldHeaders.filter(function(h) {
+    return h && ORDER_HEADERS.indexOf(h) < 0 && h !== '滿額卡分配方式';
+  });
+  var newHeaders = ORDER_HEADERS.concat(extraHeaders);
+  var mustReorder = oldMap['滿額卡分配方式'] !== undefined;
+  for (var hi = 0; hi < newHeaders.length && !mustReorder; hi++) {
+    if (oldHeaders[hi] !== newHeaders[hi]) mustReorder = true;
   }
- 
-  if (!mustReorder) {
-    sheet.getRange(1, 1, 1, ORDER_HEADERS.length).setValues([ORDER_HEADERS]).setFontWeight('bold').setBackground('#e5e7eb');
-    applyOrderTextFormats(sheet, getHeaderMap(ORDER_HEADERS));
-    return ORDER_HEADERS.slice();
-  }
- 
-  var out = [ORDER_HEADERS.slice()];
+
+  if (!mustReorder) return newHeaders;
+
+  var out = [newHeaders.slice()];
   for (var r = 1; r < values.length; r++) {
     var oldRow = values[r];
     if (!oldRow.some(function(c) { return c !== '' && c !== null; })) continue;
-    var newRow = new Array(ORDER_HEADERS.length).fill('');
- 
-    ORDER_HEADERS.forEach(function(header, idx) {
+    var newRow = new Array(newHeaders.length).fill('');
+
+    newHeaders.forEach(function(header, idx) {
       if (header === '滿額卡排序') {
         var oldSort = getVal(oldRow, oldMap, '滿額卡排序');
         var oldMode = getVal(oldRow, oldMap, '滿額卡分配方式');
@@ -130,10 +192,10 @@ function normalizeOrderSheetColumns(sheet) {
   }
  
   sheet.clearContents();
-  sheet.getRange(1, 1, out.length, ORDER_HEADERS.length).setValues(out);
-  sheet.getRange(1, 1, 1, ORDER_HEADERS.length).setFontWeight('bold').setBackground('#e5e7eb');
-  applyOrderTextFormats(sheet, getHeaderMap(ORDER_HEADERS));
-  return ORDER_HEADERS.slice();
+  sheet.getRange(1, 1, out.length, newHeaders.length).setValues(out);
+  sheet.getRange(1, 1, 1, newHeaders.length).setFontWeight('bold').setBackground('#e5e7eb');
+  applyOrderTextFormats(sheet, getHeaderMap(newHeaders));
+  return newHeaders;
 }
  
 function makeOrderId(ts) {
@@ -202,23 +264,24 @@ function buildPriorityDataText(cardSort, cardSortMode, cardCount) {
 }
  
 // ── doGet ──
+var PUBLIC_GET_ACTIONS = { '': true, 'queryOrders': true };
+var WRITE_GET_ACTIONS = { 'createCampaignSheets': true, 'rebuildItemSummaries': true, 'backfillOrderCardFields': true, 'normalizeOrderSheets': true, 'upgradeFormulas': true };
+
 function doGet(e) {
   try {
-    var action = (e.parameter && e.parameter.action) || '';
- 
-    if (action === 'verifyPassword') {
-      var pwd = e.parameter.pwd || e.parameter.password || '';
-      var ss = SpreadsheetApp.getActiveSpreadsheet();
-      var settingSheet = ss.getSheetByName(SETTING_SHEET);
-      var adminPwd = LOCAL_FALLBACK_PASSWORD;
-      if (settingSheet) {
-        var savedPwd = settingSheet.getRange('B1').getValue();
-        if (savedPwd) adminPwd = String(savedPwd);
-      }
-      var ok = String(pwd) === String(adminPwd);
-      return jsonResponse({ ok: ok, success: ok });
-    }
- 
+    var params = (e && e.parameter) || {};
+    var action = params.action || '';
+    if (!PUBLIC_GET_ACTIONS[action] && !isValidToken(params.token)) return unauthorizedResponse();
+    if (WRITE_GET_ACTIONS[action]) return withScriptLock(function() { return handleGet(action, params); });
+    return handleGet(action, params);
+  } catch (err) {
+    return errorResponse(err);
+  }
+}
+
+function handleGet(action, params) {
+  var e = { parameter: params };
+  try {
     if (action === 'getAllOrders') {
       var orders = getAllOrders();
       return jsonResponse({ ok: true, orders: orders, secondPayments: buildSecondPaymentsFromOrders(orders) });
@@ -235,12 +298,11 @@ function doGet(e) {
           var b5 = String(o.bank5 || '').replace(/\D/g, '').slice(-5);
           var hit = (q.length >= 6 && ph.slice(-q.length) === q) || (q.length === 5 && b5 === q);
           if (hit) {
+            // 不回傳完整手機與匯款後五碼，買家頁面也用不到。
             matched.push({
               orderId: o.orderId,
               campaignName: o.campaignName,
               socialName: o.socialName,
-              phone: o.phone,
-              bank5: o.bank5,
               orderDetails: o.orderDetails,
               totalAmount: o.totalAmount,
               payStatus: o.payStatus,
@@ -359,33 +421,7 @@ function doGet(e) {
     }
  
 
-    // 清空測試資料工具。預設只做 dry run，不會刪除。
-    // 預覽：API_URL?action=clearTestData
-    // 正式清空：API_URL?action=clearTestData&confirm=DELETE_TEST_DATA
-    // 如也要清空圖片資料夾：&includeImages=1
-    if (action === 'clearTestData') {
-      var cleanupDryRun = String(e.parameter.confirm || '') !== 'DELETE_TEST_DATA';
-      var cleanupIncludeImages = String(e.parameter.includeImages || '') === '1' || String(e.parameter.includeImages || '').toLowerCase() === 'true';
-      var cleanupReport = clearTestData({ dryRun: cleanupDryRun, includeImages: cleanupIncludeImages });
-      SpreadsheetApp.flush();
-      return jsonResponse(cleanupReport);
-    }
-
-    // 指定單一團務永久刪除工具。預設 dry run，不會刪除。
-    // 預覽：API_URL?action=deleteCampaignCompletely&campaignName=TWICE
-    // 正式刪除：API_URL?action=deleteCampaignCompletely&campaignName=TWICE&confirm=DELETE_CAMPAIGN
-    // 如也要清該團 Drive 圖片：&includeImages=1
-    if (action === 'deleteCampaignCompletely') {
-      var deleteDryRun = String(e.parameter.confirm || '') !== 'DELETE_CAMPAIGN';
-      var deleteIncludeImages = String(e.parameter.includeImages || '') === '1' || String(e.parameter.includeImages || '').toLowerCase() === 'true';
-      var deleteReport = deleteCampaignCompletely({
-        campaignName: e.parameter.campaignName || e.parameter.tourName || e.parameter.name || '',
-        dryRun: deleteDryRun,
-        includeImages: deleteIncludeImages
-      });
-      SpreadsheetApp.flush();
-      return jsonResponse(deleteReport);
-    }
+    // clearTestData / deleteCampaignCompletely 只能用 POST（需登入 token），不再接受 GET 網址觸發。
 
     // 列出所有開團 Google Sheet：Script Properties 裡所有「團名 → Spreadsheet ID」對應。
     // 可在後台「設定 → Google Sheet 表單清理」使用。
@@ -417,17 +453,30 @@ function doGet(e) {
     }
     return jsonResponse(catalogData);
   } catch (err) {
-    return jsonResponse({ ok: false, error: err && err.stack ? err.stack : String(err) });
+    return errorResponse(err);
   }
 }
- 
+
 // ── doPost ──
+var PUBLIC_POST_ACTIONS = { 'login': true, 'createNewOrder': true };
+
 function doPost(e) {
-  var lock = LockService.getScriptLock();
-  lock.tryLock(15000);
+  var data;
   try {
-    var data = JSON.parse(e.postData.contents || '{}');
-    switch (data.action || '') {
+    data = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+  } catch (err) {
+    return jsonResponse({ ok: false, error: 'invalid request' });
+  }
+  var action = data.action || '';
+  if (action === 'login') return jsonResponse(login(data.password));
+  if (action === 'logout') { logout(data.token); return jsonResponse({ ok: true }); }
+  if (!PUBLIC_POST_ACTIONS[action] && !isValidToken(data.token)) return unauthorizedResponse();
+  return withScriptLock(function() { return handlePost(action, data); });
+}
+
+function handlePost(action, data) {
+  try {
+    switch (action) {
       case 'updatePayStatus':
         updatePayStatus(data.campaignName || data.tourName, data.orderId, data.status || data.payStatus, data.bank5 || data.last5);
         return jsonResponse({ ok: true, status: 'success' });
@@ -468,13 +517,10 @@ function doPost(e) {
       case 'createNewOrder':
         return createNewOrder(data);
       default:
-        if (data.campaignName) return createNewOrder(data);
-        return jsonResponse({ ok: false, error: 'unknown action: ' + (data.action || '') });
+        return jsonResponse({ ok: false, error: 'unknown action: ' + action });
     }
   } catch (error) {
-    return jsonResponse({ ok: false, error: error && error.stack ? error.stack : String(error) });
-  } finally {
-    try { lock.releaseLock(); } catch (ignore) {}
+    return errorResponse(error);
   }
 }
  
@@ -795,8 +841,8 @@ function deleteCampaignCompletely(options) {
     report.images.ids.forEach(function(id) {
       try {
         if (!dryRun) {
-          DriveApp.getFileById(id).setTrashed(true);
-          report.images.trashed++;
+          if (trashImageFile(id)) report.images.trashed++;
+          else report.images.errors.push({ id: id, error: '不在圖片資料夾內，未回收' });
         } else {
           report.images.wouldTrash++;
         }
@@ -1388,6 +1434,13 @@ function ensureSecondHeaders(sheet) {
   return headers;
 }
  
+// 儲存格內容不是有效日期時回傳空字串，避免整個開團的訂單因一格錯誤而全部讀不到。
+function safeIsoTime(v) {
+  if (!v) return '';
+  var d = v instanceof Date ? v : new Date(v);
+  return isNaN(d.getTime()) ? '' : d.toISOString();
+}
+
 // ── getAllOrders ──
 function getAllOrders() {
   var allProps = PropertiesService.getScriptProperties().getProperties();
@@ -1421,7 +1474,7 @@ function getAllOrders() {
           spreadsheetId: ssId,
           orderId: orderId,
           campaignName: getVal(row, hMap, '開團名稱', campName),
-          timestamp: hMap['時間戳記'] !== undefined && row[hMap['時間戳記']] ? new Date(row[hMap['時間戳記']]).toISOString() : '',
+          timestamp: hMap['時間戳記'] !== undefined ? safeIsoTime(row[hMap['時間戳記']]) : '',
           socialName: getVal(row, hMap, '社群帳號'),
           socialLink: getVal(row, hMap, '個人主頁連結'),
           phone: phoneVal,
@@ -1582,39 +1635,101 @@ function ensureSecPayFormula(secSheet, hMap) {
 // ── createNewOrder ──
 function createNewOrder(data) {
   var timestamp = new Date();
-  var campaignName = data.campaignName || '';
-  // 優先用團的固定 id 解析出「現行團名」。即使買家頁面快取了舊團名，
-  // 只要帶了 id，就會對到改名後的正確表單，不會誤建新表。
-  var campaignId = data.tourId || data.campaignId || data.id || '';
-  if (campaignId) {
-    var resolvedName = findCatalogTourNameById(campaignId);
-    if (resolvedName) campaignName = resolvedName;
-  }
-  if (!campaignName) throw new Error('缺少開團名稱');
-  var orderId = data.orderId || makeOrderId(timestamp);
- 
+  // 買家送來的金額一律不採信：用 catalog 找出開團，依商品 id 與數量在伺服器端重算。
+  var tour = findOrderableTour(data.tourId || data.campaignId, data.campaignName);
+  var campaignName = getCatalogTourName(tour);
+  var order = buildServerOrder(tour, data);
+  var orderId = makeOrderId(timestamp);
+
   var ss = ensureCampaignSpreadsheet(campaignName);
-  setupCampaignSpreadsheet(ss, null, campaignName);
- 
-  writeOrderDetail(ss, data, timestamp, campaignName, orderId);
-  updateItemSummary(ss, data, campaignName);
-  writeSecondPayEntry(ss, data, orderId);
+  if (ss.__twtCreatedNow) setupCampaignSpreadsheet(ss, tour, campaignName);
+
+  writeOrderDetail(ss, order, timestamp, campaignName, orderId);
+  updateItemSummary(ss, order, campaignName);
+  writeSecondPayEntry(ss, order, orderId);
   return jsonResponse({ ok: true, status: 'success', orderId: orderId });
 }
 
-// 用團的固定 id 從目前 catalog 找出現行團名；找不到回空字串（交回呼叫端用 campaignName 後援）。
-function findCatalogTourNameById(id) {
-  id = String(id || '').trim();
-  if (!id) return '';
-  try {
-    var tours = getCatalogTours(readCatalogFromSettings());
-    for (var i = 0; i < tours.length; i++) {
-      if (String((tours[i] && tours[i].id) || '').trim() === id) return getCatalogTourName(tours[i]);
-    }
-  } catch (ignore) {}
-  return '';
+function findOrderableTour(tourId, campaignName) {
+  var tours = getCatalogTours(readCatalogFromSettings());
+  tourId = String(tourId || '').trim();
+  campaignName = String(campaignName || '').trim();
+  var tour = null;
+  for (var i = 0; i < tours.length && !tour; i++) {
+    if (tourId && String((tours[i] && tours[i].id) || '').trim() === tourId) tour = tours[i];
+  }
+  for (var j = 0; j < tours.length && !tour && !tourId; j++) {
+    if (campaignName && getCatalogTourName(tours[j]) === campaignName) tour = tours[j];
+  }
+  if (!tour) throw new Error('找不到這個開團，請重新整理頁面');
+  if (String(tour.status || 'open').toLowerCase() !== 'open') throw new Error('這個開團已停止收單');
+  if (!getCatalogTourName(tour)) throw new Error('開團缺少名稱');
+  return tour;
 }
- 
+
+function cleanText(v, maxLen) {
+  return String(v == null ? '' : v).trim().slice(0, maxLen);
+}
+
+// 依 catalog 價格建立訂單內容；明細格式與買家頁面一致：「【區塊】 商品 xN」。
+function buildServerOrder(tour, data) {
+  var items = Array.isArray(data.items) ? data.items : [];
+  if (!items.length) throw new Error('購物車是空的，請重新整理頁面後再下單');
+  var lines = [], total = 0, original = 0;
+  items.forEach(function(it) {
+    var qty = Number(it && it.qty);
+    if (!(qty >= 1 && qty <= 999 && Math.floor(qty) === qty)) throw new Error('商品數量不正確');
+    var sec = (tour.sections || []).filter(function(s) { return String(s.id) === String(it.sectionId); })[0];
+    var item = sec && (sec.items || []).filter(function(x) { return String(x.id) === String(it.itemId); })[0];
+    if (!item) throw new Error('商品已變更，請重新整理頁面');
+    total += (Number(item.twd) || 0) * qty;
+    original += (Number(item.original) || 0) * qty;
+    lines.push((sec.title ? '【' + sec.title + '】 ' : '') + item.name + ' x' + qty);
+  });
+
+  var socialName = cleanText(data.socialName, 100);
+  var phone = String(data.phone || '').replace(/\D/g, '');
+  var bank5 = String(data.bank5 || '').replace(/\D/g, '');
+  var remit = Number(String(data.remitAmount || '').replace(/[^\d.]/g, ''));
+  if (!socialName) throw new Error('請填寫社群帳號');
+  if (phone.length < 8 || phone.length > 15) throw new Error('手機號碼格式不正確');
+  if (bank5.length !== 5) throw new Error('匯款後五碼需為 5 位數字');
+  if (!(remit > 0)) throw new Error('請填寫正確的匯款金額');
+
+  var threshold = Number(tour.threshold || 0);
+  var cardCount = threshold > 0 ? Math.floor(original / threshold) : 0;
+  var cardSort = '', cardSortMode = '';
+  if (cardCount > 0) {
+    if (isRandomCardSortText(data.cardSortMode)) {
+      cardSortMode = '隨機分配';
+    } else {
+      // 只保留這個團真的有的成員名稱
+      var memberNames = (tour.cardMembers || []).map(function(m) { return String((m && m.name) || ''); });
+      cardSort = String(data.cardSort || '').split('>').map(function(s) { return s.trim(); })
+        .filter(function(s) { return memberNames.indexOf(s) >= 0; }).join(' > ');
+      if (cardSort) cardSortMode = '自選排序';
+    }
+  }
+
+  return {
+    socialName: socialName,
+    socialLink: cleanText(data.socialLink, 300),
+    phone: phone,
+    email: cleanText(data.email, 200),
+    orderDetails: lines.join('\n'),
+    totalAmount: total,
+    originalAmount: original,
+    remitAmount: remit,
+    bank5: bank5,
+    remark: cleanText(data.remark, 1000),
+    cardCount: cardCount,
+    cardSort: cardSort,
+    cardSortMode: cardSortMode,
+    priorityData: buildPriorityDataText(cardSort, cardSortMode, cardCount),
+    payStatus: 'pending'
+  };
+}
+
 function writeOrderDetail(ss, data, timestamp, campaignName, orderId) {
   var sheet = ss.getSheetByName(ORDER_SHEET);
   if (!sheet) sheet = ss.insertSheet(ORDER_SHEET, 0);
@@ -1881,6 +1996,8 @@ function uploadImage(data) {
     if (m) { mime = m[1]; base64 = m[2]; }
   }
   if (!base64) return jsonResponse({ ok: false, error: 'no image data' });
+  if (!/^image\/(jpeg|png|gif|webp)$/i.test(String(mime))) return jsonResponse({ ok: false, error: '只接受 JPG / PNG / GIF / WEBP 圖片' });
+  if (base64.length > 14000000) return jsonResponse({ ok: false, error: '圖片太大（上限約 10MB）' });
  
   var bytes = Utilities.base64Decode(base64);
   var ext = (String(mime).split('/')[1] || 'jpg').replace('jpeg', 'jpg');
@@ -1905,9 +2022,24 @@ function trashImages(data) {
   if ((!ids || !ids.length) && data.urls) ids = (data.urls || []).map(extractDriveId).filter(Boolean);
   var trashed = 0;
   (ids || []).forEach(function(id) {
-    try { DriveApp.getFileById(id).setTrashed(true); trashed++; } catch (ignore) {}
+    try { if (trashImageFile(id)) trashed++; } catch (ignore) {}
   });
   return jsonResponse({ ok: true, status: 'success', trashed: trashed });
+}
+
+// 只回收放在「TWT_代購平台_圖片」資料夾裡的檔案，其他 Drive 檔案一律不動。
+function trashImageFile(id) {
+  var folderId = PropertiesService.getScriptProperties().getProperty('__IMAGE_FOLDER__');
+  if (!folderId || !id) return false;
+  var file = DriveApp.getFileById(id);
+  var parents = file.getParents();
+  while (parents.hasNext()) {
+    if (parents.next().getId() === folderId) {
+      file.setTrashed(true);
+      return true;
+    }
+  }
+  return false;
 }
  
 function extractDriveId(u) {
