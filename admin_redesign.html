@@ -983,7 +983,7 @@ const ROLE_DEFS=[
 const DEFAULT_PALETTE={c1:'#7df725',c2:'#00b8a4',c3:'#7b5cff',c4:'#ff4f9a',c5:'#ffd84d'};
 let state={appData:{campaigns:[]},boardColumns:{titles:{...COL_TITLES},groups:[],storeDescription:'',brandName:'TWT',theme:null}};
 let editingId=null,dragCardId=null,selSwatch=null,lastPalette=[];
-let cloudOrders=[],reconMatches=[],allocationText='',payRows=[],secondRows=[];
+let cloudOrders=[],reconMatches=[],allocationRows=[],payRows=[],secondRows=[];
 let residualRows=[],residualDeleteTarget=null;
 let reconPage='system';
 let secondPage='weight';
@@ -1060,8 +1060,8 @@ function renderRoles(){
   ROLE_DEFS.forEach(r=>{const el=document.createElement('div');el.className='role';
     el.innerHTML=`<div class="chip" style="background:var(--${r.k})"></div>
       <div class="meta"><div class="nm">${r.nm}</div><div class="use">${r.use}</div></div>
-      <input type="color" value="${theme.palette[r.k]}" oninput="setRole('${r.k}',this.value)">
-      <input type="text" value="${theme.palette[r.k]}" oninput="setRole('${r.k}',this.value)" id="hex-${r.k}">
+      <input type="color" value="${esc(theme.palette[r.k])}" oninput="setRole('${r.k}',this.value)">
+      <input type="text" value="${esc(theme.palette[r.k])}" oninput="setRole('${r.k}',this.value)" id="hex-${r.k}">
       <button class="pull" onclick="pullSwatch('${r.k}')" title="把選中的色票放進此角色">插入所選</button>`;
     w.appendChild(el);});
 }
@@ -1180,7 +1180,8 @@ function saveEra(){const nm=(document.getElementById('eraInput').value||'').trim
   const eraEl=document.getElementById('eraName');if(eraEl)eraEl.textContent='Era · '+nm;persistTheme();renderEras();toast('已儲存 Era「'+nm+'」');}
 function renderEras(){const w=document.getElementById('eraRow');if(!w)return;w.innerHTML=theme.eras.length?'':'<span class="hint">尚無 Era</span>';
   theme.eras.forEach((e,i)=>{const el=document.createElement('div');el.className='era-card';
-    el.innerHTML=`<span class="strip" style="background:linear-gradient(110deg,${e.c1},${e.c2} 32%,${e.c3} 56%,${e.c4} 78%,${e.c5||e.c4})"></span>${e.name}<span class="x">×</span>`;
+    const ec=k=>esc(clampHex(e[k]||'')||'#999999');
+    el.innerHTML=`<span class="strip" style="background:linear-gradient(110deg,${ec('c1')},${ec('c2')} 32%,${ec('c3')} 56%,${ec('c4')} 78%,${ec(clampHex(e.c5||'')?'c5':'c4')})"></span>${esc(e.name)}<span class="x">×</span>`;
     el.onclick=ev=>{if(ev.target.classList.contains('x')){theme.eras.splice(i,1);persistTheme();renderEras();return;}
       theme.palette={c1:e.c1,c2:e.c2,c3:e.c3,c4:e.c4,c5:e.c5||e.c4};const eraEl=document.getElementById('eraName');if(eraEl)eraEl.textContent='Era · '+e.name;applyTheme();persistTheme();toast('已套用「'+e.name+'」');};
     w.appendChild(el);});}
@@ -1262,7 +1263,7 @@ function showView(v){document.querySelectorAll('.tab').forEach(n=>n.classList.to
 
 function cardProgressHtml(id,step=0){
   step=Number.isFinite(Number(step))?Number(step):0;
-  return `<div class="card-steps">${LOGI_STEPS.map((label,i)=>`<div class="card-step ${i<step?'done':''} ${i===step?'active':''}" onclick="setCardProgress(event,'${id}',${i})" title="設定為：${label}"><span class="step-round">${i+1}</span><span class="step-text">${label}</span></div>`).join('')}</div>`;
+  return `<div class="card-steps">${LOGI_STEPS.map((label,i)=>`<div class="card-step ${i<step?'done':''} ${i===step?'active':''}" onclick="setCardProgress(event,${jsArg(id)},${i})" title="設定為：${label}"><span class="step-round">${i+1}</span><span class="step-text">${label}</span></div>`).join('')}</div>`;
 }
 
 function renderBoard(){const board=document.getElementById('board');board.innerHTML='';
@@ -1279,7 +1280,7 @@ function renderBoard(){const board=document.getElementById('board');board.innerH
     board.appendChild(el);});}
 function cardEl(c,cvar,colKey){const el=document.createElement('div');el.className='pc';el.draggable=true;
   const group=state.boardColumns.groups.find(g=>g.id===c.groupId);
-  const cover=(c.covers&&c.covers[0])?`<img class="pc-cover" src="${c.covers[0]}">`:'';
+  const cover=(c.covers&&c.covers[0])?`<img class="pc-cover" src="${esc(c.covers[0])}">`:'';
   const isEndCard=c.status!=='instock'&&(isEndColumnTitle(state.boardColumns.titles[colKey]||'')||c.status==='ended');
   const prog=(c.status==='instock'||c.status==='open'||isEndCard)?'':cardProgressHtml(c.id,c.lStep||0);
   const tag=c.status==='open'?'<span class="tag open">開團</span>':(c.status==='instock'&&!isEndCard?'<span class="tag cur">賣場</span>':(isEndCard?'<span class="tag">團務結束</span>':''));
@@ -1305,7 +1306,7 @@ function openEditor(id){editingId=id;showView('editor');document.querySelectorAl
 function C(){return state.appData.campaigns.find(c=>c.id===editingId);}
 function field(k,v){C()[k]=v;saveLocal();}
 function renderEditor(){const c=C();if(!c){showView('board');return;}const v=document.getElementById('view-editor'),isStore=c.status==='instock';
-  const groupOpts=`<option value="">未分組</option>`+state.boardColumns.groups.map(g=>`<option value="${g.id}" ${c.groupId===g.id?'selected':''}>${esc(g.name)}</option>`).join('');
+  const groupOpts=`<option value="">未分組</option>`+state.boardColumns.groups.map(g=>`<option value="${esc(g.id)}" ${c.groupId===g.id?'selected':''}>${esc(g.name)}</option>`).join('');
   v.innerHTML=`<div class="ehead"><button class="back" onclick="showView('board')">←</button>
       <input class="ename" value="${esc(c.name)}" oninput="field('name',this.value)"><button class="btn danger sm" onclick="deleteCampaign()">刪除</button></div>
     <div class="panel"><div class="row">
@@ -1453,7 +1454,7 @@ async function deleteResidualCampaignSheet(){
   }
 }
 function renderThumbs(){const c=C(),w=document.getElementById('thumbs');w.innerHTML='';
-  (c.covers||[]).forEach((src,i)=>{const wrap=document.createElement('div');wrap.className='tw';wrap.innerHTML=`<img class="thumb" src="${src}"><button class="del" onclick="delCover(${i})">×</button>`;w.appendChild(wrap);});
+  (c.covers||[]).forEach((src,i)=>{const wrap=document.createElement('div');wrap.className='tw';wrap.innerHTML=`<img class="thumb" src="${esc(src)}"><button class="del" onclick="delCover(${i})">×</button>`;w.appendChild(wrap);});
   const add=document.createElement('button');add.className='add-thumb';add.textContent='＋';add.onclick=()=>pickImage(d=>{c.covers=c.covers||[];c.covers.push(d);saveLocal();renderThumbs();});w.appendChild(add);}
 function delCover(i){C().covers.splice(i,1);saveLocal();renderThumbs();}
 function addMember(){const el=document.getElementById('newMember'),v=(el.value||'').trim();if(!v)return;C().sortMembers.push(normalizeSortMember({name:v,random:false}));el.value='';el.focus();saveLocal();renderSortMembers();}
@@ -1492,7 +1493,7 @@ function renderSections(){
   w.innerHTML='';
   if(!c.sections.length)w.innerHTML='<p class="hint">尚無區塊，點右上角新增。</p>';
   c.sections.forEach((sec,si)=>{const el=document.createElement('div');el.className='section';
-    el.innerHTML=`<div class="shead"><span class="handle section-handle" title="拖曳排序">☰</span>${sec.img?`<img src="${sec.img}" style="width:34px;height:34px;border-radius:8px;object-fit:cover">`:''}
+    el.innerHTML=`<div class="shead"><span class="handle section-handle" title="拖曳排序">☰</span>${sec.img?`<img src="${esc(sec.img)}" style="width:34px;height:34px;border-radius:8px;object-fit:cover">`:''}
       <input class="sname" value="${esc(sec.name)}" oninput="C().sections[${si}].name=this.value;saveLocal()">
       <button class="mini" title="區塊圖片" onclick="secImg(${si})">📷</button><button class="mini" title="複製" onclick="dupSection(${si})">⧉</button><button class="mini del" title="刪除" onclick="delSection(${si})">🗑</button></div>
       <div class="row" style="margin-bottom:8px"><div style="flex:0 0 160px"><label class="lbl">區塊預設價（$ TWD）</label><input class="inp" type="number" value="${sec.defaultPrice||0}" oninput="C().sections[${si}].defaultPrice=+this.value;saveLocal()"></div>
@@ -1543,7 +1544,7 @@ function renderSections(){
 function renderProducts(si){const c=C(),sec=c.sections[si],w=document.getElementById('prods-'+si);w.innerHTML='';
   w.innerHTML=`<div class="prod-head"><span></span><span>圖片</span><span>商品名稱</span><span class="ph-num">$ TWD</span><span class="ph-num">${esc(currencySymbol(c.currency))} ${esc(c.currency)}</span><span class="ph-act">操作</span></div>`;
   sec.products.forEach((p,pi)=>{const row=document.createElement('div');row.className='prod';row.draggable=true;
-    row.innerHTML=`<span class="prod-handle" title="拖曳排序">☰</span>${p.img?`<img src="${p.img}">`:'<div class="noimg">·</div>'}<input class="pinp" value="${esc(p.name)}" oninput="setProd(${si},${pi},'name',this.value)">
+    row.innerHTML=`<span class="prod-handle" title="拖曳排序">☰</span>${p.img?`<img src="${esc(p.img)}">`:'<div class="noimg">·</div>'}<input class="pinp" value="${esc(p.name)}" oninput="setProd(${si},${pi},'name',this.value)">
       <input class="pinp pnum" type="number" value="${p.price||0}" oninput="setProd(${si},${pi},'price',+this.value)" title="TWD 價格">
       <input class="pinp pnum" type="number" value="${p.orig||0}" oninput="setProd(${si},${pi},'orig',+this.value)" title="原幣價格">
       <div class="prod-actions"><button class="mini" onclick="prodImg(${si},${pi})">📷</button><button class="mini del" onclick="C().sections[${si}].products[${pi}].img='';saveLocal();renderProducts(${si})">移圖</button><button class="mini del" onclick="delProduct(${si},${pi})">🗑</button></div>`;
@@ -1734,7 +1735,7 @@ function renderSecondWeightEditor(){
   box.innerHTML=c.sections.map((sec,si)=>{
     const products=Array.isArray(sec.products)?sec.products:[];
     const rows=products.length?products.map((p,pi)=>`<div class="second-weight-grid second-weight-row"><span class="handle">${pi+1}</span><span class="weight-name">${esc(p.name||'未命名商品')}</span><input class="inp second-weight-input" inputmode="decimal" type="number" step="0.001" value="${Number(p.weight||0)||''}" placeholder="0" oninput="setSecondProductWeight(${si},${pi},this.value)"></div>`).join(''):'<div class="second-weight-empty">此區塊尚無商品</div>';
-    return `<div class="second-weight-section"><div class="shead"><span class="handle">☰</span>${sec.img?`<img src="${sec.img}" style="width:34px;height:34px;border-radius:8px;object-fit:cover">`:''}<div class="sname" style="background:var(--surface);border:2px solid var(--stroke);border-radius:6px;padding:5px 8px">${esc(sec.name||'未命名區塊')}</div></div><div class="second-weight-apply"><div><label class="lbl">區塊預設重量 KG</label><input class="inp second-weight-input" inputmode="decimal" type="number" step="0.001" value="${Number(sec.defaultWeight||0)||''}" placeholder="0" oninput="setSecondSectionDefaultWeight(${si},this.value)"></div><button class="btn ghost sm" style="width:auto;white-space:nowrap" onclick="applySecondSectionWeight(${si})">套用到此區塊全部商品</button></div><div class="second-weight-grid head"><span>#</span><span>商品名稱</span><span>重量 KG</span></div>${rows}</div>`;
+    return `<div class="second-weight-section"><div class="shead"><span class="handle">☰</span>${sec.img?`<img src="${esc(sec.img)}" style="width:34px;height:34px;border-radius:8px;object-fit:cover">`:''}<div class="sname" style="background:var(--surface);border:2px solid var(--stroke);border-radius:6px;padding:5px 8px">${esc(sec.name||'未命名區塊')}</div></div><div class="second-weight-apply"><div><label class="lbl">區塊預設重量 KG</label><input class="inp second-weight-input" inputmode="decimal" type="number" step="0.001" value="${Number(sec.defaultWeight||0)||''}" placeholder="0" oninput="setSecondSectionDefaultWeight(${si},this.value)"></div><button class="btn ghost sm" style="width:auto;white-space:nowrap" onclick="applySecondSectionWeight(${si})">套用到此區塊全部商品</button></div><div class="second-weight-grid head"><span>#</span><span>商品名稱</span><span>重量 KG</span></div>${rows}</div>`;
   }).join('');
 }
 function secondWeightCampaignObj(){return findCampaignByName(selectedSecondWeightCampaign());}
@@ -1863,7 +1864,23 @@ function cleanPriorityText(o){
   }catch(_){/* keep plain text */}
   return raw.replace(/[,，]\s*/g,'\n').replace(/\s*[|｜]\s*/g,'\n');
 }
-function priorityForCsv(o){return cleanPriorityText(o).replace(/"/g,'""').replace(/\r?\n/g,' / ');}
+function priorityForCsv(o){return cleanPriorityText(o).replace(/\r?\n/g,' / ');}
+const ALLOC_CSV_HEAD=['清單序號','開團','顯示格式','顯示內容','SOCIAL NAME','PHONE NUMBER','滿額禮數量','分配方式','買家排序'];
+// 買家填的文字若以 = + - @ 開頭，Excel 會當成公式執行；前面加 ' 讓它只當文字。
+function csvSafeText(v){v=String(v==null?'':v).replace(/\r?\n/g,' / ');return /^[=+\-@\t\r]/.test(v)?"'"+v:v;}
+function csvCell(v){return '"'+String(v).replace(/"/g,'""')+'"';}
+// forExcel：手機寫成 ="0912345678"，Excel 才不會把開頭的 0 吃掉。
+function allocationCsv(forExcel){
+  const lines=[ALLOC_CSV_HEAD.map(csvCell).join(',')];
+  allocationRows.forEach(r=>lines.push(r.map((v,i)=>{
+    if(typeof v==='number')return String(v);
+    const isPhone=i===5||(i===3&&r[2]==='phone');
+    const ph=isPhone?String(v||'').replace(/\D/g,''):'';
+    if(ph)return forExcel?csvCell('="'+ph+'"'):csvCell(ph);
+    return csvCell(csvSafeText(v));
+  }).join(',')));
+  return lines.join('\r\n');
+}
 function allocTimeValue(o){const t=Date.parse(o.timestamp||'');return Number.isFinite(t)?t:0;}
 function sortAllocRows(rows,method){
   if(method==='random')return rows.map(x=>[Math.random(),x]).sort((a,b)=>a[0]-b[0]).map(x=>x[1]);
@@ -1915,12 +1932,13 @@ async function runAllocate(){
   rows=sortAllocRows(rows,method);
   if(limit>0)rows=rows.slice(0,limit);
   const totalCards=rows.reduce((sum,o)=>sum+orderCardCount(o),0),withCards=rows.filter(o=>orderCardCount(o)>0).length;
-  allocationText='清單序號,開團,顯示格式,顯示內容,SOCIAL NAME,PHONE NUMBER,滿額禮數量,分配方式,買家排序\n'+rows.map((o,i)=>`${i+1},"${String(o.tourName||o.campaignName||'').replace(/"/g,'""')}",${displayMode},"${String(allocDisplayValue(o,displayMode)).replace(/"/g,'""')}","${String(o.social||'').replace(/"/g,'""')}",${String(o.phone||'')},${orderCardCount(o)},"${String(o.cardSortMode||'').replace(/"/g,'""')}","${priorityForCsv(o)}"`).join('\n');
+  allocationRows=rows.map((o,i)=>[i+1,o.tourName||o.campaignName||'',displayMode,allocDisplayValue(o,displayMode),o.social||'',o.phone||'',orderCardCount(o),o.cardSortMode||'',priorityForCsv(o)]);
   const methodLabel=method==='random'?'隨機':method==='time'?'時間':'滿額禮';
   document.getElementById('allocResult').innerHTML=`<div class="stat-grid"><div class="stat"><b>${rows.length}</b><span>訂單筆數</span></div><div class="stat"><b>${withCards}</b><span>有滿額禮</span></div><div class="stat"><b>${totalCards}</b><span>滿額禮總數</span></div><div class="stat"><b>${methodLabel}</b><span>排序方式</span></div></div>`+(rows.length?`<div class="alloc-result-wrap">${rows.map((o,i)=>allocationCardHtml(o,i,displayMode)).join('')}</div>`:'<div class="empty">這個開團目前沒有訂單</div>');
 }
-function copy配位(){if(!allocationText)return toast('尚無配位清單');navigator.clipboard.writeText(allocationText);toast('已複製配位清單');}
-function export配位Csv(){if(!allocationText)return toast('尚無配位清單');const blob=new Blob([allocationText],{type:'text/csv;charset=utf-8'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);const cid=(document.getElementById('allocCampaign')?.value||'allocation').replace(/[\\/:*?"<>|]/g,'_');a.download='twt-allocation-'+cid+'.csv';a.click();}
+async function copy配位(){if(!allocationRows.length)return toast('尚無配位清單');try{await navigator.clipboard.writeText(allocationCsv(false));toast('已複製配位清單');}catch(e){toast('⚠️ 複製失敗，請改用匯出 CSV');}}
+// 開頭加 BOM（\uFEFF），Excel 才會用 UTF-8 開啟，中文不會變亂碼。
+function export配位Csv(){if(!allocationRows.length)return toast('尚無配位清單');const blob=new Blob(['\uFEFF'+allocationCsv(true)],{type:'text/csv;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;const cid=(document.getElementById('allocCampaign')?.value||'allocation').replace(/[\\/:*?"<>|]/g,'_');a.download='twt-allocation-'+cid+'.csv';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
 
 async function runQuery(){const q=(document.getElementById('qInput').value||'').trim(),box=document.getElementById('qResult');if(!q)return;
   box.innerHTML='<p class="hint">查詢中…</p>';let orders=[];
@@ -1941,7 +1959,9 @@ function pickImage(cb){const inp=document.createElement('input');inp.type='file'
 function exportJSON(){const blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='twt-backup-'+Date.now()+'.json';a.click();}
 function importJSON(file){if(!file)return;const fr=new FileReader();fr.onload=e=>{try{state=JSON.parse(e.target.result);saveLocal();renderAll();toast('已匯入');}catch(err){toast('檔案格式錯誤');}};fr.readAsText(file);}
 
-function esc(s){return(s==null?'':String(s)).replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));}
+function esc(s){return(s==null?'':String(s)).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+// 放進 onclick="fn(...)" 的字串參數：先轉成 JS 字串常值，再做 HTML 跳脫。
+function jsArg(v){return esc(JSON.stringify(String(v==null?'':v)));}
 function toast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._t);t._t=setTimeout(()=>t.classList.remove('show'),2200);}
 function modal(h){document.getElementById('modalBody').innerHTML=h;document.getElementById('overlay').classList.add('show');}
 function closeOverlay(){document.getElementById('overlay').classList.remove('show');}

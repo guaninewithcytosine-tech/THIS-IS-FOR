@@ -208,6 +208,11 @@ img{display:block}
 .member-rank-num{font-family:var(--disp);font-weight:900;font-size:16px;color:var(--c1);min-width:22px}
 .member-rank-name{flex:1;font-weight:800;font-size:13.5px}
 .member-rank-handle{color:var(--faint);font-size:16px}
+.rank-move{width:34px;height:34px;border-radius:7px;border:2px solid var(--stroke);background:var(--surface-2);font-size:12px;font-weight:900;display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:.1s;line-height:1}
+.rank-move:hover{background:var(--surface-3)}
+.rank-move:disabled{opacity:.3;cursor:default}
+.member-rank-row.dimmed .rank-move{pointer-events:none}
+@media(hover:none){.member-rank-handle{display:none}}
 .card-count-line{font-family:var(--disp);font-size:17px;font-weight:900;color:var(--ink);margin-bottom:6px}
 .card-threshold-info{font-size:13px;color:var(--dim);margin-bottom:10px;padding:8px 12px;background:var(--surface);border:1.5px solid var(--stroke);border-radius:var(--r-sm)}
 .no-sort-btn{width:100%;margin-top:8px;padding:9px;border-radius:var(--r-sm);border:2px dashed var(--stroke);background:transparent;font-size:13px;font-weight:800;color:var(--dim);cursor:pointer;transition:.12s}
@@ -322,7 +327,11 @@ let theme={mode:localStorage.getItem('twt-mode')||'light', palette:{}};
   applyTheme();
 })();
 
-function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+// 放進 onclick="fn(...)" 的字串參數：先轉成 JS 字串常值，再做 HTML 跳脫，名稱含引號也不會跑版或被注入程式。
+function jsArg(v){return esc(JSON.stringify(String(v??'')));}
+// 只允許 http(s) 連結，擋掉 javascript: 之類的網址。
+function safeUrl(u){u=String(u||'').trim();return /^https?:\/\//i.test(u)?u:'';}
 function toast(m,d=2600){const el=document.getElementById('toast');el.textContent=m;el.classList.add('show');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),d);}
 
 function switchTab(t){
@@ -348,7 +357,7 @@ function openDetail(tourId){
 
 function openStoreLink(tourId){
   const tour=(catalog?.appData?.tours||[]).find(t=>t.id===tourId);
-  const link=String(tour?.sellLink||'').trim();
+  const link=safeUrl(tour?.sellLink);
   if(!link){toast('目前沒有設定賣場連結');return;}
   window.open(link,'_blank','noopener');
 }
@@ -472,7 +481,7 @@ function renderList(tours, gridId){
     const filterWrap = document.getElementById('groupFilter');
     if(filterWrap && groups.length){
       filterWrap.innerHTML = groups.map(gr=>
-        `<button class="group-tag" onclick="filterGroup('${esc(gr)}')">${esc(gr)}</button>`
+        `<button class="group-tag" data-group="${esc(gr)}" onclick="filterGroup(${jsArg(gr)})">${esc(gr)}</button>`
       ).join('');
     }
   }
@@ -482,7 +491,7 @@ function renderList(tours, gridId){
 function filterGroup(gr){
   _activeGroup = _activeGroup === gr ? null : gr;
   document.querySelectorAll('.group-tag').forEach(b=>{
-    b.classList.toggle('active', b.textContent === gr && _activeGroup === gr);
+    b.classList.toggle('active', b.dataset.group === gr && _activeGroup === gr);
   });
   const filtered = _activeGroup
     ? _allShopTours.filter(t => t.group === _activeGroup)
@@ -657,7 +666,8 @@ function renderDetail(tour){
   const coverHtml=tour.coverImages?.length?`<img class="detail-cover" src="${esc(tour.coverImages[0])}" alt="${esc(tour.name)}">`:'';
   const tagHtml=isStorePageItem?`<span class="tag ${instockCat === 'group' ? 'tag-service' : 'tag-instock'}">${instockCategoryLabel(instockCat)}</span>`:`<span class="tag tag-open">收單中</span>`;
   const curTag='';
-  const linkHtml=tour.sellLink?`<a class="sell-link" href="${esc(tour.sellLink)}" target="_blank" rel="noopener"> 7-11 賣貨便 ↗</a>`:'';
+  const sellLink=safeUrl(tour.sellLink);
+  const linkHtml=sellLink?`<a class="sell-link" href="${esc(sellLink)}" target="_blank" rel="noopener"> 7-11 賣貨便 ↗</a>`:'';
   const remitHtml=(!isStorePageItem&&tour.paymentInfo)?`<div class="remit">${esc(tour.paymentInfo)}</div>`:'';
 
   let secHtml='';
@@ -678,9 +688,9 @@ function renderDetail(tour){
             ${p?`<div class="prod-price">${esc(p)}</div>`:''}
           </div>
           <div class="qty-wrap">
-            <button class="qty-btn" onclick="chg('${esc(tour.id)}','${esc(key)}',-1)">−</button>
+            <button class="qty-btn" onclick="chg(${jsArg(tour.id)},${jsArg(key)},-1)">−</button>
             <span class="qty-num" id="q-${esc(tour.id)}-${esc(key)}">${qty}</span>
-            <button class="qty-btn" onclick="chg('${esc(tour.id)}','${esc(key)}',1)">＋</button>
+            <button class="qty-btn" onclick="chg(${jsArg(tour.id)},${jsArg(key)},1)">＋</button>
           </div>
         </div>`;
       }).join('');
@@ -780,12 +790,14 @@ function openModal(){
         <div class="card-sort-title">滿額卡</div>
         <div class="card-count-line">${cardCount} 張</div>
         ${cardSortNote?`<div class="card-sort-note">${esc(cardSortNote)}</div>`:''}
-        <div class="card-sort-label">拖曳調整您的成員順位：</div>
+        <div class="card-sort-label">按 ▲▼ 或拖曳調整您的成員順位：</div>
         <div class="card-sort-members" id="cardSortMembers">
           ${members.map((m,i)=>`
             <div class="member-rank-row" draggable="true" data-idx="${i}" id="mr-${i}">
               <span class="member-rank-num">#${i+1}</span>
               <span class="member-rank-name">${esc(m.name)}</span>
+              <button type="button" class="rank-move" data-dir="-1" onclick="moveRank(${i},-1)" aria-label="往上移">▲</button>
+              <button type="button" class="rank-move" data-dir="1" onclick="moveRank(${i},1)" aria-label="往下移">▼</button>
               <span class="member-rank-handle">≡</span>
             </div>`).join('')}
         </div>
@@ -828,10 +840,33 @@ function toggleNoSort(){
     rows.forEach(r=>{r.classList.remove('dimmed');r.draggable=true;});
   }
 }
+// 依 window._rankOrder 重新排列成員列、更新序號，並停用最上面的 ▲ 與最下面的 ▼。
+function renderRankRows(){
+  const wrap=document.getElementById('cardSortMembers');
+  if(!wrap)return;
+  const rows=[...wrap.querySelectorAll('.member-rank-row')];
+  const order=window._rankOrder||[];
+  order.map(idx=>rows.find(r=>+r.dataset.idx===idx)).filter(Boolean).forEach((r,i)=>{
+    r.querySelector('.member-rank-num').textContent='#'+(i+1);
+    r.querySelector('.rank-move[data-dir="-1"]').disabled=i===0;
+    r.querySelector('.rank-move[data-dir="1"]').disabled=i===order.length-1;
+    wrap.appendChild(r);
+  });
+}
+// 手機無法拖曳，用 ▲▼ 按鈕移動一格。
+function moveRank(idx,delta){
+  if(window._noSort)return;
+  const arr=window._rankOrder||[];
+  const from=arr.indexOf(idx),to=from+delta;
+  if(from<0||to<0||to>=arr.length)return;
+  [arr[from],arr[to]]=[arr[to],arr[from]];
+  renderRankRows();
+}
 function initDragSort(){
   const wrap = document.getElementById('cardSortMembers');
   if(!wrap){ window._rankOrder = []; return; }
   window._rankOrder = [...wrap.querySelectorAll('.member-rank-row')].map(row=>+row.dataset.idx);
+  renderRankRows();
   let dragIdx = null;
   wrap.querySelectorAll('.member-rank-row').forEach(row=>{
     row.addEventListener('dragstart', e=>{
@@ -850,9 +885,7 @@ function initDragSort(){
       const arr=window._rankOrder;
       const from=arr.indexOf(dragIdx), to=arr.indexOf(toIdx);
       arr.splice(from,1);arr.splice(to,0,dragIdx);
-      const rows=[...wrap.querySelectorAll('.member-rank-row')];
-      const sorted=arr.map(idx=>rows.find(r=>+r.dataset.idx===idx));
-      sorted.forEach((r,i)=>{r.querySelector('.member-rank-num').textContent='#'+(i+1);wrap.appendChild(r);});
+      renderRankRows();
       dragIdx=null;
     });
   });
@@ -973,7 +1006,7 @@ function renderOrderSecondInfo(o){
 }
 function renderOrderSellLink(o,tour){
   const info=orderSecondInfo(o);
-  const link=String(firstFilled(o,['sellLink','storeLink','marketLink','sevenLink','sevenElevenLink','賣貨便連結'])||tour?.sellLink||'').trim();
+  const link=safeUrl(firstFilled(o,['sellLink','storeLink','marketLink','sevenLink','sevenElevenLink','賣貨便連結'])||tour?.sellLink);
   if(!link)return '';
   const step=tour?getBuyerLogiStep(tour):0;
   if(tour&&step<4&&!info.has)return '';
