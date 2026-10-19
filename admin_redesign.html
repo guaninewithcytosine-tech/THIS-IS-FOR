@@ -1320,7 +1320,7 @@ function renderEditor(){const c=C();if(!c){showView('board');return;}const v=doc
       ${isStore?'':`<label class="lbl" style="margin-top:14px">匯款說明</label><textarea class="txt bar-yellow" oninput="field('remitDesc',this.value)">${esc(c.remitDesc)}</textarea>`}
       <div class="row" style="margin-top:14px">
         <div><label class="lbl">7-11 賣貨便連結</label><input class="inp" value="${esc(c.link)}" oninput="field('link',this.value)"></div></div></div>
-    ${isStore?'':`<div class="panel"><div class="ptitle"><span class="ic">🃏</span>滿額禮</div>
+    ${isStore?'':`<div class="panel"><div class="ptitle">滿額禮</div>
       <div class="row" style="margin-bottom:14px"><div><label class="lbl">滿額門檻（${esc(currencySymbol(c.currency))} ${esc(c.currency)}）</label><input class="inp" type="number" value="${c.threshold||0}" oninput="field('threshold',+this.value)"></div>
         <div><label class="lbl">滿額禮名稱</label><input class="inp" value="${esc(c.giftName||'')}" placeholder="滿額禮" maxlength="20" oninput="field('giftName',this.value)"></div>
         <div><label class="lbl">單位</label><input class="inp" value="${esc(c.giftUnit||'')}" placeholder="份" maxlength="5" oninput="field('giftUnit',this.value)"></div></div>
@@ -1572,7 +1572,7 @@ function prodImg(si,pi){pickImage(d=>{C().sections[si].products[pi].img=d;saveLo
 function setCardProgress(ev,id,step){ev.stopPropagation();const c=state.appData.campaigns.find(x=>x.id===id);if(!c)return;c.lStep=step;saveLocal();renderBoard();}
 
 function normalizeOrder(o){const bank5=String(o.bank5||o.last5||'').replace(/\D/g,'');const num=v=>(v===''||v==null)?'':Number(v);const cardSort=String(o.cardSort||o.cardPriority||'').trim();const cardSortMode=String(o.cardSortMode||o.fullGiftMode||'').trim();const cardCount=Number(o.cardCount||o.card_count||o.fullGiftCount||o.fullGiftQty||o.giftCount||o.giftQty||0);let priorityData=String(o.priorityData||'').trim();if(!priorityData&&(cardCount||cardSort||cardSortMode)){priorityData=[cardCount?`滿額卡 x${cardCount}`:'',/隨機/.test(cardSortMode)?'隨機分配':(cardSort?`順位：${cardSort}`:'')].filter(Boolean).join(' | ');}return{orderId:String(o.orderId||''),campaignName:o.campaignName||o.tourName||'',tourName:o.tourName||o.campaignName||'',social:o.social||o.socialName||'',socialLink:o.socialLink||'',phone:String(o.phone||''),bank5,last5:bank5.slice(-5),systemTotal:Number(o.systemTotal||o.totalAmount||0),buyerPaid:Number(o.buyerPaid||o.remitAmount||0),originalTotal:Number(o.originalTotal||o.originalAmount||o.currencyTotal||0),orderDetails:o.orderDetails||o.details||'',priorityData,cardSort,cardSortMode,cardCount,payStatus:o.payStatus||'pending',weight:num(o.weight),intlShipping:num(o.intlShipping),packagingFee:num(o.packagingFee),secondPayment:num(o.secondPayment),secondPayStatus:o.secondPayStatus||'未收款',timestamp:o.timestamp||'',rowIndex:o.rowIndex,spreadsheetId:o.spreadsheetId};}
-function normTextForMatch(v){return String(v||'').replace(/[🃏🎲]/g,'').replace(/[\s　:：，,。．.()（）\[\]【】{}<>《》「」『』"'`]+/g,'').toLowerCase();}
+function normTextForMatch(v){return String(v||'').replace(/🎲/g,'').replace(/[\s　:：，,。．.()（）\[\]【】{}<>《》「」『』"'`]+/g,'').toLowerCase();}
 function findCampaignForOrder(o){const name=String(o.campaignName||o.tourName||'').trim();return (state.appData.campaigns||[]).find(c=>String(c.name||'').trim()===name)||null;}
 function catalogProductWeights(campaign){
   const rows=[];
