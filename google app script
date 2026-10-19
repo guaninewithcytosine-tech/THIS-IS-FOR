@@ -1019,7 +1019,7 @@ var UI_ROLE_LABELS = [
 ];
 
 var TOUR_HEADERS = ['團務名稱', '狀態', '團體', '幣別', '滿額門檻', '滿額禮名稱', '滿額禮單位', '團務進度', '賣場分類', '賣貨便連結',
-  '開團說明', '匯款說明', '排序說明', '排序成員', '封面圖', '團務ID（系統用）'];
+  '開團說明', '匯款說明', '排序說明', '排序方式', '排序成員', '封面圖', '團務ID（系統用）'];
 var TOUR_HEADER_ALIASES = { '團務名稱': ['開團名稱'], '團務ID（系統用）': ['開團ID（系統用）'] };
 var TOUR_NUMBER_COLS = ['滿額門檻'];
 var TOUR_WRAP_COLS = ['開團說明', '匯款說明', '排序說明', '排序成員', '封面圖'];
@@ -1131,6 +1131,7 @@ function readStoredTours(ss) {
         giftUnit: cellText(get('滿額禮單位')).trim(),
         sellLink: cellText(get('賣貨便連結')).trim(),
         cardSortNote: cellText(get('排序說明')),
+        cardSortRandom: /隨機/.test(cellText(get('排序方式'))),
         cardMembers: splitLines(get('排序成員')).map(function(n) { return { name: n, random: false }; }),
         lStep: stepIdx >= 0 ? stepIdx : clampStep(progress)
       });
@@ -1149,6 +1150,7 @@ function tourToRow(t) {
     Number(t.threshold || 0), t.giftName || '', t.giftUnit || '', showStep ? LOGI_STEP_LABELS[clampStep(t.lStep)] : '',
     STORE_CATEGORY_LABELS[t.storeCategory] || '', t.sellLink || '',
     t.description || '', t.paymentInfo || '', t.cardSortNote || '',
+    t.cardSortRandom ? '隨機分配' : ((t.cardMembers || []).length ? '買家排序' : ''),
     (t.cardMembers || []).map(function(m) { return typeof m === 'string' ? m : (m && m.name) || ''; }).filter(Boolean).join('\n'),
     (t.coverImages || []).join('\n'), t.id || ''
   ];
@@ -2097,7 +2099,8 @@ function buildServerOrder(tour, data) {
   var cardCount = threshold > 0 ? Math.floor(original / threshold) : 0;
   var cardSort = '', cardSortMode = '';
   if (cardCount > 0) {
-    if (isRandomCardSortText(data.cardSortMode)) {
+    // 後台設定隨機分配時，不論買家送什麼都記為隨機
+    if (tour.cardSortRandom || isRandomCardSortText(data.cardSortMode)) {
       cardSortMode = '隨機分配';
     } else {
       // 只保留這個團真的有的成員名稱

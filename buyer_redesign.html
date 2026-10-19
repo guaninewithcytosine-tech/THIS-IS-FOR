@@ -788,7 +788,9 @@ function openModal(){
   const threshold = Number(tour.threshold || 0);
   // 自動計算份數：原幣金額 ÷ 門檻，無條件捨去
 
-  window._noSort = false;
+  // 後台設定「隨機分配」→ 不給買家排序，訂單一律記為隨機分配
+  const randomOnly = !!tour.cardSortRandom;
+  window._noSort = randomOnly;
   window._rankOrder = members.map((_,i)=>i);
 
   const cur = (CUR[tour.currency]||{s:'',l:tour.currency||''});
@@ -805,8 +807,8 @@ function openModal(){
         <div class="card-count-line">0 ${esc(giftUnit(tour))}</div>
       </div>`;
   } else if(threshold > 0 && cardCount > 0){
-    if(members.length === 0){
-      // 有門檻、無成員 → 只顯示份數
+    if(members.length === 0 || randomOnly){
+      // 有門檻、無成員或後台設定隨機分配 → 只顯示份數
       cardBlock = `<div class="card-sort-block">
         <div class="card-sort-title">${esc(giftName(tour))}</div>
         <div class="card-count-line">${cardCount} ${esc(giftUnit(tour))}</div>
