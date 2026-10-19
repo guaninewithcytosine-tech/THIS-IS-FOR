@@ -464,12 +464,14 @@ function fmtNum(n){return Number(n||0).toLocaleString('en-US',{maximumFractionDi
 function origMoney(n,currency){const c=CUR[currency]||{s:'',l:currency||''};return `${c.s}${fmtNum(n)} ${c.l}`.trim();}
 // 幣別是台幣以外時，才另外顯示原幣金額
 function showOriginal(currency){return !!currency&&String(currency).toUpperCase()!=='TWD';}
-// 滿額卡：依原幣總額計算張數，以及再差多少可以多 1 張；沒有設定門檻時回傳 null
+// 滿額禮名稱與單位：各團在後台自己設定，沒填就用「滿額禮」「份」
+function giftName(tour){return String(tour?.giftName||'').trim()||'滿額禮';}
+function giftUnit(tour){return String(tour?.giftUnit||'').trim()||'份';}
+// 滿額禮：依原幣總額計算份數；沒有設定門檻時回傳 null
 function cardInfo(tour,origAmount){
   const th=Number(tour?.threshold||0);
   if(!(th>0))return null;
-  const amt=Number(origAmount||0);
-  return{threshold:th,count:Math.floor(amt/th),need:th-(amt%th)};
+  return{threshold:th,count:Math.floor(Number(origAmount||0)/th)};
 }
 function priceStr(item,currency){
   const parts=[];
@@ -683,7 +685,7 @@ function renderDetail(tour){
   const linkHtml=sellLink?`<a class="sell-link" href="${esc(sellLink)}" target="_blank" rel="noopener"> 7-11 賣貨便 ↗</a>`:'';
   const remitHtml=(!isStorePageItem&&tour.paymentInfo)?`<div class="remit">${esc(tour.paymentInfo)}</div>`:'';
   const cardRule=cardInfo(tour,0);
-  const cardRuleHtml=(!isStorePageItem&&cardRule)?`<div class="card-threshold-info">滿額卡：原幣每滿 ${esc(origMoney(cardRule.threshold,tour.currency))} 可得 1 張</div>`:'';
+  const cardRuleHtml=(!isStorePageItem&&cardRule)?`<div class="card-threshold-info">${esc(giftName(tour))}：原幣每滿 ${esc(origMoney(cardRule.threshold,tour.currency))} 可得 1 ${esc(giftUnit(tour))}</div>`:'';
 
   let secHtml='';
   if(!isStorePageItem&&tour.sections?.length){
@@ -767,7 +769,7 @@ function updateBar(){
   const subs=[];
   if(origAmount&&showOriginal(tour.currency))subs.push('原幣 '+origMoney(origAmount,tour.currency));
   const ci=cardInfo(tour,origAmount);
-  if(ci)subs.push(`滿額卡 ${ci.count} 張（再 ${origMoney(ci.need,tour.currency)} 多 1 張）`);
+  if(ci)subs.push(`${giftName(tour)} ${ci.count} ${giftUnit(tour)}`);
   document.getElementById('cartInfo').innerHTML=`<b>${count}</b> 件已選${amount?'・共 $ '+fmtNum(amount)+' TWD':''}${subs.length?`<div class="cart-sub">${esc(subs.join('・'))}</div>`:''}`;
 }
 
@@ -779,47 +781,42 @@ function openModal(){
   // 匯款資訊
   const remitBlock = tour.paymentInfo
     ? `<div class="remit">${esc(tour.paymentInfo)}</div>` : '';
-  // 滿額卡排序
+  // 滿額禮排序
   const members = (tour.cardMembers || []).filter(m=>!m.random);
   const hasCard = members.length > 0;
   const cardSortNote = tour.cardSortNote || '';
   const threshold = Number(tour.threshold || 0);
-  // 自動計算張數：金額 ÷ 門檻，無條件捨去
+  // 自動計算份數：原幣金額 ÷ 門檻，無條件捨去
 
   window._noSort = false;
   window._rankOrder = members.map((_,i)=>i);
 
   const cur = (CUR[tour.currency]||{s:'',l:tour.currency||''});
-  // 無門檻 → 完全不顯示滿額卡
-  // 有門檻才計算張數
+  // 無門檻 → 完全不顯示滿額禮
+  // 有門檻才計算份數
   const cardCount = (threshold > 0 && origAmount >= threshold)
     ? Math.floor(origAmount / threshold) : 0;
 
   let cardBlock = '';
-  const ci = cardInfo(tour, origAmount);
-  const ruleLine = ci ? `<div class="card-threshold-info">原幣每滿 ${esc(origMoney(ci.threshold, tour.currency))} 可得 1 張・再 ${esc(origMoney(ci.need, tour.currency))} 可多 1 張</div>` : '';
   if(threshold > 0 && cardCount === 0){
-    // 有門檻但還沒達到 → 顯示 0 張與還差多少
+    // 有門檻但還沒達到 → 顯示 0 份
     cardBlock = `<div class="card-sort-block">
-        <div class="card-sort-title">滿額卡</div>
-        <div class="card-count-line">0 張</div>
-        ${ruleLine}
+        <div class="card-sort-title">${esc(giftName(tour))}</div>
+        <div class="card-count-line">0 ${esc(giftUnit(tour))}</div>
       </div>`;
   } else if(threshold > 0 && cardCount > 0){
     if(members.length === 0){
-      // 有門檻、無成員 → 只顯示張數
+      // 有門檻、無成員 → 只顯示份數
       cardBlock = `<div class="card-sort-block">
-        <div class="card-sort-title">滿額卡</div>
-        <div class="card-count-line">${cardCount} 張</div>
-        ${ruleLine}
+        <div class="card-sort-title">${esc(giftName(tour))}</div>
+        <div class="card-count-line">${cardCount} ${esc(giftUnit(tour))}</div>
         ${cardSortNote?`<div class="card-sort-note">${esc(cardSortNote)}</div>`:''}
       </div>`;
     } else {
-      // 有門檻、有成員 → 張數 + 拖曳排序 + 不排序選項
+      // 有門檻、有成員 → 份數 + 拖曳排序 + 不排序選項
       cardBlock = `<div class="card-sort-block">
-        <div class="card-sort-title">滿額卡</div>
-        <div class="card-count-line">${cardCount} 張</div>
-        ${ruleLine}
+        <div class="card-sort-title">${esc(giftName(tour))}</div>
+        <div class="card-count-line">${cardCount} ${esc(giftUnit(tour))}</div>
         ${cardSortNote?`<div class="card-sort-note">${esc(cardSortNote)}</div>`:''}
         <div class="card-sort-label">按住 ≡ 拖曳，或按 ▲▼ 調整您的成員順位：</div>
         <div class="card-sort-members" id="cardSortMembers">
@@ -984,7 +981,7 @@ async function submitOrder(){
         cardSortMode='自選排序';
       }
     }
-    // 金額、明細與滿額卡張數由伺服器依商品目錄重新計算，這裡只送商品 id 與數量。
+    // 金額、明細與滿額禮份數由伺服器依商品目錄重新計算，這裡只送商品 id 與數量。
     const items=Object.entries(cart[activeId]||{}).map(([key,qty])=>{
       const[sectionId,itemId]=key.split('__');
       return{sectionId,itemId,qty};
@@ -1099,7 +1096,7 @@ async function runQuery(){
         <div class="o-row"><b>明細：</b>${esc(orderDetails||'')}</div>
         ${totalAmount?`<div class="o-row"><b>金額：</b>$ ${esc(totalAmount)} TWD</div>`:''}
         ${origAmount&&tour&&showOriginal(tour.currency)?`<div class="o-row"><b>原幣：</b>${esc(origMoney(origAmount,tour.currency))}</div>`:''}
-        ${cards>0?`<div class="o-row"><b>滿額卡：</b>${cards} 張</div>`:''}
+        ${cards>0?`<div class="o-row"><b>${esc(giftName(tour))}：</b>${cards} ${esc(giftUnit(tour))}</div>`:''}
         ${secondHtml}
         ${sellLinkHtml}
         ${logiHtml}

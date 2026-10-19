@@ -1018,7 +1018,7 @@ var UI_ROLE_LABELS = [
   ['brand', '店名顏色'], ['logiActive', '團務進度條'], ['cardRankNum', '順位編號顏色']
 ];
 
-var TOUR_HEADERS = ['團務名稱', '狀態', '團體', '幣別', '滿額門檻', '團務進度', '賣場分類', '賣貨便連結',
+var TOUR_HEADERS = ['團務名稱', '狀態', '團體', '幣別', '滿額門檻', '滿額禮名稱', '滿額禮單位', '團務進度', '賣場分類', '賣貨便連結',
   '開團說明', '匯款說明', '排序說明', '排序成員', '封面圖', '團務ID（系統用）'];
 var TOUR_HEADER_ALIASES = { '團務名稱': ['開團名稱'], '團務ID（系統用）': ['開團ID（系統用）'] };
 var TOUR_NUMBER_COLS = ['滿額門檻'];
@@ -1127,6 +1127,8 @@ function readStoredTours(ss) {
         paymentInfo: cellText(get('匯款說明')),
         currency: cellText(get('幣別')).trim().toUpperCase() || 'JPY',
         threshold: cellNumber(get('滿額門檻')),
+        giftName: cellText(get('滿額禮名稱')).trim(),
+        giftUnit: cellText(get('滿額禮單位')).trim(),
         sellLink: cellText(get('賣貨便連結')).trim(),
         cardSortNote: cellText(get('排序說明')),
         cardMembers: splitLines(get('排序成員')).map(function(n) { return { name: n, random: false }; }),
@@ -1144,7 +1146,7 @@ function tourToRow(t) {
   var showStep = status === 'closed' || status === 'sorting' || status === 'ended' || status === 'deleted';
   return [
     getCatalogTourName(t), STATUS_LABELS[status] || status, t.group || '', t.currency || '',
-    Number(t.threshold || 0), showStep ? LOGI_STEP_LABELS[clampStep(t.lStep)] : '',
+    Number(t.threshold || 0), t.giftName || '', t.giftUnit || '', showStep ? LOGI_STEP_LABELS[clampStep(t.lStep)] : '',
     STORE_CATEGORY_LABELS[t.storeCategory] || '', t.sellLink || '',
     t.description || '', t.paymentInfo || '', t.cardSortNote || '',
     (t.cardMembers || []).map(function(m) { return typeof m === 'string' ? m : (m && m.name) || ''; }).filter(Boolean).join('\n'),
