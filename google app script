@@ -263,6 +263,33 @@ function buildPriorityDataText(cardSort, cardSortMode, cardCount) {
   return parts.join(' | ');
 }
  
+// ── 試算表選單：TWT 代購 → 整理系統設定 ──
+// 打開主控表時在上方選單列加入「TWT 代購」。不必透過後台儲存，直接把「系統設定」A1 的舊資料
+// 整理成新格式（系統設定／團務資料／各團的商品清單），並更新團務索引表單。
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('TWT 代購')
+    .addItem('整理系統設定', 'tidySettingsSheet')
+    .addToUi();
+}
+
+function tidySettingsSheet() {
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    _catalogMemo = null;
+    var catalog = readCatalogFromSettings();
+    var report = ensureCampaignSheetsFromCatalog(catalog);
+    writeCatalog(catalog);
+    refreshCampaignIndex(report);
+    SpreadsheetApp.flush();
+    var msg = '整理完成：' + getCatalogTours(catalog).length + ' 個團已放到「' + TOUR_SHEET + '」';
+    try { getMainSpreadsheetOrThrow().toast(msg, 'TWT 代購', 8); } catch (ignore) {}
+    return msg;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
 // ── doGet ──
 var PUBLIC_GET_ACTIONS = { '': true, 'queryOrders': true };
 var WRITE_GET_ACTIONS = { 'createCampaignSheets': true, 'rebuildItemSummaries': true, 'backfillOrderCardFields': true, 'normalizeOrderSheets': true, 'upgradeFormulas': true };
