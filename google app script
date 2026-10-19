@@ -338,6 +338,8 @@ function handleGet(action, params) {
               socialName: o.socialName,
               orderDetails: o.orderDetails,
               totalAmount: o.totalAmount,
+              originalAmount: o.originalAmount,
+              cardCount: o.cardCount,
               payStatus: o.payStatus,
               secondPayment: o.secondPayment,
               secondPayStatus: o.secondPayStatus
