@@ -869,17 +869,19 @@ function toggleNoSort(){
     rows.forEach(r=>r.classList.remove('dimmed'));
   }
 }
-// 依 window._rankOrder 重新排列成員列、更新序號，並停用最上面的 ▲ 與最下面的 ▼。
+// 依 window._rankOrder 排列成員列、更新序號，並停用最上面的 ▲ 與最下面的 ▼。
+// 順序已經一樣時不搬動任何列（拖曳中被手指按住的那一列不能被拿出畫面，否則手機會中斷拖曳）。
 function renderRankRows(){
   const wrap=document.getElementById('cardSortMembers');
   if(!wrap)return;
   const rows=[...wrap.querySelectorAll('.member-rank-row')];
   const order=window._rankOrder||[];
-  order.map(idx=>rows.find(r=>+r.dataset.idx===idx)).filter(Boolean).forEach((r,i)=>{
+  const sorted=order.map(idx=>rows.find(r=>+r.dataset.idx===idx)).filter(Boolean);
+  if(sorted.some((r,i)=>rows[i]!==r))sorted.forEach(r=>wrap.appendChild(r));
+  sorted.forEach((r,i)=>{
     r.querySelector('.member-rank-num').textContent='#'+(i+1);
     r.querySelector('.rank-move[data-dir="-1"]').disabled=i===0;
-    r.querySelector('.rank-move[data-dir="1"]').disabled=i===order.length-1;
-    wrap.appendChild(r);
+    r.querySelector('.rank-move[data-dir="1"]').disabled=i===sorted.length-1;
   });
 }
 // ▲▼ 按鈕：移動一格。
@@ -894,54 +896,68 @@ function moveRank(idx,delta){
 // 拖曳排序用 Pointer Events，手指和滑鼠都能用（瀏覽器內建的 draggable 拖放在手機上大多不支援）。
 // 觸控只能從 ≡ 開始拖（≡ 設了 touch-action:none，拖的時候頁面不會跟著捲動；其他地方照常可以滑動捲動）；
 // 滑鼠可以從整列任何位置拖，按鈕除外。
+let _rankDrag=null;
 function initDragSort(){
+  endRankDrag();
   const wrap = document.getElementById('cardSortMembers');
   if(!wrap){ window._rankOrder = []; return; }
   window._rankOrder = [...wrap.querySelectorAll('.member-rank-row')].map(row=>+row.dataset.idx);
   renderRankRows();
-  let drag = null;
   wrap.addEventListener('pointerdown', e=>{
-    if(window._noSort || drag || (e.pointerType==='mouse' && e.button!==0))return;
+    if(window._noSort || (e.pointerType==='mouse' && e.button!==0))return;
     const row = e.target.closest('.member-rank-row');
     if(!row || e.target.closest('button'))return;
     if(e.pointerType!=='mouse' && !e.target.closest('.member-rank-handle'))return;
     e.preventDefault();
-    drag = {row, idx:+row.dataset.idx, id:e.pointerId};
-    row.classList.add('dragging');
-    // 鎖定在不會被搬動的外層容器，列重新排序時才不會中斷拖曳
-    try{ wrap.setPointerCapture(e.pointerId); }catch(_){}
+    startRankDrag(wrap, row, e.pointerId);
   });
-  wrap.addEventListener('pointermove', e=>{
-    if(!drag || e.pointerId!==drag.id)return;
+}
+function startRankDrag(wrap, row, pointerId){
+  endRankDrag(); // 上一次沒正常結束的拖曳先清掉，不會卡住
+  const mid = el=>{ const b=el.getBoundingClientRect(); return b.top + b.height/2; };
+  const move = e=>{
+    if(e.pointerId!==pointerId)return;
     e.preventDefault();
     const y = e.clientY;
-    // 手指拖到清單可視範圍邊緣時，自動捲動訂單視窗
+    // 手指拖到訂單視窗上下邊緣時自動捲動
     const modal = document.getElementById('modalBody');
     if(modal){
       const mr = modal.getBoundingClientRect();
       if(y < mr.top + 48) modal.scrollTop -= 12;
       else if(y > mr.bottom - 48) modal.scrollTop += 12;
     }
-    // 目標位置 = 中線在手指上方的其他列數量
-    const others = [...wrap.querySelectorAll('.member-rank-row')].filter(r=>r!==drag.row);
-    let target = 0;
-    others.forEach(r=>{ const b=r.getBoundingClientRect(); if(y > b.top + b.height/2) target++; });
-    const arr = window._rankOrder;
-    const from = arr.indexOf(drag.idx);
-    if(from<0 || from===target)return;
-    arr.splice(from,1); arr.splice(target,0,drag.idx);
-    renderRankRows();
-  });
-  const end = e=>{
-    if(!drag || e.pointerId!==drag.id)return;
-    drag.row.classList.remove('dragging');
-    try{ wrap.releasePointerCapture(e.pointerId); }catch(_){}
-    drag = null;
+    // 被拖的這一列不動，把它旁邊的列搬到它的另一側
+    let moved = false, guard = 0;
+    while(guard++ < 100){
+      const next = row.nextElementSibling, prev = row.previousElementSibling;
+      if(next && y > mid(next)){ wrap.insertBefore(next, row); moved = true; }
+      else if(prev && y < mid(prev)){ wrap.insertBefore(prev, row.nextElementSibling); moved = true; }
+      else break;
+    }
+    if(moved){
+      window._rankOrder = [...wrap.querySelectorAll('.member-rank-row')].map(r=>+r.dataset.idx);
+      renderRankRows();
+    }
   };
-  wrap.addEventListener('pointerup', end);
-  wrap.addEventListener('pointercancel', end);
+  const up = e=>{ if(e.pointerId===pointerId) endRankDrag(); };
+  // 監聽整個視窗：手指在哪裡放開、或瀏覽器取消拖曳，都一定收得到
+  window.addEventListener('pointermove', move, {passive:false});
+  window.addEventListener('pointerup', up);
+  window.addEventListener('pointercancel', up);
+  row.classList.add('dragging');
+  try{ row.setPointerCapture(pointerId); }catch(_){}
+  _rankDrag = {row, pointerId, move, up};
 }
-function closeModal(){window._rankOrder=[];window._noSort=false;document.getElementById('overlay').classList.remove('show');}
+function endRankDrag(){
+  if(!_rankDrag)return;
+  const d = _rankDrag; _rankDrag = null;
+  window.removeEventListener('pointermove', d.move, {passive:false});
+  window.removeEventListener('pointerup', d.up);
+  window.removeEventListener('pointercancel', d.up);
+  d.row.classList.remove('dragging');
+  try{ d.row.releasePointerCapture(d.pointerId); }catch(_){}
+}
+function closeModal(){endRankDrag();window._rankOrder=[];window._noSort=false;document.getElementById('overlay').classList.remove('show');}
 
 async function submitOrder(){
   const s=document.getElementById('fs')?.value.trim();
