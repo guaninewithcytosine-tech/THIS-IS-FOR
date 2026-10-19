@@ -300,7 +300,7 @@ function tidySettingsSheet() {
 // ・付款狀態、二補收款狀態：雙向同步（在 Notion 改會寫回 Google Sheet；在後台改會更新到 Notion）
 // ・其他欄位：單向，由系統寫到 Notion
 // ・每 10 分鐘自動同步一次；選單「TWT 代購 → Notion 對帳：立即同步」可馬上同步
-// 使用 Notion API 2025-09-03（資料庫底下的 data source）。
+// 使用 Notion API 2025-09-03（資料庫底下的 data source）。Notion 現在把「整合」改稱「連接」。
 // ══════════════════════════════════════════
 var NOTION_API = 'https://api.notion.com/v1/';
 var NOTION_VERSION = '2025-09-03';
@@ -336,7 +336,7 @@ function notionSchema() {
 // ── Notion API ──
 function notionFetch(method, path, body) {
   var token = PropertiesService.getScriptProperties().getProperty(NOTION_TOKEN_KEY);
-  if (!token) throw new Error('尚未設定 Notion 密鑰');
+  if (!token) throw new Error('尚未設定 Notion 存取權杖');
   for (var attempt = 0; attempt < 4; attempt++) {
     var options = {
       method: method,
@@ -355,8 +355,8 @@ function notionFetch(method, path, body) {
     var json = {};
     try { json = JSON.parse(res.getContentText() || '{}'); } catch (ignore) {}
     if (code >= 400) {
-      if (code === 401) throw new Error('Notion 密鑰不正確或已失效');
-      if (code === 404) throw new Error('Notion 找不到這個頁面或資料庫：請在 Notion 頁面右上角「⋯ → 連結」加入你的整合');
+      if (code === 401) throw new Error('Notion 存取權杖不正確或已失效');
+      if (code === 404) throw new Error('Notion 找不到這個頁面或資料庫：請在 Notion 頁面右上角「⋯ → 連接」加入你建立的連接');
       throw new Error('Notion ' + code + '：' + (json.message || ''));
     }
     return json;
@@ -374,7 +374,7 @@ function extractNotionId(text) {
 }
 
 function notionCreateDatabase(pageId) {
-  notionFetch('get', 'pages/' + pageId); // 先確認頁面已經連結到整合
+  notionFetch('get', 'pages/' + pageId); // 先確認頁面已經加入連接
   var db = notionFetch('post', 'databases', {
     parent: { type: 'page_id', page_id: pageId },
     title: [{ type: 'text', text: { content: 'TWT 訂單對帳' } }],
@@ -409,11 +409,11 @@ function installNotionTrigger() {
 // ── 選單 ──
 function notionSetup() {
   var ui = SpreadsheetApp.getUi();
-  var r1 = ui.prompt('Notion 對帳設定（1/2）', '貼上 Notion 整合的「內部整合密鑰」（ntn_ 開頭）', ui.ButtonSet.OK_CANCEL);
+  var r1 = ui.prompt('Notion 對帳設定（1/2）', '貼上 Notion 連接的存取權杖（開發人員工具 → 連接 → 你建立的連接 → 設定／Configuration）', ui.ButtonSet.OK_CANCEL);
   if (r1.getSelectedButton() !== ui.Button.OK) return;
   var token = String(r1.getResponseText() || '').trim();
-  if (!token) return ui.alert('沒有輸入密鑰');
-  var r2 = ui.prompt('Notion 對帳設定（2/2）', '貼上要放對帳資料庫的 Notion 頁面連結（這個頁面要先「⋯ → 連結」加入你的整合）', ui.ButtonSet.OK_CANCEL);
+  if (!token) return ui.alert('沒有輸入存取權杖');
+  var r2 = ui.prompt('Notion 對帳設定（2/2）', '貼上要放對帳資料庫的 Notion 頁面連結（這個頁面要先在右上角「⋯ → 連接」加入你建立的連接）', ui.ButtonSet.OK_CANCEL);
   if (r2.getSelectedButton() !== ui.Button.OK) return;
   var pageId = extractNotionId(r2.getResponseText());
   if (!pageId) return ui.alert('看不出這是 Notion 頁面連結，請在 Notion 頁面按「分享 → 複製連結」再貼上');
@@ -675,7 +675,7 @@ function syncNotion() {
       } catch (e) {
         report.errors.push((o.socialName || o.orderId) + '：' + e.message);
         if (base) nextState[o.orderId] = base;
-        if (/密鑰|找不到/.test(e.message)) break; // 設定有問題，後面的也不會成功
+        if (/權杖|找不到/.test(e.message)) break; // 設定有問題，後面的也不會成功
       }
     }
     saveNotionState(nextState);
