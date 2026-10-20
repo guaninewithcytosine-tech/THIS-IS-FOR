@@ -1244,6 +1244,8 @@ function syncNotion() {
         if (e.status === 401) break;
       }
     }
+    // 順便更新團務索引表單的數字（包含在 Notion 改的付款狀態、自動算好的二補）
+    try { withShortLock(function() { updateCampaignIndexRows(Object.keys(byCamp), orders); }); } catch (ignore) {}
   } finally {
     saveChunked(NOTION_CAMPS_KEY, map);
     saveChunked(NOTION_STATE_KEY, state);
@@ -1450,22 +1452,30 @@ function doPost(e) {
   return withScriptLock(function() { return handlePost(action, data); });
 }
 
+// 後台改了付款或二補後，更新那幾個團在索引表單的數字；失敗也不影響原本的動作
+function touchIndex(campaignNames) {
+  try { updateCampaignIndexRows(campaignSheetIds(campaignNames)); } catch (ignore) {}
+}
+
 function handlePost(action, data) {
   try {
     switch (action) {
       case 'updatePayStatus':
         updatePayStatus(data.campaignName || data.tourName, data.orderId, data.status || data.payStatus, data.bank5 || data.last5);
+        touchIndex([data.campaignName || data.tourName]);
         return jsonResponse({ ok: true, status: 'success' });
       case 'batchUpdatePayStatus':
         (data.updates || []).forEach(function(u) {
           updatePayStatus(u.campaignName || u.tourName, u.orderId, u.status || u.payStatus || 'paid', u.bank5 || u.last5);
         });
+        touchIndex((data.updates || []).map(function(u) { return u.campaignName || u.tourName; }));
         return jsonResponse({ ok: true, status: 'success', count: (data.updates || []).length });
       case 'batchUpdateSecondPayment':
         (data.updates || []).forEach(function(u) {
           updateSecondPaymentLogic(u.campaignName || u.tourName, u.orderId, u.weight, u.intlShipping, u.packageFee != null ? u.packageFee : u.packagingFee, u.bank5 || u.last5, u.secondPayStatus);
         });
         SpreadsheetApp.flush();
+        touchIndex((data.updates || []).map(function(u) { return u.campaignName || u.tourName; }));
         return jsonResponse({ ok: true, status: 'success', count: (data.updates || []).length });
       case 'uploadImage':
         return uploadImage(data);
@@ -2372,7 +2382,53 @@ function writeSystemSettings(ss, bc) {
 // ══════════════════════════════════════════
 // 團務索引表單：每個團的 Google Sheet 連結與訂單數字（狀態等設定看「團務資料」）
 // ══════════════════════════════════════════
-var INDEX_HEADERS = ['團務名稱', '訂單數', '訂單總額', '已付款', '未付款', '二補待收', '備註'];
+var INDEX_HEADERS = ['團務名稱', '訂單數', '訂單總額', '已付款', '未付款', '金額不符', '二補待收', '備註'];
+var INDEX_NUMBER_COUNT = 6; // 訂單數 ~ 二補待收
+
+// 一個團在索引表單上的數字（金額不符、退款不算進已付款或未付款）
+function indexNumbers(orders) {
+  var s = campaignStats(orders || [], false);
+  return [s.count, s.total, s.paid, s.unpaid, s.mismatch, s.second];
+}
+function groupOrdersBySheet(orders) {
+  var out = {};
+  (orders || []).forEach(function(o) { (out[o.spreadsheetId] = out[o.spreadsheetId] || []).push(o); });
+  return out;
+}
+function indexStamp(sheet) {
+  sheet.getRange(1, INDEX_HEADERS.length + 2).setValue('更新：' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy/MM/dd HH:mm')).setFontColor('#6b7280');
+}
+
+// 訂單有變動時，只更新那幾個團在「團務索引表單」的那一列（不用打開每個團的試算表）
+// 表格還沒建好、是舊格式、或找不到那一列時，整張重建
+// orders：已經讀好的訂單（可省略，省略時只讀這幾個團）
+function updateCampaignIndexRows(ssIds, orders) {
+  var want = {};
+  (ssIds || []).forEach(function(id) { if (id) want[id] = true; });
+  var ids = Object.keys(want);
+  if (!ids.length) return;
+  var sheet = getMainSpreadsheetOrThrow().getSheetByName(CAMPAIGN_INDEX_SHEET);
+  var width = INDEX_HEADERS.length;
+  if (!sheet || sheet.getLastRow() < 2 || sheet.getRange(1, 1, 1, width).getValues()[0].join('|') !== INDEX_HEADERS.join('|')) {
+    refreshCampaignIndex();
+    return;
+  }
+  var byCamp = groupOrdersBySheet(orders || getAllOrders({ onlyIds: want }));
+  var props = PropertiesService.getScriptProperties().getProperties();
+  var nameOf = {};
+  Object.keys(props).forEach(function(k) { if (!isInternalPropKey(k)) nameOf[props[k]] = k; });
+  var names = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues().map(function(r) { return String(r[0]).trim(); });
+  for (var i = 0; i < ids.length; i++) {
+    var row = names.indexOf(nameOf[ids[i]]);
+    if (row < 0) { refreshCampaignIndex(); return; }
+    sheet.getRange(row + 2, 2, 1, INDEX_NUMBER_COUNT).setValues([indexNumbers(byCamp[ids[i]])]);
+  }
+  indexStamp(sheet);
+}
+function campaignSheetIds(names) {
+  var props = PropertiesService.getScriptProperties();
+  return (names || []).map(function(n) { return props.getProperty(propKeyCampaign(n)); }).filter(Boolean);
+}
 
 function getIndexSheet(ss) {
   var sheet = ss.getSheetByName(CAMPAIGN_INDEX_SHEET);
@@ -2389,16 +2445,7 @@ function refreshCampaignIndex(report, orders) {
   if (!orders) orders = getAllOrders({ includeEnded: true });
   var props = PropertiesService.getScriptProperties().getProperties();
 
-  var stats = {};
-  orders.forEach(function(o) {
-    var s = stats[o.spreadsheetId] || (stats[o.spreadsheetId] = { count: 0, total: 0, paid: 0, unpaid: 0, second: 0 });
-    var pay = String(o.payStatus || '').trim();
-    s.count++;
-    s.total += Number(o.totalAmount) || 0;
-    if (pay === 'paid' || pay === '已付款') s.paid++;
-    else if (pay !== '退款') s.unpaid++;
-    if ((Number(o.secondPayment) || 0) > 0 && normalizeSecondStatus(o.secondPayStatus) !== '已收款') s.second++;
-  });
+  var byCamp = groupOrdersBySheet(orders);
   var errors = {};
   ((report && report.errors) || []).forEach(function(e) { errors[e.name] = String(e.error || '').split('\n')[0].slice(0, 200); });
 
@@ -2419,11 +2466,10 @@ function refreshCampaignIndex(report, orders) {
   var width = INDEX_HEADERS.length;
   sheet.clear();
   sheet.getRange(1, 1, 1, width).setValues([INDEX_HEADERS]).setFontWeight('bold').setBackground('#e5e7eb');
-  sheet.getRange(1, width + 2).setValue('更新：' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy/MM/dd HH:mm')).setFontColor('#6b7280');
+  indexStamp(sheet);
   if (rows.length) {
     sheet.getRange(2, 1, rows.length, width).setValues(rows.map(function(r) {
-      var s = stats[r.ssId] || { count: 0, total: 0, paid: 0, unpaid: 0, second: 0 };
-      return ['', s.count, s.total, s.paid, s.unpaid, s.second, errors[r.name] || (r.ended ? '已結束' : '')];
+      return [''].concat(indexNumbers(byCamp[r.ssId]), [errors[r.name] || (r.ended ? '已結束' : '')]);
     }));
     // 團名直接連到該團的 Google Sheet
     sheet.getRange(2, 1, rows.length, 1).setRichTextValues(rows.map(function(r) {
@@ -3022,6 +3068,7 @@ function createNewOrder(data) {
   writeOrderDetail(ss, order, timestamp, campaignName, orderId);
   updateItemSummary(ss, order, campaignName);
   writeSecondPayEntry(ss, order, orderId);
+  try { updateCampaignIndexRows([ss.getId()]); } catch (ignore) {} // 索引表單的數字跟著更新；失敗也不影響下單
   return jsonResponse({ ok: true, status: 'success', orderId: orderId });
 }
 
