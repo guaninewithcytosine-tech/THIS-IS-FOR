@@ -296,54 +296,126 @@ function tidySettingsSheet() {
 
 // ══════════════════════════════════════════
 // Notion 對帳同步
-// ・你指定的 Notion 頁面裡有「團務對帳」表格：一個團一列（狀態、訂單數、金額、已付／未付筆數）
-// ・點進某個團，頁面裡是那個團自己的「訂單」表格：一筆訂單一列
-// ・付款狀態、二補收款狀態：雙向同步（在 Notion 改會寫回 Google Sheet；在後台改會更新到 Notion）
-// ・其他欄位：單向，由系統寫到 Notion
-// ・每 10 分鐘自動同步一次；選單「TWT 代購 → Notion 對帳：立即同步」可馬上同步
+// 你指定的 Notion 頁面裡會有：
+// ・「團務對帳」表格：進行中的團，一個團一列（團體、狀態、團務進度、訂單數、金額、各付款狀態的筆數）
+// ・「已結束團務」頁面：團在後台刪除（已結束）後，整列連同裡面的訂單搬到這裡保留，之後不再同步
+// 點進某個團，裡面有兩個表格：
+// ・「第一次匯款」：每筆訂單一列
+// ・「二補」：量好重量、算出二補的訂單才會出現
+// 付款狀態、二補收款狀態：雙向同步（在 Notion 改會寫回 Google Sheet；在後台改會更新到 Notion）
+// 其他欄位：單向，由系統寫到 Notion
+// 每 10 分鐘自動同步一次；選單「TWT 代購 → Notion 對帳：立即同步」可馬上同步
 // 使用 Notion API 2025-09-03（資料庫底下的 data source）。Notion 現在把「整合」改稱「連接」。
 // ══════════════════════════════════════════
 var NOTION_API = 'https://api.notion.com/v1/';
 var NOTION_VERSION = '2025-09-03';
 var NOTION_TOKEN_KEY = '__NOTION_TOKEN__';
-var NOTION_DB_KEY = '__NOTION_DB__';          // 「團務對帳」表
+var NOTION_LAYOUT_KEY = '__NOTION_LAYOUT__';
+var NOTION_LAYOUT = '2';                        // Notion 版面改了就換號碼：舊版面要重新執行設定
+var NOTION_DB_KEY = '__NOTION_DB__';            // 「團務對帳」表
 var NOTION_DS_KEY = '__NOTION_DS__';
-var NOTION_CAMPS_KEY = '__NOTION_CAMPS_';     // 各團在 Notion 的位置：{ 試算表ID: { row, db, ds } }
-var NOTION_STATE_KEY = '__NOTION_STATE_';     // 每筆訂單上次同步時兩邊一致的狀態，用來判斷是哪一邊改的
+var NOTION_ENDED_KEY = '__NOTION_ENDED__';      // 「已結束團務」頁面與表格：{ page, db, ds }
+var NOTION_CAMPS_KEY = '__NOTION_CAMPS_';       // 各團在 Notion 的位置：{ 試算表ID: { row, first, second, ended, frozen } }
+var NOTION_STATE_KEY = '__NOTION_STATE_';       // 每筆訂單上次同步時兩邊一致的狀態：{ 訂單編號: { p: 付款狀態, s: 二補收款狀態 } }
 var NOTION_SYNC_MINUTES = 10;
-var NOTION_TIME_BUDGET_MS = 270000;           // 單次最多跑 4.5 分鐘，剩下的下一輪繼續
+var NOTION_TIME_BUDGET_MS = 270000;             // 單次最多跑 4.5 分鐘，剩下的下一輪繼續
+var NOTION_FIRST_TITLE = '第一次匯款';
+var NOTION_SECOND_TITLE = '二補';
+var NOTION_ENDED_TITLE = '已結束團務';
 
 var NOTION_PAY_OPTIONS = [{ name: '未付款', color: 'red' }, { name: '已付款', color: 'green' }, { name: '金額不符', color: 'orange' }, { name: '退款', color: 'gray' }];
 var NOTION_SECOND_OPTIONS = [{ name: '未收款', color: 'red' }, { name: '已收款', color: 'green' }];
 var NOTION_CAMP_STATUS_OPTIONS = [{ name: '開團中', color: 'green' }, { name: '停止收單', color: 'yellow' }, { name: '理貨中', color: 'blue' },
   { name: '現貨賣場', color: 'purple' }, { name: '團務結束', color: 'gray' }, { name: '已結束', color: 'default' }];
+var NOTION_STEP_COLORS = ['gray', 'brown', 'orange', 'yellow', 'blue', 'green'];
 var NOTION_MATCH_FORMULA = 'if(empty(prop("匯款金額")), "", if(prop("匯款金額") == prop("系統總計"), "相符", "不符"))';
 
-function notionCampaignSchema() {
-  return {
-    '團務名稱': { title: {} },
-    '狀態': { select: { options: NOTION_CAMP_STATUS_OPTIONS } },
-    '訂單數': { number: { format: 'number' } },
-    '訂單總額': { number: { format: 'number_with_commas' } },
-    '已付款（筆）': { number: { format: 'number' } },
-    '未付款（筆）': { number: { format: 'number' } },
-    '二補待收（筆）': { number: { format: 'number' } }
-  };
+// 各表格的欄位：[程式裡的名字, Notion 欄名, 類型, 選項或數字格式]
+function notionCampFields() {
+  return [
+    ['name', '團務名稱', 'title'],
+    ['group', '團體', 'select'],
+    ['status', '狀態', 'select', NOTION_CAMP_STATUS_OPTIONS],
+    ['progress', '團務進度', 'select', LOGI_STEP_LABELS.map(function(n, i) { return { name: n, color: NOTION_STEP_COLORS[i] || 'default' }; })],
+    ['count', '訂單數', 'number', 'number'],
+    ['total', '訂單總額', 'number'],
+    ['paid', '已付款（筆）', 'number', 'number'],
+    ['unpaid', '未付款（筆）', 'number', 'number'],
+    ['mismatch', '金額不符（筆）', 'number', 'number'],
+    ['second', '二補待收（筆）', 'number', 'number']
+  ];
 }
-function notionOrderSchema() {
-  return {
-    '社群帳號': { title: {} },
-    '付款狀態': { select: { options: NOTION_PAY_OPTIONS } },
-    '匯款後五碼': { rich_text: {} },
-    '匯款金額': { number: { format: 'number_with_commas' } },
-    '系統總計': { number: { format: 'number_with_commas' } },
-    '二補總計': { number: { format: 'number_with_commas' } },
-    '二補收款狀態': { select: { options: NOTION_SECOND_OPTIONS } },
-    '手機號碼': { phone_number: {} },
-    '明細': { rich_text: {} },
-    '下單時間': { date: {} },
-    '訂單編號': { rich_text: {} }
-  };
+function notionFirstFields() {
+  return [
+    ['title', '社群帳號', 'title'],
+    ['pay', '付款狀態', 'select', NOTION_PAY_OPTIONS],
+    ['bank5', '匯款後五碼', 'text'],
+    ['remit', '匯款金額', 'number'],
+    ['total', '系統總計', 'number'],
+    ['details', '明細', 'text'],
+    ['time', '下單時間', 'date'],
+    ['orderId', '訂單編號', 'text']
+  ];
+}
+function notionSecondFields() {
+  return [
+    ['title', '社群帳號', 'title'],
+    ['second', '二補收款狀態', 'select', NOTION_SECOND_OPTIONS],
+    ['weight', '商品重量(kg)', 'number', 'number'],
+    ['intl', '國際運費', 'number'],
+    ['pack', '包材費', 'number'],
+    ['secondTotal', '二補總計', 'number'],
+    ['details', '明細', 'text'],
+    ['orderId', '訂單編號', 'text']
+  ];
+}
+
+function notionSchema(fields) {
+  var out = {};
+  fields.forEach(function(f) {
+    var type = f[2], cfg = f[3];
+    out[f[1]] = type === 'title' ? { title: {} }
+      : type === 'text' ? { rich_text: {} }
+      : type === 'date' ? { date: {} }
+      : type === 'number' ? { number: { format: cfg || 'number_with_commas' } }
+      : { select: { options: cfg || [] } };
+  });
+  return out;
+}
+function notionPropValue(type, v) {
+  if (type === 'title') return { title: richText(v) };
+  if (type === 'text') return { rich_text: richText(v) };
+  if (type === 'number') return { number: v == null || v === '' ? null : v };
+  if (type === 'date') return { date: v ? { start: v } : null };
+  return { select: v ? { name: v } : null };
+}
+function notionReadValue(type, x) {
+  if (type === 'title' || type === 'text') return readText(x);
+  if (type === 'number') return readNumber(x);
+  if (type === 'date') return (x && x.date && x.date.start) || '';
+  return readSelect(x);
+}
+// 沒給的欄位（undefined）不寫
+function notionProps(fields, w) {
+  var out = {};
+  fields.forEach(function(f) { if (w[f[0]] !== undefined) out[f[1]] = notionPropValue(f[2], w[f[0]]); });
+  return out;
+}
+function notionRead(fields, page) {
+  var p = (page && page.properties) || {}, out = {};
+  fields.forEach(function(f) { out[f[0]] = notionReadValue(f[2], p[f[1]]); });
+  return out;
+}
+// 只回傳跟 Notion 上不一樣的欄位；都一樣時回傳 null
+function notionChanged(fields, want, have) {
+  var out = {}, changed = false;
+  fields.forEach(function(f) {
+    var k = f[0];
+    if (want[k] === undefined) return;
+    var same = f[2] === 'date' ? sameTime(want[k], have[k]) : sameValue(want[k], have[k]);
+    if (!same) { out[f[1]] = notionPropValue(f[2], want[k]); changed = true; }
+  });
+  return changed ? out : null;
 }
 
 // ── Notion API ──
@@ -414,15 +486,27 @@ function notionCreateTable(parentPageId, title, schema, withFormula) {
   return { db: db.id, ds: dsId, formulaOk: formulaOk };
 }
 
-function notionCreateDatabase(pageId) {
+// 在你的頁面裡建立「團務對帳」表格和「已結束團務」頁面
+function notionCreateLayout(pageId) {
   notionFetch('get', 'pages/' + pageId); // 先確認頁面已經加入連接
-  var t = notionCreateTable(pageId, '團務對帳', notionCampaignSchema(), false);
+  var list = notionCreateTable(pageId, '團務對帳', notionSchema(notionCampFields()), false);
+  var endedPage = notionFetch('post', 'pages', {
+    parent: { type: 'page_id', page_id: pageId },
+    icon: { type: 'emoji', emoji: '📦' },
+    properties: { title: { title: richText(NOTION_ENDED_TITLE) } }
+  });
+  var ended = notionCreateTable(endedPage.id, NOTION_ENDED_TITLE, notionSchema(notionCampFields()), false);
   var props = PropertiesService.getScriptProperties();
-  props.setProperty(NOTION_DB_KEY, t.db);
-  props.setProperty(NOTION_DS_KEY, t.ds);
+  props.setProperty(NOTION_DB_KEY, list.db);
+  props.setProperty(NOTION_DS_KEY, list.ds);
+  props.setProperty(NOTION_ENDED_KEY, JSON.stringify({ page: endedPage.id, db: ended.db, ds: ended.ds }));
+  props.setProperty(NOTION_LAYOUT_KEY, NOTION_LAYOUT);
   saveChunked(NOTION_CAMPS_KEY, {}); // 新的對帳頁，從頭開始
   saveChunked(NOTION_STATE_KEY, {});
-  return t;
+}
+
+function notionEndedInfo() {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty(NOTION_ENDED_KEY) || 'null'); } catch (e) { return null; }
 }
 
 function installNotionTrigger() {
@@ -445,15 +529,20 @@ function notionSetup() {
   if (!pageId) return ui.alert('看不出這是 Notion 頁面連結，請在 Notion 頁面按「分享 → 複製連結」再貼上');
   var props = PropertiesService.getScriptProperties();
   var oldToken = props.getProperty(NOTION_TOKEN_KEY);
+  var hadOld = !!props.getProperty(NOTION_DS_KEY);
   props.setProperty(NOTION_TOKEN_KEY, token);
   try {
-    notionCreateDatabase(pageId);
+    notionCreateLayout(pageId);
     installNotionTrigger();
     var r = syncNotion();
     ui.alert('Notion 對帳設定完成',
-      '已在 Notion 頁面建立「團務對帳」：同步 ' + (r.campaigns || 0) + ' 個團、' + (r.created || 0) + ' 筆訂單。\n' +
-      '點團務名稱進去，就是那個團的訂單。之後每 ' + NOTION_SYNC_MINUTES + ' 分鐘自動同步一次。' +
+      '已在 Notion 頁面建立「團務對帳」：同步 ' + (r.campaigns || 0) + ' 個團、' + (r.orders || 0) + ' 筆訂單' +
+      (r.ended ? '；另有 ' + r.ended + ' 個已結束的團放在「' + NOTION_ENDED_TITLE + '」' : '') + '。\n' +
+      '點團務名稱進去，裡面有「' + NOTION_FIRST_TITLE + '」和「' + NOTION_SECOND_TITLE + '」兩個表格（量好重量、算出二補的訂單才會出現在二補）。\n' +
+      '團在後台刪除後會整個搬到「' + NOTION_ENDED_TITLE + '」頁面保留。之後每 ' + NOTION_SYNC_MINUTES + ' 分鐘自動同步一次。' +
+      (hadOld ? '\n\n之前建立的舊表格不會再更新，可以在 Notion 直接刪掉。' : '') +
       (r.formulaFailed ? '\n\n（「金額相符」公式欄沒有建立成功，可以之後在 Notion 自己新增）' : '') +
+      (r.errors && r.errors.length ? '\n\n有 ' + r.errors.length + ' 筆沒同步成功：' + r.errors[0] : '') +
       (r.pending ? '\n\n訂單比較多，剩下的會在下一輪自動補上。' : ''),
       ui.ButtonSet.OK);
   } catch (e) {
@@ -466,6 +555,7 @@ function notionSyncNow() {
   var r = syncNotion();
   var msg = r.skipped ? r.skipped
     : ('新增 ' + r.created + ' 筆、更新 ' + r.updated + ' 筆到 Notion；從 Notion 寫回 ' + r.pulled + ' 筆狀態' +
+       (r.ended ? '；' + r.ended + ' 個團移到「' + NOTION_ENDED_TITLE + '」' : '') +
        (r.errors.length ? '；' + r.errors.length + ' 筆失敗：' + r.errors[0] : '') + (r.pending ? '；其餘下一輪繼續' : ''));
   try { getMainSpreadsheetOrThrow().toast(msg, 'Notion 對帳', 10); } catch (ignore) {}
   return msg;
@@ -491,6 +581,7 @@ function payValueForSheet(label) {
   return label;
 }
 function notionText(s, max) { return String(s == null ? '' : s).slice(0, max || 1900); }
+function notionSelectName(s) { return String(s == null ? '' : s).replace(/,/g, '，').trim().slice(0, 100); } // Notion 選項不能有半形逗號
 function numOrNull(v) { var n = Number(v); return (v === '' || v == null || !isFinite(n) || n === 0) ? null : n; }
 function richText(s) { return s ? [{ type: 'text', text: { content: s } }] : []; }
 function readText(x) { return ((x && (x.title || x.rich_text)) || []).map(function(t) { return t.plain_text || (t.text && t.text.content) || ''; }).join(''); }
@@ -502,95 +593,55 @@ function sameTime(a, b) {
   return Math.floor(new Date(a).getTime() / 60000) === Math.floor(new Date(b).getTime() / 60000);
 }
 
+// 量好重量或算出二補金額，才放進「二補」表格
+function hasSecondPayment(o) {
+  return (Number(o.secondPayment) || 0) > 0 || (Number(o.weight) || 0) > 0;
+}
+
 // 訂單：系統這邊應該長的樣子
-function notionWanted(o) {
+function notionFirstWanted(o) {
   return {
     title: notionText(o.socialName || '（未填）', 200),
     pay: payLabel(o.payStatus),
     bank5: notionText(o.bank5, 20),
     remit: numOrNull(o.remitAmount),
     total: numOrNull(o.totalAmount),
-    secondTotal: numOrNull(o.secondPayment),
-    second: normalizeSecondStatus(o.secondPayStatus),
-    phone: notionText(o.phone, 30),
     details: notionText(o.orderDetails),
     time: o.timestamp || '',
     orderId: o.orderId
   };
 }
-var NOTION_ORDER_FIELDS = { title: '社群帳號', pay: '付款狀態', bank5: '匯款後五碼', remit: '匯款金額', total: '系統總計',
-  secondTotal: '二補總計', second: '二補收款狀態', phone: '手機號碼', details: '明細', time: '下單時間', orderId: '訂單編號' };
-
-function notionOrderProps(w) {
+function notionSecondWanted(o) {
   return {
-    '社群帳號': { title: richText(w.title) },
-    '付款狀態': { select: { name: w.pay } },
-    '匯款後五碼': { rich_text: richText(w.bank5) },
-    '匯款金額': { number: w.remit },
-    '系統總計': { number: w.total },
-    '二補總計': { number: w.secondTotal },
-    '二補收款狀態': { select: { name: w.second } },
-    '手機號碼': { phone_number: w.phone || null },
-    '明細': { rich_text: richText(w.details) },
-    '下單時間': { date: w.time ? { start: w.time } : null },
-    '訂單編號': { rich_text: richText(w.orderId) }
+    title: notionText(o.socialName || '（未填）', 200),
+    second: normalizeSecondStatus(o.secondPayStatus),
+    weight: numOrNull(o.weight),
+    intl: numOrNull(o.intlShipping),
+    pack: numOrNull(o.packagingFee),
+    secondTotal: numOrNull(o.secondPayment),
+    details: notionText(o.orderDetails),
+    orderId: o.orderId
   };
 }
-function notionReadOrder(page) {
-  var p = page.properties || {};
-  return {
-    title: readText(p['社群帳號']), pay: readSelect(p['付款狀態']), bank5: readText(p['匯款後五碼']),
-    remit: readNumber(p['匯款金額']), total: readNumber(p['系統總計']), secondTotal: readNumber(p['二補總計']),
-    second: readSelect(p['二補收款狀態']), phone: (p['手機號碼'] && p['手機號碼'].phone_number) || '',
-    details: readText(p['明細']), time: (p['下單時間'] && p['下單時間'].date && p['下單時間'].date.start) || '',
-    orderId: readText(p['訂單編號'])
-  };
-}
-function notionChangedOrderProps(want, have) {
-  var all = notionOrderProps(want), out = {}, changed = false;
-  Object.keys(NOTION_ORDER_FIELDS).forEach(function(k) {
-    var same = k === 'time' ? sameTime(want.time, have.time) : sameValue(want[k], have[k]);
-    if (!same) { out[NOTION_ORDER_FIELDS[k]] = all[NOTION_ORDER_FIELDS[k]]; changed = true; }
-  });
-  return changed ? out : null;
-}
 
-// 團務列：名稱、狀態、統計（已結束的團只更新名稱和狀態）
-function notionCampaignProps(w) {
-  var out = { '團務名稱': { title: richText(w.name) }, '狀態': { select: { name: w.status } } };
-  if (w.stats) {
-    out['訂單數'] = { number: w.stats.count };
-    out['訂單總額'] = { number: w.stats.total };
-    out['已付款（筆）'] = { number: w.stats.paid };
-    out['未付款（筆）'] = { number: w.stats.unpaid };
-    out['二補待收（筆）'] = { number: w.stats.second };
+// 團務列：沒有 stats 時（已結束、最後一次同步做過了）只更新名稱、團體、狀態、進度
+function notionCampaignWanted(c, stats) {
+  var w = { name: c.name, group: notionSelectName(c.group), status: notionSelectName(STATUS_LABELS[c.status] || c.status), progress: c.progress };
+  if (stats) {
+    w.count = stats.count; w.total = stats.total; w.paid = stats.paid;
+    w.unpaid = stats.unpaid; w.mismatch = stats.mismatch; w.second = stats.second;
   }
-  return out;
+  return w;
 }
-function notionReadCampaign(page) {
-  var p = page.properties || {};
-  return { name: readText(p['團務名稱']), status: readSelect(p['狀態']),
-    stats: { count: readNumber(p['訂單數']), total: readNumber(p['訂單總額']), paid: readNumber(p['已付款（筆）']),
-      unpaid: readNumber(p['未付款（筆）']), second: readNumber(p['二補待收（筆）']) } };
-}
-function notionChangedCampaignProps(want, have) {
-  var all = notionCampaignProps(want), out = {}, changed = false;
-  if (!sameValue(want.name, have.name)) { out['團務名稱'] = all['團務名稱']; changed = true; }
-  if (!sameValue(want.status, have.status)) { out['狀態'] = all['狀態']; changed = true; }
-  if (want.stats) {
-    [['count', '訂單數'], ['total', '訂單總額'], ['paid', '已付款（筆）'], ['unpaid', '未付款（筆）'], ['second', '二補待收（筆）']].forEach(function(f) {
-      if (!sameValue(want.stats[f[0]], have.stats[f[0]])) { out[f[1]] = all[f[1]]; changed = true; }
-    });
-  }
-  return changed ? out : null;
-}
+// 金額不符、退款各自分開，不算進已付款或未付款
 function campaignStats(orders) {
-  var s = { count: 0, total: 0, paid: 0, unpaid: 0, second: 0 };
+  var s = { count: 0, total: 0, paid: 0, unpaid: 0, mismatch: 0, second: 0 };
   orders.forEach(function(o) {
-    var pay = String(o.payStatus || '').trim();
+    var pay = payLabel(o.payStatus);
     s.count++;
     s.total += Number(o.totalAmount) || 0;
-    if (pay === 'paid' || pay === '已付款') s.paid++;
+    if (pay === '已付款') s.paid++;
+    else if (pay === '金額不符') s.mismatch++;
     else if (pay !== '退款') s.unpaid++;
     if ((Number(o.secondPayment) || 0) > 0 && normalizeSecondStatus(o.secondPayStatus) !== '已收款') s.second++;
   });
@@ -607,7 +658,7 @@ function resolveTwoWay(sheetVal, notionVal, baseVal) {
 }
 
 // 讀出一個表格的所有列：{ key: { id, values } }
-function notionQueryAll(dsId, readFn, keyFn) {
+function notionQueryAll(dsId, fields, keyFn) {
   var out = {}, cursor = null;
   do {
     var body = { page_size: 100 };
@@ -615,7 +666,7 @@ function notionQueryAll(dsId, readFn, keyFn) {
     var res = notionFetch('post', 'data_sources/' + dsId + '/query', body);
     (res.results || []).forEach(function(pg) {
       if (pg.object !== 'page' || pg.in_trash || pg.archived) return;
-      var v = readFn(pg), key = keyFn(pg, v);
+      var v = notionRead(fields, pg), key = keyFn(pg, v);
       if (key && !out[key]) out[key] = { id: pg.id, values: v };
     });
     cursor = res.has_more ? res.next_cursor : null;
@@ -649,20 +700,28 @@ function withShortLock(fn) {
   try { return fn(); } finally { lock.releaseLock(); }
 }
 
-// 寫回 Google Sheet：用訂單編號找到那一列
-function writeOrderCell(ssId, sheetName, orderId, column, value) {
+// 寫回 Google Sheet：用訂單編號找到那一列；舊的二補列沒有訂單編號時用手機號碼找
+function writeOrderCell(ssId, sheetName, orderId, column, value, phone) {
   var sheet = SpreadsheetApp.openById(ssId).getSheetByName(sheetName);
   if (!sheet || sheet.getLastRow() < 2) return false;
   var rows = sheet.getDataRange().getValues();
   var h = getHeaderMap(rows[0]);
-  if (h['訂單編號'] === undefined || h[column] === undefined) return false;
-  for (var i = 1; i < rows.length; i++) {
-    if (String(rows[i][h['訂單編號']]) === String(orderId)) {
-      sheet.getRange(i + 1, h[column] + 1).setValue(value);
-      return true;
+  var idCol = h['訂單編號'], phoneCol = h['手機號碼'];
+  if (h[column] === undefined) return false;
+  var digits = String(phone || '').replace(/\D/g, '');
+  var target = -1, i;
+  if (idCol !== undefined && orderId) {
+    for (i = 1; i < rows.length; i++) if (String(rows[i][idCol]) === String(orderId)) { target = i; break; }
+  }
+  if (target < 0 && digits && phoneCol !== undefined) {
+    for (i = 1; i < rows.length; i++) {
+      var noId = idCol === undefined || !String(rows[i][idCol] || '');
+      if (noId && String(rows[i][phoneCol]).replace(/\D/g, '') === digits) { target = i; break; }
     }
   }
-  return false;
+  if (target < 0) return false;
+  sheet.getRange(target + 1, h[column] + 1).setValue(value);
+  return true;
 }
 
 // 舊訂單沒有訂單編號時補上一個，Notion 才能對得上
@@ -680,55 +739,74 @@ function ensureOrderIds(orders) {
   });
 }
 
-// 同步一個團的訂單表；時間用完時回傳 false
-function syncCampaignOrders(entry, orders, state, report, started) {
-  var pages;
-  try {
-    pages = notionQueryAll(entry.ds, notionReadOrder, function(pg, v) { return v.orderId; });
-  } catch (e) {
-    if (e.status !== 404) throw e;
-    // 這個團的訂單表在 Notion 被刪掉了 → 在團務頁裡重建，訂單全部重新放進去
-    var t = notionCreateTable(entry.row, '訂單', notionOrderSchema(), true);
-    entry.db = t.db; entry.ds = t.ds;
-    orders.forEach(function(o) { delete state[o.orderId]; });
-    pages = {};
+// 讀出團務頁裡的某個訂單表格；表格還沒建或在 Notion 被刪掉時（重新）建立
+function notionLoadOrderTable(entry, key, title, fields, withFormula, orders, state, report) {
+  if (entry[key]) {
+    try {
+      return notionQueryAll(entry[key].ds, fields, function(pg, v) { return v.orderId; });
+    } catch (e) {
+      if (e.status !== 404) throw e;
+    }
   }
+  var t = notionCreateTable(entry.row, title, notionSchema(fields), withFormula);
+  if (!t.formulaOk) report.formulaFailed = true;
+  var hadTable = !!entry[key];
+  entry[key] = { db: t.db, ds: t.ds };
+  // 表格被刪掉重建時，訂單全部重新放進去
+  if (hadTable) {
+    var stateKey = key === 'first' ? 'p' : 's';
+    orders.forEach(function(o) { if (state[o.orderId]) delete state[o.orderId][stateKey]; });
+  }
+  return {};
+}
+
+// 把一筆訂單寫到某個表格；回傳 Notion 上有沒有這一列
+function notionPushOrder(ds, fields, want, page, skipCreate, report) {
+  if (!page) {
+    if (skipCreate) return false;
+    notionFetch('post', 'pages', { parent: { type: 'data_source_id', data_source_id: ds }, properties: notionProps(fields, want) });
+    report.created++;
+    Utilities.sleep(340);
+    return true;
+  }
+  var patch = notionChanged(fields, want, page.values);
+  if (patch) {
+    notionFetch('patch', 'pages/' + page.id, { properties: patch });
+    report.updated++;
+    Utilities.sleep(340);
+  }
+  return true;
+}
+
+// 同步一個團的「第一次匯款」與「二補」表格；時間用完時回傳 false
+function syncCampaignOrders(entry, orders, state, report, started) {
+  var firstFields = notionFirstFields(), secondFields = notionSecondFields();
+  var firstPages = notionLoadOrderTable(entry, 'first', NOTION_FIRST_TITLE, firstFields, true, orders, state, report);
+  var secondPages = notionLoadOrderTable(entry, 'second', NOTION_SECOND_TITLE, secondFields, false, orders, state, report);
   for (var i = 0; i < orders.length; i++) {
     var o = orders[i];
     if (!o.orderId) continue;
     if (Date.now() - started > NOTION_TIME_BUDGET_MS) return false;
-    var want = notionWanted(o);
-    var page = pages[o.orderId];
-    var base = state[o.orderId];
+    var st = state[o.orderId] = state[o.orderId] || {};
+    var w1 = notionFirstWanted(o), w2 = notionSecondWanted(o);
+    var p1 = firstPages[o.orderId], p2 = secondPages[o.orderId];
     try {
-      if (!page) {
-        if (base) continue; // 同步過但在 Notion 被刪掉 → 尊重刪除，不再建立
-        notionFetch('post', 'pages', { parent: { type: 'data_source_id', data_source_id: entry.ds }, properties: notionOrderProps(want) });
-        report.created++;
-        state[o.orderId] = [want.pay, want.second];
-        Utilities.sleep(340);
-        continue;
-      }
-      var pay = resolveTwoWay(want.pay, page.values.pay, base && base[0]);
-      var second = resolveTwoWay(want.second, page.values.second, base && base[1]);
+      var pay = p1 ? resolveTwoWay(w1.pay, p1.values.pay, st.p) : w1.pay;
+      var second = p2 ? resolveTwoWay(w2.second, p2.values.second, st.s) : w2.second;
       // 寫回失敗時會丟出錯誤：這筆不更新 Notion、不更新同步紀錄，下一輪重試（不會把 Notion 的修改蓋掉）
-      if (pay !== want.pay || second !== want.second) {
+      if (pay !== w1.pay || second !== w2.second) {
         withShortLock(function() {
-          if (pay !== want.pay && !writeOrderCell(o.spreadsheetId, ORDER_SHEET, o.orderId, '付款狀態', payValueForSheet(pay))) throw new Error('找不到訂單列');
-          if (second !== want.second && !writeOrderCell(o.spreadsheetId, SECOND_SHEET, o.orderId, '二補收款狀態', second)) throw new Error('找不到二補列');
+          if (pay !== w1.pay && !writeOrderCell(o.spreadsheetId, ORDER_SHEET, o.orderId, '付款狀態', payValueForSheet(pay))) throw new Error('找不到訂單列');
+          if (second !== w2.second && !writeOrderCell(o.spreadsheetId, SECOND_SHEET, o.orderId, '二補收款狀態', second, o.phone)) throw new Error('找不到二補列');
         });
-        report.pulled += (pay !== want.pay ? 1 : 0) + (second !== want.second ? 1 : 0);
+        report.pulled += (pay !== w1.pay ? 1 : 0) + (second !== w2.second ? 1 : 0);
         o.payStatus = payValueForSheet(pay);
         o.secondPayStatus = second;
+        w1.pay = pay; w2.second = second;
       }
-      want.pay = pay; want.second = second;
-      var patch = notionChangedOrderProps(want, page.values);
-      if (patch) {
-        notionFetch('patch', 'pages/' + page.id, { properties: patch });
-        report.updated++;
-        Utilities.sleep(340);
-      }
-      state[o.orderId] = [pay, second];
+      // 同步過、但在 Notion 被刪掉的列 → 尊重刪除，不再建立
+      if (notionPushOrder(entry.first.ds, firstFields, w1, p1, st.p !== undefined, report)) st.p = pay;
+      if (notionPushOrder(entry.second.ds, secondFields, w2, p2, st.s !== undefined || !hasSecondPayment(o), report)) st.s = second;
     } catch (e) {
       report.errors.push((o.socialName || o.orderId) + '：' + e.message);
       if (e.status === 401) throw e; // 權杖有問題，後面的也不會成功
@@ -739,16 +817,21 @@ function syncCampaignOrders(entry, orders, state, report, started) {
 
 function syncNotion() {
   var sp = PropertiesService.getScriptProperties();
-  var campDs = sp.getProperty(NOTION_DS_KEY);
-  if (!campDs || !sp.getProperty(NOTION_TOKEN_KEY)) return { skipped: '尚未設定 Notion 對帳' };
+  var listDs = sp.getProperty(NOTION_DS_KEY);
+  if (!listDs || !sp.getProperty(NOTION_TOKEN_KEY)) return { skipped: '尚未設定 Notion 對帳' };
+  var endedInfo = notionEndedInfo();
+  if (sp.getProperty(NOTION_LAYOUT_KEY) !== NOTION_LAYOUT || !endedInfo) {
+    return { skipped: 'Notion 對帳的版面更新了，請再執行一次「TWT 代購 → Notion 對帳：設定」' };
+  }
   // 同一時間只跑一個同步（自動與手動同時觸發時）；不佔用下單用的鎖
   var cache = CacheService.getScriptCache();
   if (cache.get('notion_sync_running')) return { skipped: '同步正在進行中' };
   cache.put('notion_sync_running', '1', 330);
   var started = Date.now();
-  var report = { campaigns: 0, created: 0, updated: 0, pulled: 0, errors: [], pending: false };
+  var report = { campaigns: 0, orders: 0, ended: 0, created: 0, updated: 0, pulled: 0, errors: [], pending: false };
   var map = loadChunked(NOTION_CAMPS_KEY);
   var state = loadChunked(NOTION_STATE_KEY);
+  var campFields = notionCampFields();
   try {
     _catalogMemo = null;
     var allProps = sp.getProperties();
@@ -763,38 +846,67 @@ function syncNotion() {
       var name = getCatalogTourName(t), ssId = allProps[propKeyCampaign(name)];
       if (!ssId || seen[ssId]) return;
       seen[ssId] = true;
-      camps.push({ ssId: ssId, name: name, status: String(t.status || 'open').toLowerCase() });
+      camps.push({ ssId: ssId, name: name, status: String(t.status || 'open').toLowerCase(), group: t.group || '', progress: tourProgressLabel(t) });
     });
-    var rows = notionQueryAll(campDs, notionReadCampaign, function(pg) { return pg.id; });
+    var byId = function(pg) { return pg.id; };
+    var listRows, endedRows;
+    try {
+      listRows = notionQueryAll(listDs, campFields, byId);
+      endedRows = notionQueryAll(endedInfo.ds, campFields, byId);
+    } catch (e) {
+      if (e.status === 404) e.message = '找不到「團務對帳」或「' + NOTION_ENDED_TITLE + '」表格（可能在 Notion 被刪掉了），請再執行一次「Notion 對帳：設定」';
+      throw e;
+    }
 
     for (var i = 0; i < camps.length; i++) {
       if (Date.now() - started > NOTION_TIME_BUDGET_MS) { report.pending = true; break; }
       var c = camps[i], active = c.status !== 'deleted';
       var entry = map[c.ssId];
-      var want = { name: c.name, status: STATUS_LABELS[c.status] || c.status, stats: null };
       try {
         if (!entry) {
-          if (!active) continue; // 已結束、又從沒同步過的團不放進 Notion
-          var row = notionFetch('post', 'pages', { parent: { type: 'data_source_id', data_source_id: campDs },
-            properties: notionCampaignProps({ name: c.name, status: want.status }) });
-          var t = notionCreateTable(row.id, '訂單', notionOrderSchema(), true);
-          if (!t.formulaOk) report.formulaFailed = true;
-          entry = map[c.ssId] = { row: row.id, db: t.db, ds: t.ds };
-          rows[row.id] = { id: row.id, values: { name: c.name, status: want.status, stats: {} } };
+          var home = active ? listDs : endedInfo.ds;
+          var row = notionFetch('post', 'pages', { parent: { type: 'data_source_id', data_source_id: home },
+            properties: notionProps(campFields, notionCampaignWanted(c, null)) });
+          entry = map[c.ssId] = { row: row.id };
+          (active ? listRows : endedRows)[row.id] = { id: row.id, values: notionRead(campFields, null) };
           saveChunked(NOTION_CAMPS_KEY, map); // 馬上記住，避免中途出錯時重複建立
-        } else if (!rows[entry.row]) {
-          continue; // 這個團在 Notion 被刪掉了 → 尊重刪除，不再同步
         }
-        if (active) {
-          report.campaigns++;
-          var campOrders = byCamp[c.ssId] || [];
+        var have = listRows[entry.row] || endedRows[entry.row];
+        if (!have) continue; // 這個團在 Notion 被刪掉了 → 尊重刪除，不再同步
+        entry.ended = !listRows[entry.row];
+
+        var want, finalOrders = null;
+        if (!active && entry.frozen) {
+          want = notionCampaignWanted(c, null); // 已結束、最後一次同步做過了
+        } else {
+          // 進行中的團每輪同步；剛結束的團最後再同步一次訂單，之後就不動了
+          var campOrders = active ? (byCamp[c.ssId] || []) : getAllOrders({ onlyIds: oneKey(c.ssId) });
+          if (!active) ensureOrderIds(campOrders);
           var done = syncCampaignOrders(entry, campOrders, state, report, started);
           saveChunked(NOTION_CAMPS_KEY, map);
           if (!done) { report.pending = true; break; }
-          want.stats = campaignStats(campOrders);
+          want = notionCampaignWanted(c, campaignStats(campOrders));
+          if (active) { report.campaigns++; report.orders += campOrders.length; } else finalOrders = campOrders;
         }
-        var patch = notionChangedCampaignProps(want, rows[entry.row].values);
-        if (patch) notionFetch('patch', 'pages/' + entry.row, { properties: patch });
+
+        if (entry.ended === active) {
+          // 放到對的地方：進行中 →「團務對帳」；已結束 →「已結束團務」（連同裡面的訂單一起搬）
+          notionFetch('post', 'pages/' + entry.row + '/move', { parent: { type: 'data_source_id', data_source_id: active ? listDs : endedInfo.ds } });
+          entry.ended = !active;
+          if (!active) report.ended++;
+          notionFetch('patch', 'pages/' + entry.row, { properties: notionProps(campFields, want) });
+        } else {
+          if (!active && !entry.frozen) report.ended++;
+          var patch = notionChanged(campFields, want, have.values);
+          if (patch) notionFetch('patch', 'pages/' + entry.row, { properties: patch });
+        }
+        if (active) delete entry.frozen;
+        else if (!entry.frozen) {
+          entry.frozen = true;
+          // 之後不再同步：清掉這個團每筆訂單的同步紀錄（Script Properties 有容量上限）
+          (finalOrders || []).forEach(function(o) { delete state[o.orderId]; });
+        }
+        saveChunked(NOTION_CAMPS_KEY, map);
       } catch (e) {
         report.errors.push(c.name + '：' + e.message);
         if (e.status === 401) break;
@@ -806,6 +918,8 @@ function syncNotion() {
   }
   return report;
 }
+
+function oneKey(k) { var o = {}; o[k] = true; return o; }
 
 // ── doGet ──
 var PUBLIC_GET_ACTIONS = { '': true, 'queryOrders': true };
@@ -1659,12 +1773,18 @@ function readStoredTours(ss) {
   return { tours: (legacy && legacy.appData && legacy.appData.tours) || [], legacyJson: legacy };
 }
 
-function tourToRow(t) {
+// 團務進度：停止收單以後才有（開團中、現貨賣場沒有）
+function tourProgressLabel(t) {
   var status = String(t.status || 'open').toLowerCase();
   var showStep = status === 'closed' || status === 'sorting' || status === 'ended' || status === 'deleted';
+  return showStep ? LOGI_STEP_LABELS[clampStep(t.lStep)] : '';
+}
+
+function tourToRow(t) {
+  var status = String(t.status || 'open').toLowerCase();
   return [
     getCatalogTourName(t), STATUS_LABELS[status] || status, t.group || '', t.currency || '',
-    Number(t.threshold || 0), t.giftName || '', t.giftUnit || '', showStep ? LOGI_STEP_LABELS[clampStep(t.lStep)] : '',
+    Number(t.threshold || 0), t.giftName || '', t.giftUnit || '', tourProgressLabel(t),
     STORE_CATEGORY_LABELS[t.storeCategory] || '', t.sellLink || '',
     t.description || '', t.paymentInfo || '', t.cardSortNote || '',
     t.cardSortRandom ? '隨機分配' : ((t.cardMembers || []).length ? '買家排序' : ''),
@@ -2361,13 +2481,16 @@ function safeIsoTime(v) {
 
 // ── getAllOrders ──
 // 預設只回傳網站上還在的團；options.includeEnded 連已結束的團也一起（團務索引表單統計用）
+// options.onlyIds：只讀指定的團（Notion 對帳替剛結束的團做最後一次同步用）
 function getAllOrders(options) {
-  var active = (options && options.includeEnded) ? null : activeTourNames();
+  var only = options && options.onlyIds; // 只讀這幾個團（試算表ID），不管有沒有結束
+  var active = (options && (options.includeEnded || only)) ? null : activeTourNames();
   var allProps = PropertiesService.getScriptProperties().getProperties();
   var result = [];
   for (var campName in allProps) {
     if (isInternalPropKey(campName)) continue;
     if (active && !active[campName]) continue;
+    if (only && !only[allProps[campName]]) continue;
     try {
       var ssId = allProps[campName];
       var ss = SpreadsheetApp.openById(ssId);
