@@ -299,9 +299,10 @@ function tidySettingsSheet() {
 // 你指定的 Notion 頁面裡會有：
 // ・「團務對帳」表格：進行中的團，一個團一列（團體、狀態、團務進度、訂單數、金額、各付款狀態的筆數）
 // ・「已結束團務」頁面：團在後台刪除（已結束）後，整列連同裡面的訂單搬到這裡保留，之後不再同步
-// 點進某個團，裡面有兩個表格：
-// ・「第一次匯款」：每筆訂單一列
-// ・「二補」：量好重量、算出二補的訂單才會出現
+// 點進某個團，裡面是那個團的「訂單」表格，上方有兩個分頁：
+// ・「第一次匯款」：每筆訂單一列，依付款狀態分組（未付款、金額不符在前面）
+// ・「二補」：只顯示量好重量、算出二補的訂單，依二補收款狀態分組
+// 每個表格的欄位順序都由程式排好（Notion 的檢視 views API）
 // 付款狀態、二補收款狀態：雙向同步（在 Notion 改會寫回 Google Sheet；在後台改會更新到 Notion）
 // 其他欄位：單向，由系統寫到 Notion
 // 每 10 分鐘自動同步一次；選單「TWT 代購 → Notion 對帳：立即同步」可馬上同步
@@ -311,19 +312,21 @@ var NOTION_API = 'https://api.notion.com/v1/';
 var NOTION_VERSION = '2025-09-03';
 var NOTION_TOKEN_KEY = '__NOTION_TOKEN__';
 var NOTION_LAYOUT_KEY = '__NOTION_LAYOUT__';
-var NOTION_LAYOUT = '2';                        // Notion 版面改了就換號碼：舊版面要重新執行設定
+var NOTION_LAYOUT = '3';                        // Notion 版面改了就換號碼：舊版面要重新執行設定
 var NOTION_DB_KEY = '__NOTION_DB__';            // 「團務對帳」表
 var NOTION_DS_KEY = '__NOTION_DS__';
 var NOTION_ENDED_KEY = '__NOTION_ENDED__';      // 「已結束團務」頁面與表格：{ page, db, ds }
-var NOTION_CAMPS_KEY = '__NOTION_CAMPS_';       // 各團在 Notion 的位置：{ 試算表ID: { row, first, second, ended, frozen } }
+var NOTION_CAMPS_KEY = '__NOTION_CAMPS_';       // 各團在 Notion 的位置：{ 試算表ID: { row, orders: { db, ds }, ended, frozen } }
 var NOTION_STATE_KEY = '__NOTION_STATE_';       // 每筆訂單上次同步時兩邊一致的狀態：{ 訂單編號: { p: 付款狀態, s: 二補收款狀態 } }
 var NOTION_SYNC_MINUTES = 10;
 var NOTION_TIME_BUDGET_MS = 270000;             // 單次最多跑 4.5 分鐘，剩下的下一輪繼續
+var NOTION_ORDERS_TITLE = '訂單';
 var NOTION_FIRST_TITLE = '第一次匯款';
 var NOTION_SECOND_TITLE = '二補';
 var NOTION_ENDED_TITLE = '已結束團務';
 
-var NOTION_PAY_OPTIONS = [{ name: '未付款', color: 'red' }, { name: '已付款', color: 'green' }, { name: '金額不符', color: 'orange' }, { name: '退款', color: 'gray' }];
+// 選項順序就是 Notion 分組的順序：要處理的放前面
+var NOTION_PAY_OPTIONS = [{ name: '未付款', color: 'red' }, { name: '金額不符', color: 'orange' }, { name: '已付款', color: 'green' }, { name: '退款', color: 'gray' }];
 var NOTION_SECOND_OPTIONS = [{ name: '未收款', color: 'red' }, { name: '已收款', color: 'green' }];
 var NOTION_CAMP_STATUS_OPTIONS = [{ name: '開團中', color: 'green' }, { name: '停止收單', color: 'yellow' }, { name: '理貨中', color: 'blue' },
   { name: '現貨賣場', color: 'purple' }, { name: '團務結束', color: 'gray' }, { name: '已結束', color: 'default' }];
@@ -345,28 +348,36 @@ function notionCampFields() {
     ['second', '二補待收（筆）', 'number', 'number']
   ];
 }
-function notionFirstFields() {
+// 一個團一個「訂單」表格；「第一次匯款」「二補」是同一個表格的兩個分頁，各自只顯示需要的欄位
+function notionOrderFields() {
   return [
     ['title', '社群帳號', 'title'],
     ['pay', '付款狀態', 'select', NOTION_PAY_OPTIONS],
     ['bank5', '匯款後五碼', 'text'],
     ['remit', '匯款金額', 'number'],
     ['total', '系統總計', 'number'],
-    ['details', '明細', 'text'],
     ['time', '下單時間', 'date'],
-    ['orderId', '訂單編號', 'text']
-  ];
-}
-function notionSecondFields() {
-  return [
-    ['title', '社群帳號', 'title'],
+    ['details', '明細', 'text'],
     ['second', '二補收款狀態', 'select', NOTION_SECOND_OPTIONS],
     ['weight', '商品重量(kg)', 'number', 'number'],
     ['intl', '國際運費', 'number'],
     ['pack', '包材費', 'number'],
     ['secondTotal', '二補總計', 'number'],
-    ['details', '明細', 'text'],
     ['orderId', '訂單編號', 'text']
+  ];
+}
+
+// 各表格的分頁：名稱、顯示哪些欄位（照順序，其他欄位隱藏）、分組、篩選
+function notionCampViews() {
+  return [{ columns: ['團務名稱', '團體', '狀態', '團務進度', '訂單數', '訂單總額', '已付款（筆）', '未付款（筆）', '金額不符（筆）', '二補待收（筆）'] }];
+}
+function notionOrderViews() {
+  return [
+    { name: NOTION_FIRST_TITLE, groupBy: '付款狀態',
+      columns: ['社群帳號', '付款狀態', '匯款後五碼', '匯款金額', '系統總計', '金額相符', '下單時間', '明細'] },
+    { name: NOTION_SECOND_TITLE, groupBy: '二補收款狀態',
+      columns: ['社群帳號', '二補收款狀態', '商品重量(kg)', '國際運費', '包材費', '二補總計', '明細'],
+      filter: { or: [{ property: '二補總計', number: { is_not_empty: true } }, { property: '商品重量(kg)', number: { is_not_empty: true } }] } }
   ];
 }
 
@@ -486,16 +497,72 @@ function notionCreateTable(parentPageId, title, schema, withFormula) {
   return { db: db.id, ds: dsId, formulaOk: formulaOk };
 }
 
+// 排好表格的分頁與欄位順序。只影響外觀：失敗時回傳 false，資料照樣同步
+function notionArrangeViews(dbId, dsId, views) {
+  try {
+    var src = notionFetch('get', 'data_sources/' + dsId);
+    var ids = {};
+    Object.keys(src.properties || {}).forEach(function(name) { ids[name] = src.properties[name].id; });
+    var list = notionFetch('get', 'views?database_id=' + encodeURIComponent(dbId));
+    var firstView = list.results && list.results[0] && list.results[0].id;
+    views.forEach(function(v, i) {
+      var shown = v.columns.filter(function(n) { return ids[n]; });
+      var props = shown.map(function(n) {
+        var c = { property_id: ids[n], visible: true };
+        if (n === '明細') c.wrap = true;
+        return c;
+      }).concat(Object.keys(ids).filter(function(n) { return shown.indexOf(n) < 0; }).map(function(n) {
+        return { property_id: ids[n], visible: false };
+      }));
+      var group = v.groupBy && ids[v.groupBy] ? { type: 'select', property_id: ids[v.groupBy], sort: { type: 'manual' }, hide_empty_groups: true } : null;
+      notionSaveView(i === 0 ? firstView : null, dbId, dsId, v, props, group);
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+// 先用完整設定；Notion 不接受時改用另一種寫法，或拿掉分組／篩選再試
+function notionSaveView(viewId, dbId, dsId, v, props, group) {
+  var tries = [];
+  [true, false].forEach(function(extras) {
+    [{ type: 'table', properties: props }, { table: { properties: props } }].forEach(function(cfg) {
+      if (!extras && !group && !v.filter && tries.length) return;
+      var c = JSON.parse(JSON.stringify(cfg));
+      if (extras && group) (c.table || c).group_by = group;
+      var body = { configuration: c };
+      if (v.name) body.name = v.name;
+      if (extras && v.filter) body.filter = v.filter;
+      tries.push(body);
+    });
+  });
+  var lastErr;
+  for (var i = 0; i < tries.length; i++) {
+    var body = tries[i];
+    try {
+      if (viewId) return notionFetch('patch', 'views/' + viewId, body);
+      body.data_source_id = dsId; body.database_id = dbId; body.type = 'table'; body.position = { type: 'end' };
+      return notionFetch('post', 'views', body);
+    } catch (e) {
+      if (e.status !== 400) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+
 // 在你的頁面裡建立「團務對帳」表格和「已結束團務」頁面
 function notionCreateLayout(pageId) {
   notionFetch('get', 'pages/' + pageId); // 先確認頁面已經加入連接
   var list = notionCreateTable(pageId, '團務對帳', notionSchema(notionCampFields()), false);
+  var viewsOk = notionArrangeViews(list.db, list.ds, notionCampViews());
   var endedPage = notionFetch('post', 'pages', {
     parent: { type: 'page_id', page_id: pageId },
     icon: { type: 'emoji', emoji: '📦' },
     properties: { title: { title: richText(NOTION_ENDED_TITLE) } }
   });
   var ended = notionCreateTable(endedPage.id, NOTION_ENDED_TITLE, notionSchema(notionCampFields()), false);
+  viewsOk = notionArrangeViews(ended.db, ended.ds, notionCampViews()) && viewsOk;
   var props = PropertiesService.getScriptProperties();
   props.setProperty(NOTION_DB_KEY, list.db);
   props.setProperty(NOTION_DS_KEY, list.ds);
@@ -503,6 +570,15 @@ function notionCreateLayout(pageId) {
   props.setProperty(NOTION_LAYOUT_KEY, NOTION_LAYOUT);
   saveChunked(NOTION_CAMPS_KEY, {}); // 新的對帳頁，從頭開始
   saveChunked(NOTION_STATE_KEY, {});
+  return { viewsOk: viewsOk };
+}
+
+// 重新設定後，把之前建立的表格和頁面移到 Notion 的垃圾桶（30 天內可以還原）
+function notionTrashOld(old) {
+  var n = 0;
+  if (old.db) { try { notionFetch('patch', 'databases/' + old.db, { in_trash: true }); n++; } catch (ignore) {} }
+  if (old.ended && old.ended.page) { try { notionFetch('patch', 'pages/' + old.ended.page, { in_trash: true }); n++; } catch (ignore) {} }
+  return n;
 }
 
 function notionEndedInfo() {
@@ -529,18 +605,20 @@ function notionSetup() {
   if (!pageId) return ui.alert('看不出這是 Notion 頁面連結，請在 Notion 頁面按「分享 → 複製連結」再貼上');
   var props = PropertiesService.getScriptProperties();
   var oldToken = props.getProperty(NOTION_TOKEN_KEY);
-  var hadOld = !!props.getProperty(NOTION_DS_KEY);
+  var old = { db: props.getProperty(NOTION_DB_KEY), ended: notionEndedInfo() };
   props.setProperty(NOTION_TOKEN_KEY, token);
   try {
-    notionCreateLayout(pageId);
+    var made = notionCreateLayout(pageId);
+    var trashed = notionTrashOld(old);
     installNotionTrigger();
     var r = syncNotion();
     ui.alert('Notion 對帳設定完成',
       '已在 Notion 頁面建立「團務對帳」：同步 ' + (r.campaigns || 0) + ' 個團、' + (r.orders || 0) + ' 筆訂單' +
       (r.ended ? '；另有 ' + r.ended + ' 個已結束的團放在「' + NOTION_ENDED_TITLE + '」' : '') + '。\n' +
-      '點團務名稱進去，裡面有「' + NOTION_FIRST_TITLE + '」和「' + NOTION_SECOND_TITLE + '」兩個表格（量好重量、算出二補的訂單才會出現在二補）。\n' +
+      '點團務名稱進去是那個團的訂單，上方可以切換「' + NOTION_FIRST_TITLE + '」和「' + NOTION_SECOND_TITLE + '」兩個分頁（量好重量、算出二補的訂單才會出現在二補）。\n' +
       '團在後台刪除後會整個搬到「' + NOTION_ENDED_TITLE + '」頁面保留。之後每 ' + NOTION_SYNC_MINUTES + ' 分鐘自動同步一次。' +
-      (hadOld ? '\n\n之前建立的舊表格不會再更新，可以在 Notion 直接刪掉。' : '') +
+      (trashed ? '\n\n之前建立的舊表格已經移到 Notion 的垃圾桶（30 天內可以還原）。' : '') +
+      (made.viewsOk && !r.viewsFailed ? '' : '\n\n（有些表格的欄位順序或分頁沒有設定成功，可以在 Notion 自己拖曳調整；資料同步不受影響）') +
       (r.formulaFailed ? '\n\n（「金額相符」公式欄沒有建立成功，可以之後在 Notion 自己新增）' : '') +
       (r.errors && r.errors.length ? '\n\n有 ' + r.errors.length + ' 筆沒同步成功：' + r.errors[0] : '') +
       (r.pending ? '\n\n訂單比較多，剩下的會在下一輪自動補上。' : ''),
@@ -593,33 +671,21 @@ function sameTime(a, b) {
   return Math.floor(new Date(a).getTime() / 60000) === Math.floor(new Date(b).getTime() / 60000);
 }
 
-// 量好重量或算出二補金額，才放進「二補」表格
-function hasSecondPayment(o) {
-  return (Number(o.secondPayment) || 0) > 0 || (Number(o.weight) || 0) > 0;
-}
-
 // 訂單：系統這邊應該長的樣子
-function notionFirstWanted(o) {
+function notionOrderWanted(o) {
   return {
     title: notionText(o.socialName || '（未填）', 200),
     pay: payLabel(o.payStatus),
     bank5: notionText(o.bank5, 20),
     remit: numOrNull(o.remitAmount),
     total: numOrNull(o.totalAmount),
-    details: notionText(o.orderDetails),
     time: o.timestamp || '',
-    orderId: o.orderId
-  };
-}
-function notionSecondWanted(o) {
-  return {
-    title: notionText(o.socialName || '（未填）', 200),
+    details: notionText(o.orderDetails),
     second: normalizeSecondStatus(o.secondPayStatus),
     weight: numOrNull(o.weight),
     intl: numOrNull(o.intlShipping),
     pack: numOrNull(o.packagingFee),
     secondTotal: numOrNull(o.secondPayment),
-    details: notionText(o.orderDetails),
     orderId: o.orderId
   };
 }
@@ -739,74 +805,65 @@ function ensureOrderIds(orders) {
   });
 }
 
-// 讀出團務頁裡的某個訂單表格；表格還沒建或在 Notion 被刪掉時（重新）建立
-function notionLoadOrderTable(entry, key, title, fields, withFormula, orders, state, report) {
-  if (entry[key]) {
+// 讀出團務頁裡的「訂單」表格；表格還沒建或在 Notion 被刪掉時（重新）建立
+function notionLoadOrderTable(entry, orders, state, report) {
+  var fields = notionOrderFields();
+  if (entry.orders) {
     try {
-      return notionQueryAll(entry[key].ds, fields, function(pg, v) { return v.orderId; });
+      return notionQueryAll(entry.orders.ds, fields, function(pg, v) { return v.orderId; });
     } catch (e) {
       if (e.status !== 404) throw e;
     }
   }
-  var t = notionCreateTable(entry.row, title, notionSchema(fields), withFormula);
+  var t = notionCreateTable(entry.row, NOTION_ORDERS_TITLE, notionSchema(fields), true);
   if (!t.formulaOk) report.formulaFailed = true;
-  var hadTable = !!entry[key];
-  entry[key] = { db: t.db, ds: t.ds };
+  if (!notionArrangeViews(t.db, t.ds, notionOrderViews())) report.viewsFailed = true;
   // 表格被刪掉重建時，訂單全部重新放進去
-  if (hadTable) {
-    var stateKey = key === 'first' ? 'p' : 's';
-    orders.forEach(function(o) { if (state[o.orderId]) delete state[o.orderId][stateKey]; });
-  }
+  if (entry.orders) orders.forEach(function(o) { delete state[o.orderId]; });
+  entry.orders = { db: t.db, ds: t.ds };
   return {};
 }
 
-// 把一筆訂單寫到某個表格；回傳 Notion 上有沒有這一列
-function notionPushOrder(ds, fields, want, page, skipCreate, report) {
-  if (!page) {
-    if (skipCreate) return false;
-    notionFetch('post', 'pages', { parent: { type: 'data_source_id', data_source_id: ds }, properties: notionProps(fields, want) });
-    report.created++;
-    Utilities.sleep(340);
-    return true;
-  }
-  var patch = notionChanged(fields, want, page.values);
-  if (patch) {
-    notionFetch('patch', 'pages/' + page.id, { properties: patch });
-    report.updated++;
-    Utilities.sleep(340);
-  }
-  return true;
-}
-
-// 同步一個團的「第一次匯款」與「二補」表格；時間用完時回傳 false
+// 同步一個團的「訂單」表格；時間用完時回傳 false
 function syncCampaignOrders(entry, orders, state, report, started) {
-  var firstFields = notionFirstFields(), secondFields = notionSecondFields();
-  var firstPages = notionLoadOrderTable(entry, 'first', NOTION_FIRST_TITLE, firstFields, true, orders, state, report);
-  var secondPages = notionLoadOrderTable(entry, 'second', NOTION_SECOND_TITLE, secondFields, false, orders, state, report);
+  var fields = notionOrderFields();
+  var pages = notionLoadOrderTable(entry, orders, state, report);
   for (var i = 0; i < orders.length; i++) {
     var o = orders[i];
     if (!o.orderId) continue;
     if (Date.now() - started > NOTION_TIME_BUDGET_MS) return false;
-    var st = state[o.orderId] = state[o.orderId] || {};
-    var w1 = notionFirstWanted(o), w2 = notionSecondWanted(o);
-    var p1 = firstPages[o.orderId], p2 = secondPages[o.orderId];
+    var st = state[o.orderId] || {};
+    var want = notionOrderWanted(o);
+    var page = pages[o.orderId];
     try {
-      var pay = p1 ? resolveTwoWay(w1.pay, p1.values.pay, st.p) : w1.pay;
-      var second = p2 ? resolveTwoWay(w2.second, p2.values.second, st.s) : w2.second;
+      if (!page) {
+        if (st.p !== undefined) continue; // 同步過、但在 Notion 被刪掉 → 尊重刪除，不再建立
+        notionFetch('post', 'pages', { parent: { type: 'data_source_id', data_source_id: entry.orders.ds }, properties: notionProps(fields, want) });
+        report.created++;
+        state[o.orderId] = { p: want.pay, s: want.second };
+        Utilities.sleep(340);
+        continue;
+      }
+      var pay = resolveTwoWay(want.pay, page.values.pay, st.p);
+      var second = resolveTwoWay(want.second, page.values.second, st.s);
       // 寫回失敗時會丟出錯誤：這筆不更新 Notion、不更新同步紀錄，下一輪重試（不會把 Notion 的修改蓋掉）
-      if (pay !== w1.pay || second !== w2.second) {
+      if (pay !== want.pay || second !== want.second) {
         withShortLock(function() {
-          if (pay !== w1.pay && !writeOrderCell(o.spreadsheetId, ORDER_SHEET, o.orderId, '付款狀態', payValueForSheet(pay))) throw new Error('找不到訂單列');
-          if (second !== w2.second && !writeOrderCell(o.spreadsheetId, SECOND_SHEET, o.orderId, '二補收款狀態', second, o.phone)) throw new Error('找不到二補列');
+          if (pay !== want.pay && !writeOrderCell(o.spreadsheetId, ORDER_SHEET, o.orderId, '付款狀態', payValueForSheet(pay))) throw new Error('找不到訂單列');
+          if (second !== want.second && !writeOrderCell(o.spreadsheetId, SECOND_SHEET, o.orderId, '二補收款狀態', second, o.phone)) throw new Error('找不到二補列');
         });
-        report.pulled += (pay !== w1.pay ? 1 : 0) + (second !== w2.second ? 1 : 0);
+        report.pulled += (pay !== want.pay ? 1 : 0) + (second !== want.second ? 1 : 0);
         o.payStatus = payValueForSheet(pay);
         o.secondPayStatus = second;
-        w1.pay = pay; w2.second = second;
+        want.pay = pay; want.second = second;
       }
-      // 同步過、但在 Notion 被刪掉的列 → 尊重刪除，不再建立
-      if (notionPushOrder(entry.first.ds, firstFields, w1, p1, st.p !== undefined, report)) st.p = pay;
-      if (notionPushOrder(entry.second.ds, secondFields, w2, p2, st.s !== undefined || !hasSecondPayment(o), report)) st.s = second;
+      var patch = notionChanged(fields, want, page.values);
+      if (patch) {
+        notionFetch('patch', 'pages/' + page.id, { properties: patch });
+        report.updated++;
+        Utilities.sleep(340);
+      }
+      state[o.orderId] = { p: pay, s: second };
     } catch (e) {
       report.errors.push((o.socialName || o.orderId) + '：' + e.message);
       if (e.status === 401) throw e; // 權杖有問題，後面的也不會成功
