@@ -272,11 +272,10 @@ function onOpen() {
     .addItem('整理系統設定', 'tidySettingsSheet')
     .addSeparator()
     .addItem('Notion 對帳：設定', 'notionSetup')
-    .addItem('Notion 對帳：立即同步', 'notionSyncNow')
-    .addItem('Notion 對帳：停止自動同步', 'notionStop')
+    .addItem('TWT：同步到 Notion', 'notionSyncNow')
     .addSeparator()
-    .addItem('賣貨便／KOCA：立即讀取通知信', 'emailOrdersNow')
-    .addItem('賣貨便／KOCA：停止自動讀取', 'emailOrdersStop')
+    .addItem('賣貨便：讀取通知信並同步', 'myshipSyncNow')
+    .addItem('KOCA：讀取通知信並同步', 'kocaSyncNow')
     .addToUi();
 }
 
@@ -311,7 +310,7 @@ function tidySettingsSheet() {
 // ・訂單：每筆訂單一列，依付款狀態分組（未付款、金額不符在前面），有二補金額欄
 // ・二補：已經在後台算好二補的訂單（重量、國際運費、包材費、二補金額都直接讀 Google Sheet 的「匯率與二補」），依收款狀態分組
 // 雙向同步：付款狀態、二補收款狀態。其他欄位由 Google Sheet 寫到 Notion。
-// 每 10 分鐘自動同步一次；選單「TWT 代購 → Notion 對帳：立即同步」可馬上同步
+// 不會自動同步：要更新時按選單「TWT 代購 → TWT：同步到 Notion」（之前設定的每 10 分鐘自動同步會自動移除）
 // 使用 Notion API 2025-09-03。Notion 現在把「整合」改稱「連接」。
 // ══════════════════════════════════════════
 var NOTION_API = 'https://api.notion.com/v1/';
@@ -324,8 +323,7 @@ var NOTION_CAMPS_KEY = '__NOTION_CAMPS_';       // 各團在 Notion 的頁面與
 var NOTION_STATE_KEY = '__NOTION_STATE_';       // 每筆訂單上次同步時兩邊一致的狀態：{ 訂單編號: { p: 付款狀態, s: 二補收款狀態 } }
 var NOTION_OLD_DB_KEY = '__NOTION_DB__';        // 舊版面（表格式）留下的設定，重新設定時清掉
 var NOTION_OLD_KEYS = ['__NOTION_DB__', '__NOTION_DS__', '__NOTION_ENDED__'];
-var NOTION_SYNC_MINUTES = 10;
-var NOTION_TIME_BUDGET_MS = 270000;             // 單次最多跑 4.5 分鐘，剩下的下一輪繼續
+var NOTION_TIME_BUDGET_MS = 270000;             // 單次最多跑 4.5 分鐘，剩下的再按一次同步接著做
 var NOTION_ACTIVE_TITLE = '進行中團務';
 var NOTION_ENDED_TITLE = '已結束團務';
 var NOTION_TABLE_TITLE = '訂單與二補';
@@ -542,21 +540,13 @@ function notionSaveView(viewId, dbId, dsId, v, props, group) {
   }
   throw lastErr;
 }
-function installNotionTrigger() {
+// 改成手動同步：拿掉之前設定的每 10 分鐘自動同步（按任何一個同步、或舊的自動同步再跑一次時就會拿掉）
+function removeSyncTriggers() {
+  var n = 0;
   ScriptApp.getProjectTriggers().forEach(function(t) {
-    if (t.getHandlerFunction() === 'syncNotion') ScriptApp.deleteTrigger(t);
+    if (t.getHandlerFunction() === 'syncNotion') { ScriptApp.deleteTrigger(t); n++; }
   });
-  ScriptApp.newTrigger('syncNotion').timeBased().everyMinutes(NOTION_SYNC_MINUTES).create();
-  PropertiesService.getScriptProperties().deleteProperty(SYNC_STOPPED_KEY);
-}
-function notionStop() {
-  ScriptApp.getProjectTriggers().forEach(function(t) {
-    if (t.getHandlerFunction() === 'syncNotion') ScriptApp.deleteTrigger(t);
-  });
-  var sp = PropertiesService.getScriptProperties();
-  sp.setProperty(SYNC_STOPPED_KEY, '1');
-  var msg = '已停止自動同步（Notion 裡的資料保留）' + (sp.getProperty(EMAIL_ON_KEY) ? '；賣貨便／KOCA 通知信也不會自動讀取' : '');
-  try { getMainSpreadsheetOrThrow().toast(msg, 'Notion 對帳', 8); } catch (ignore) {}
+  return n;
 }
 // ── 欄位轉換 ──
 function payLabel(v) {
@@ -626,7 +616,7 @@ function saveChunked(prefix, obj) {
 // 寫入 Google Sheet 時才短暫排隊，不會擋住買家下單
 function withShortLock(fn) {
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) throw new Error('系統忙碌中，下一輪再寫回');
+  if (!lock.tryLock(10000)) throw new Error('系統忙碌中，請稍後再同步一次');
   try { return fn(); } finally { lock.releaseLock(); }
 }
 // 寫回 Google Sheet：用訂單編號找到那一列；舊的二補列沒有訂單編號時用手機號碼找
@@ -800,19 +790,19 @@ function notionSetup() {
     var old = notionOldLayout();
     notionCreateLayout(pageId);
     var trashed = notionTrashOld(old);
-    installNotionTrigger();
+    removeSyncTriggers();
     var r = syncNotion();
     ui.alert('Notion 對帳設定完成',
       '已在 Notion 頁面建立「📋 ' + NOTION_ACTIVE_TITLE + '」和「📦 ' + NOTION_ENDED_TITLE + '」：同步 ' + (r.campaigns || 0) + ' 個團、' + (r.orders || 0) + ' 筆訂單' +
       (r.ended ? '；另有 ' + r.ended + ' 個已結束的團放在「' + NOTION_ENDED_TITLE + '」' : '') + '。\n' +
       '每個團都有自己的頁面：最上面是摘要，下面的「' + NOTION_TABLE_TITLE + '」表格用分頁切換「訂單／二補」。\n' +
-      '二補的重量和金額直接讀 Google Sheet（在後台算好二補就會出現）。之後每 ' + NOTION_SYNC_MINUTES + ' 分鐘自動同步一次。' +
-      (r.email && r.email.ran ? '\n賣貨便、KOCA 的訂單另外放在「🏪 賣貨便訂單」「🛒 KOCA 訂單」兩個頁面。' : '') +
+      '二補的重量和金額直接讀 Google Sheet（在後台算好二補就會出現）。不會自動同步：之後要更新時，按「TWT 代購 → TWT：同步到 Notion」。' +
+      (emailChannels().some(function(c) { return getMainSpreadsheetOrThrow().getSheetByName(c.sheet); }) ? '\n賣貨便、KOCA 的 Notion 頁面按各自的「讀取通知信並同步」就會建立。' : '') +
       (trashed ? '\n\n之前建立的舊表格和頁面已經移到 Notion 的垃圾桶（30 天內可以還原）。' : '') +
       (r.viewsFailed ? '\n\n（有些表格的欄位順序沒有設定成功，可以在 Notion 自己拖曳調整；資料同步不受影響）' : '') +
       (r.formulaFailed ? '\n\n（「金額相符」公式欄沒有建立成功，可以之後在 Notion 自己新增）' : '') +
       (r.errors && r.errors.length ? '\n\n有 ' + r.errors.length + ' 筆沒同步成功：' + r.errors[0] : '') +
-      (r.pending ? '\n\n資料比較多，剩下的會在下一輪自動補上。' : ''),
+      (r.pending ? '\n\n資料比較多，還沒同步完：再按一次「TWT：同步到 Notion」會接著做。' : ''),
       ui.ButtonSet.OK);
   } catch (e) {
     if (oldToken) props.setProperty(NOTION_TOKEN_KEY, oldToken); else props.deleteProperty(NOTION_TOKEN_KEY);
@@ -821,12 +811,12 @@ function notionSetup() {
 }
 
 function notionSyncNow() {
+  removeSyncTriggers();
   var r = syncNotion();
   var msg = r.skipped ? r.skipped
     : ((r.upgraded ? 'Notion 已換成新版面（舊頁面在垃圾桶）；' : '') + '新增 ' + r.created + ' 筆、更新 ' + r.updated + ' 筆到 Notion；從 Notion 寫回 ' + r.pulled + ' 筆狀態' +
        (r.ended ? '；' + r.ended + ' 個團移到「' + NOTION_ENDED_TITLE + '」' : '') +
-       (r.errors.length ? '；' + r.errors.length + ' 筆失敗：' + r.errors[0] : '') + (r.pending ? '；其餘下一輪繼續' : ''));
-  if (r.email && r.email.ran) msg += '；' + emailShortText(r.email);
+       (r.errors.length ? '；' + r.errors.length + ' 筆失敗：' + r.errors[0] : '') + (r.pending ? '；還沒同步完，再按一次會接著做' : ''));
   try { getMainSpreadsheetOrThrow().toast(msg, 'Notion 對帳', 10); } catch (ignore) {}
   return msg;
 }
@@ -902,7 +892,7 @@ function syncOrderRows(rows, ds, fields, orders, state, report, started) {
       }
       var pay = resolveTwoWay(want.pay, page.values.pay, st.p);
       var second = resolveTwoWay(want.second, page.values.second, st.s);
-      // 寫回失敗時會丟出錯誤：這筆不更新 Notion、不更新同步紀錄，下一輪重試（不會把 Notion 的修改蓋掉）
+      // 寫回失敗時會丟出錯誤：這筆不更新 Notion、不更新同步紀錄，下次同步重試（不會把 Notion 的修改蓋掉）
       if (pay !== want.pay || second !== want.second) {
         withShortLock(function() {
           if (pay !== want.pay && !writeOrderCell(o.spreadsheetId, ORDER_SHEET, o.orderId, '付款狀態', payValueForSheet(pay))) throw new Error('找不到訂單列');
@@ -991,23 +981,23 @@ function notionRebuildLayout(pages, orders, state, report) {
   notionTrashOld({ db: null, pages: [pages.active, pages.ended] });
 }
 
-function syncNotion() {
+// TWT 各團同步到 Notion。只由選單執行；之前設定的每 10 分鐘自動同步（會帶 e）跑到這裡時，把自己拿掉、不做事
+function syncNotion(e) {
+  if (e) { removeSyncTriggers(); return { skipped: '已改成手動同步' }; }
   var sp = PropertiesService.getScriptProperties();
   var pages = notionPagesInfo();
-  // Notion 還沒設定好時，賣貨便／KOCA 的通知信照樣讀進 Google Sheet
-  if (!sp.getProperty(NOTION_TOKEN_KEY) || (!pages && !sp.getProperty(NOTION_OLD_DB_KEY))) return emailOnlyRun({ skipped: '尚未設定 Notion 對帳' });
+  if (!sp.getProperty(NOTION_TOKEN_KEY) || (!pages && !sp.getProperty(NOTION_OLD_DB_KEY))) return { skipped: '尚未設定 Notion 對帳' };
   var layout = sp.getProperty(NOTION_LAYOUT_KEY);
   var upgradable = layout === '4' || layout === '5'; // 這兩版會自動換成新版，不用重新設定
   if (!pages || (layout !== NOTION_LAYOUT && !upgradable)) {
-    return emailOnlyRun({ skipped: 'Notion 對帳的版面更新了，請再執行一次「TWT 代購 → Notion 對帳：設定」' });
+    return { skipped: 'Notion 對帳的版面更新了，請再執行一次「TWT 代購 → Notion 對帳：設定」' };
   }
-  // 同一時間只跑一個同步（自動與手動同時觸發時）；不佔用下單用的鎖
+  // 同一時間只跑一個同步（連按兩次，或 TWT、賣貨便、KOCA 同時按時）；不佔用下單用的鎖
   var cache = CacheService.getScriptCache();
   if (cache.get('notion_sync_running')) return { skipped: '同步正在進行中' };
   cache.put('notion_sync_running', '1', 330);
   var started = Date.now();
-  var report = { campaigns: 0, orders: 0, ended: 0, created: 0, updated: 0, pulled: 0, errors: [], pending: false,
-    email: emailNewReport(), notionExt: { created: 0, updated: 0, pulled: 0 } };
+  var report = { campaigns: 0, orders: 0, ended: 0, created: 0, updated: 0, pulled: 0, errors: [], pending: false };
   var map = null, state = null;
   try {
     _catalogMemo = null;
@@ -1018,12 +1008,6 @@ function syncNotion() {
       notionRebuildLayout(pages, orders, loadChunked(NOTION_STATE_KEY), report);
       report.upgraded = true;
       pages = notionPagesInfo();
-    }
-    // 賣貨便／KOCA 的通知信（有開啟時）：先讀新的信，再同步到各自的 Notion 頁面（跟 TWT 各團的頁面分開）
-    if (sp.getProperty(EMAIL_ON_KEY)) {
-      try { scanOrderEmails(report.email, EMAIL_TIME_BUDGET_MS); }
-      catch (e) { report.errors.push('讀取賣貨便／KOCA 通知信：' + e.message); }
-      notionSyncChannels(pages, report, started);
     }
     map = loadChunked(NOTION_CAMPS_KEY);
     state = loadChunked(NOTION_STATE_KEY);
@@ -1114,22 +1098,20 @@ function syncNotion() {
 //   新訂單 → 新增一筆（待出貨）；訂單完成 → 已完成，記下進帳明細（運費、平台服務費、金流服務費、進帳金額）
 //   提領完成 → 記在提領紀錄（提領金額、提領手續費、入帳金額）
 // 狀態雙向：在 Notion 改（例如寄出後改成「已出貨」）會寫回 Google Sheet；之後收到這筆訂單更新的通知信時以信為準
-// 第一次請按選單「TWT 代購 → 賣貨便／KOCA：立即讀取通知信」（Google 會要求允許讀取 Gmail）
-// 之後跟 Notion 對帳一起每 10 分鐘自動讀取。只讀信：不會寄信、刪信，也不會改已讀狀態或標籤
+// 不會自動讀信：要更新時按選單「TWT 代購 → 賣貨便：讀取通知信並同步」或「KOCA：讀取通知信並同步」，兩個平台各讀各的
+// 第一次按的時候 Google 會要求允許讀取 Gmail。只讀信：不會寄信、刪信，也不會改已讀狀態或標籤
 // ══════════════════════════════════════════
 var MYSHIP_SHEET = '賣貨便訂單';
 var KOCA_SHEET = 'KOCA 訂單';
 var KOCA_PAYOUT_SHEET = 'KOCA 提領';
-var EMAIL_ON_KEY = '__EMAIL_ON__';             // 有值 = 自動讀取通知信
-var EMAIL_SINCE_KEY = '__EMAIL_SINCE__';       // 讀到的最後一封信的時間（秒）
-var EMAIL_SEEN_KEY = '__EMAIL_SEEN_';          // 最近讀過的信：往前多看的那兩天裡不再重讀
-var EMAIL_PARSER_KEY = '__EMAIL_PARSER__';
-var EMAIL_PARSER_VERSION = '1';                // 讀信規則改了就換號碼：下一輪自動重讀最近 EMAIL_FIRST_DAYS 天的信（同一筆訂單不會重複）
+var EMAIL_PARSER_VERSION = '1';                // 讀信規則改了就換號碼：下次同步時重讀最近 EMAIL_FIRST_DAYS 天的信（同一筆訂單不會重複）
 var EMAIL_FIRST_DAYS = 180;                    // 第一次讀最近幾天的信
 var EMAIL_OVERLAP_SEC = 2 * 86400;             // 每次往前多看兩天，晚到的信也不會漏
-var EMAIL_TIME_BUDGET_MS = 120000;
-var EMAIL_QUERY = '{from:sp88.com from:7-11.com.tw from:koca.shop "koca.shop" 酷卡宇宙}';
-var SYNC_STOPPED_KEY = '__SYNC_STOPPED__';     // 選單「停止自動同步」後，讀信時不要自己再打開
+var EMAIL_MENU_BUDGET_MS = 200000;             // 讀信最多 3 分 20 秒，剩下的再按一次接著讀
+// 各平台讀到哪裡：{ since: 最後一封信的時間（秒）, seen: 最近讀過的信（往前多看的兩天裡不再重讀）, parser: 讀信規則的版本 }
+function emailKeys(c) {
+  return { since: '__EMAIL_SINCE_' + c.id + '__', seen: '__EMAIL_SEEN_' + c.id + '_', parser: '__EMAIL_PARSER_' + c.id + '__' };
+}
 var MYSHIP_HEADERS = ['訂單編號', '狀態', '訂單日期', '賣場', '買家', '收件資訊', '商品明細', '商品金額', '運費', '訂單總額',
   '付款方式', '配送方式', '買家回饋', '訂單備註', '最後通知時間', '信件連結', '更新時間（系統用）'];
 var KOCA_HEADERS = ['訂單編號', '狀態', '訂單日期', '買家', '商品明細', '商品小計', '運費', '總金額',
@@ -1145,13 +1127,14 @@ var KOCA_STATUS_OPTIONS = [
   { name: '已完成', color: 'green' }, { name: '已取消', color: 'gray' }, { name: '退貨／退款', color: 'gray' }
 ];
 
-// 兩個平台各自的 Google Sheet 分頁、Notion 頁面與表格
+// 兩個平台各自的 Gmail 搜尋、Google Sheet 分頁、Notion 頁面與表格
 function emailChannels() {
   return [
-    { id: 'myship', name: '賣貨便', sheet: MYSHIP_SHEET, headers: MYSHIP_HEADERS, numbers: ['商品金額', '運費', '訂單總額'],
+    { id: 'myship', name: '賣貨便', query: '{from:sp88.com from:7-11.com.tw}',
+      sheet: MYSHIP_SHEET, headers: MYSHIP_HEADERS, numbers: ['商品金額', '運費', '訂單總額'],
       wraps: ['商品明細', '收件資訊', '買家回饋', '訂單備註'], notionKey: '__NOTION_MYSHIP_', title: '賣貨便訂單', emoji: '🏪',
       spec: notionMyshipSpec, wanted: notionMyshipWanted, summary: notionMyshipSummary },
-    { id: 'koca', name: 'KOCA', sheet: KOCA_SHEET, headers: KOCA_HEADERS,
+    { id: 'koca', name: 'KOCA', query: '{from:koca.shop "koca.shop" 酷卡宇宙}', sheet: KOCA_SHEET, headers: KOCA_HEADERS,
       numbers: ['商品小計', '運費', '總金額', '平台服務費', '金流服務費', '其他扣款', '進帳金額'],
       wraps: ['商品明細', '費用明細'], notionKey: '__NOTION_KOCA_', title: 'KOCA 訂單', emoji: '🛒',
       spec: notionKocaSpec, wanted: notionKocaWanted, summary: notionKocaSummary, payouts: true }
@@ -1416,7 +1399,7 @@ function emailSearchLink(to, query) {
   return 'https://mail.google.com/mail/' + (me ? '?authuser=' + encodeURIComponent(me[0]) : 'u/0/') + '#search/' + encodeURIComponent(query);
 }
 function emailNewReport() {
-  return { ran: false, mails: 0, created: { myship: 0, koca: 0 }, updated: { myship: 0, koca: 0 }, payouts: 0, unmatched: 0, skipped: 0, unknown: [], errors: [], pending: false };
+  return { ran: false, mails: 0, created: 0, updated: 0, payouts: 0, unmatched: 0, skipped: 0, unknown: [], errors: [], pending: false };
 }
 
 // 主控表的「賣貨便訂單」「KOCA 訂單」「KOCA 提領」分頁讀成 { 欄名: 值 }
@@ -1434,35 +1417,34 @@ function extWriteSheet(name, headers, rows, numberCols, wrapCols) {
     return headers.map(function(h) { return o[h] == null ? '' : o[h]; });
   }), numberCols, wrapCols);
 }
-function emailLoadStore() {
-  var store = { ch: {} };
-  emailChannels().forEach(function(c) {
-    var rows = extReadSheet(c.sheet, c.headers), byNo = {};
-    rows.forEach(function(r) { if (r['訂單編號']) byNo[String(r['訂單編號'])] = r; });
-    store.ch[c.id] = { c: c, rows: rows, byNo: byNo, dirty: false };
-  });
-  var payouts = extReadSheet(KOCA_PAYOUT_SHEET, KOCA_PAYOUT_HEADERS), keys = {};
-  payouts.forEach(function(r) { keys[String(r['入帳時間'])] = true; });
-  store.payouts = { rows: payouts, keys: keys, dirty: false };
+// 一個平台的訂單（KOCA 另外有提領紀錄）
+function emailLoadStore(c) {
+  var rows = extReadSheet(c.sheet, c.headers), byNo = {};
+  rows.forEach(function(r) { if (r['訂單編號']) byNo[String(r['訂單編號'])] = r; });
+  var store = { c: c, rows: rows, byNo: byNo, dirty: false, payouts: null };
+  if (c.payouts) {
+    var payouts = extReadSheet(KOCA_PAYOUT_SHEET, KOCA_PAYOUT_HEADERS), keys = {};
+    payouts.forEach(function(r) { keys[String(r['入帳時間'])] = true; });
+    store.payouts = { rows: payouts, keys: keys, dirty: false };
+  }
   return store;
 }
 function emailSaveStore(store) {
-  Object.keys(store.ch).forEach(function(id) {
-    var s = store.ch[id];
-    if (s.dirty) extWriteSheet(s.c.sheet, s.c.headers, s.rows, s.c.numbers, s.c.wraps);
-  });
-  if (store.payouts.dirty) extWriteSheet(KOCA_PAYOUT_SHEET, KOCA_PAYOUT_HEADERS, store.payouts.rows, ['提領金額', '提領手續費', '入帳金額'], []);
+  var c = store.c;
+  if (store.dirty) extWriteSheet(c.sheet, c.headers, store.rows, c.numbers, c.wraps);
+  if (store.payouts && store.payouts.dirty) extWriteSheet(KOCA_PAYOUT_SHEET, KOCA_PAYOUT_HEADERS, store.payouts.rows, ['提領金額', '提領手續費', '入帳金額'], []);
 }
 
-// 一封信寫進 Google Sheet（在記憶體裡，最後一起寫入）
+// 一封信寫進 Google Sheet（在記憶體裡，最後一起寫入）；不是這個平台的信就跳過
 function emailApply(store, p, sec, er) {
-  if (!p.channel) return;
+  if (p.channel !== store.c.id) return;
   er.mails++;
   var d = p.data;
   if (!d) { if (p.hasOrderNo) er.unknown.push(p.subject); return; }
   if (d.skip) { er.skipped++; return; }
   var link = emailSearchLink(p.to, d.search);
   if (d.payout) {
+    if (!store.payouts) return;
     if (store.payouts.keys[d.when]) return;
     var pr = {};
     KOCA_PAYOUT_HEADERS.forEach(function(h) { pr[h] = d.fields[h] == null ? '' : d.fields[h]; });
@@ -1473,7 +1455,7 @@ function emailApply(store, p, sec, er) {
     er.payouts++;
     return;
   }
-  var s = store.ch[p.channel], row = s.byNo[d.orderNo];
+  var s = store, row = s.byNo[d.orderNo];
   if (!row) {
     // 只有取貨、取消這類通知、找不到原本的訂單：訂單成立的信太舊（超過 EMAIL_FIRST_DAYS 天），或是自己當買家的訂單
     if (!d.full) { er.unmatched++; return; }
@@ -1483,7 +1465,7 @@ function emailApply(store, p, sec, er) {
     s.rows.push(row);
     s.byNo[d.orderNo] = row;
     s.dirty = true;
-    er.created[p.channel]++;
+    er.created++;
   }
   if (!d.status) er.unknown.push(p.subject);
   Object.keys(d.fields).forEach(function(h) {
@@ -1495,7 +1477,7 @@ function emailApply(store, p, sec, er) {
   // 狀態只用比上次新的信：在 Notion 手動改的狀態，不會被重讀到的舊信蓋回去
   var last = Number(row['更新時間（系統用）']) || 0;
   if (d.status && sec > last) {
-    if (row['狀態'] && row['狀態'] !== d.status) er.updated[p.channel]++;
+    if (row['狀態'] && row['狀態'] !== d.status) er.updated++;
     row['狀態'] = d.status;
     row['更新時間（系統用）'] = String(sec);
     row['最後通知時間'] = extFmtTime(new Date(sec * 1000));
@@ -1503,18 +1485,19 @@ function emailApply(store, p, sec, er) {
   }
 }
 
-// 讀新的通知信。第一次讀最近 EMAIL_FIRST_DAYS 天；之後從上次讀到的地方往前多看兩天
-function scanOrderEmails(er, budgetMs) {
+// 讀一個平台新的通知信。第一次讀最近 EMAIL_FIRST_DAYS 天；之後從上次讀到的地方往前多看兩天
+function scanOrderEmails(c, er, budgetMs) {
   var started = Date.now();
   var sp = PropertiesService.getScriptProperties();
-  var fresh = sp.getProperty(EMAIL_PARSER_KEY) !== EMAIL_PARSER_VERSION;
-  var since = fresh ? 0 : Number(sp.getProperty(EMAIL_SINCE_KEY) || 0);
+  var keys = emailKeys(c);
+  var fresh = sp.getProperty(keys.parser) !== EMAIL_PARSER_VERSION;
+  var since = fresh ? 0 : Number(sp.getProperty(keys.since) || 0);
   if (!since) { since = Math.floor(started / 1000) - EMAIL_FIRST_DAYS * 86400; fresh = true; }
   var after = fresh ? since : since - EMAIL_OVERLAP_SEC;
-  var seen = fresh ? {} : loadChunked(EMAIL_SEEN_KEY);
+  var seen = fresh ? {} : loadChunked(keys.seen);
   var threads = [];
   for (var start = 0; start < 5000; start += 100) {
-    var batch = GmailApp.search(EMAIL_QUERY + ' after:' + after, start, 100);
+    var batch = GmailApp.search(c.query + ' after:' + after, start, 100);
     threads = threads.concat(batch);
     if (batch.length < 100) break;
   }
@@ -1528,43 +1511,33 @@ function scanOrderEmails(er, budgetMs) {
     });
   }
   items.sort(function(a, b) { return a.sec - b.sec; });
-  var store = emailLoadStore(), latest = since;
+  var store = emailLoadStore(c), latest = since;
   for (var i = 0; i < items.length; i++) {
-    if (Date.now() - started > budgetMs) { er.pending = true; break; } // 從舊到新讀，剩下的下一輪接著讀
+    if (Date.now() - started > budgetMs) { er.pending = true; break; } // 從舊到新讀，剩下的再按一次接著讀
     var it = items[i];
     try { emailApply(store, emailParse(it.msg), it.sec, er); }
     catch (e) { er.errors.push((it.msg.getSubject() || '') + '：' + e.message); }
     seen[it.msg.getId()] = it.sec;
     if (it.sec > latest) latest = it.sec;
   }
-  emailSaveStore(store); // 寫入失敗會丟出錯誤：讀到哪裡不會記下，下一輪重讀
+  emailSaveStore(store); // 寫入失敗會丟出錯誤：讀到哪裡不會記下，下次重讀
   var keep = {};
   Object.keys(seen).forEach(function(id) { if (seen[id] >= latest - EMAIL_OVERLAP_SEC - 3600) keep[id] = seen[id]; });
-  saveChunked(EMAIL_SEEN_KEY, keep);
-  sp.setProperty(EMAIL_SINCE_KEY, String(latest));
-  sp.setProperty(EMAIL_PARSER_KEY, EMAIL_PARSER_VERSION);
+  saveChunked(keys.seen, keep);
+  sp.setProperty(keys.since, String(latest));
+  sp.setProperty(keys.parser, EMAIL_PARSER_VERSION);
   er.ran = true;
 }
 
-function emailSummaryText(er) {
-  if (!er || !er.ran) return '';
+function emailSummaryText(c, er) {
   var lines = [];
-  if (!er.mails) lines.push('沒有新的賣貨便／KOCA 通知信。');
-  else {
-    lines.push('讀了 ' + er.mails + ' 封通知信：');
-    lines.push('・賣貨便：新增 ' + er.created.myship + ' 筆訂單、更新 ' + er.updated.myship + ' 筆狀態');
-    lines.push('・KOCA：新增 ' + er.created.koca + ' 筆訂單、更新 ' + er.updated.koca + ' 筆狀態' + (er.payouts ? '、提領 ' + er.payouts + ' 筆' : ''));
-  }
+  if (!er.mails) lines.push('沒有新的' + c.name + '通知信。');
+  else lines.push('讀了 ' + er.mails + ' 封' + c.name + '通知信：新增 ' + er.created + ' 筆訂單、更新 ' + er.updated + ' 筆狀態' + (er.payouts ? '、提領 ' + er.payouts + ' 筆' : '') + '。');
   if (er.unmatched) lines.push('有 ' + er.unmatched + ' 封取貨、取消之類的通知找不到原本的訂單（訂單成立的信超過 ' + EMAIL_FIRST_DAYS + ' 天，或是你自己當買家的訂單），沒有記。');
   if (er.unknown.length) lines.push('看不懂的通知信（請告訴我，我再加上）：' + er.unknown.slice(0, 3).join('、') + (er.unknown.length > 3 ? ' 等 ' + er.unknown.length + ' 封' : ''));
   if (er.errors.length) lines.push(er.errors.length + ' 封讀取失敗：' + er.errors[0]);
-  if (er.pending) lines.push('信比較多，剩下的下一輪自動接著讀。');
+  if (er.pending) lines.push('信比較多，還沒讀完：再按一次會接著讀。');
   return lines.join('\n');
-}
-function emailShortText(er) {
-  if (!er || !er.ran) return '';
-  var n = er.created.myship + er.created.koca, u = er.updated.myship + er.updated.koca;
-  return '賣貨便／KOCA 通知信 ' + er.mails + ' 封（新增 ' + n + ' 筆、更新 ' + u + ' 筆' + (er.payouts ? '、提領 ' + er.payouts + ' 筆' : '') + '）';
 }
 
 // ── Notion：「🏪 賣貨便訂單」「🛒 KOCA 訂單」兩個獨立的頁面 ──
@@ -1693,21 +1666,22 @@ function emailStatusLine(rows, options) {
   return parts.length ? rows.length + ' 筆：' + parts.join('・') : '還沒有訂單';
 }
 function emailSum(rows, col) { return rows.reduce(function(t, r) { return t + (Number(r[col]) || 0); }, 0); }
-function emailReadLine() {
-  var since = Number(PropertiesService.getScriptProperties().getProperty(EMAIL_SINCE_KEY) || 0);
-  return since ? '讀到 ' + extFmtTime(new Date(since * 1000)) + ' 的信；每 ' + NOTION_SYNC_MINUTES + ' 分鐘自動讀取新的信' : '還沒有讀到通知信';
+function emailReadLine(c) {
+  var since = Number(PropertiesService.getScriptProperties().getProperty(emailKeys(c).since) || 0);
+  return (since ? '讀到 ' + extFmtTime(new Date(since * 1000)) + ' 的信' : '還沒有讀到通知信') +
+    '；要更新時按 Google Sheet 選單「TWT 代購 → ' + c.name + '：讀取通知信並同步」';
 }
-var EMAIL_STATUS_HINT = '\n狀態可以直接在表格裡改（例如寄出後改成「已出貨」）；收到這筆訂單新的通知信時會自動更新';
-function notionMyshipSummary(rows) {
+var EMAIL_STATUS_HINT = '\n狀態可以直接在表格裡改（例如寄出後改成「已出貨」）；之後讀到這筆訂單新的通知信時會再更新';
+function notionMyshipSummary(c, rows) {
   var live = rows.filter(function(r) { return !/取消|退/.test(String(r['狀態'] || '')); });
   return notionCallout([
     ['訂單　', true], [emailStatusLine(rows, MYSHIP_STATUS_OPTIONS)],
     ['\n金額　', true], [live.length ? '訂單總額 ' + fmtMoney(emailSum(live, '訂單總額')) + '（含運費 ' + fmtMoney(emailSum(live, '運費')) + '；不含已取消、退貨）' : '—'],
-    ['\n通知信　', true], [emailReadLine()],
+    ['\n通知信　', true], [emailReadLine(c)],
     [EMAIL_STATUS_HINT]
   ], '🏪');
 }
-function notionKocaSummary(rows, payouts) {
+function notionKocaSummary(c, rows, payouts) {
   var done = rows.filter(function(r) { return extNum(r['進帳金額']) != null; });
   var open = rows.filter(function(r) { return extNum(r['進帳金額']) == null && !/取消|退/.test(String(r['狀態'] || '')); });
   var other = emailSum(done, '其他扣款');
@@ -1720,7 +1694,7 @@ function notionKocaSummary(rows, payouts) {
     ['\n已完成的訂單　', true], [settled],
     ['\n還沒完成　', true], [open.length ? open.length + ' 筆・總金額 ' + fmtMoney(emailSum(open, '總金額')) + '（完成後才知道實際扣多少費用）' : '—'],
     ['\n提領　', true], [payouts.length ? '已入帳 ' + fmtMoney(emailSum(payouts, '入帳金額')) + '（' + payouts.length + ' 次' + (fee ? '，提領手續費 ' + fmtMoney(fee) : '') + '）' : '還沒有'],
-    ['\n通知信　', true], [emailReadLine()],
+    ['\n通知信　', true], [emailReadLine(c)],
     [EMAIL_STATUS_HINT]
   ], '🛒');
 }
@@ -1792,9 +1766,9 @@ function notionSyncChannelRows(c, ext, rows, report, started) {
     try {
       extWriteSheet(c.sheet, c.headers, rows, c.numbers, c.wraps);
     } catch (e) {
-      // 寫不回 Google Sheet：同步紀錄還原，下一輪再寫（Notion 改的狀態不會被蓋掉）
+      // 寫不回 Google Sheet：同步紀錄還原，下次同步再寫（Notion 改的狀態不會被蓋掉）
       Object.keys(pulled).forEach(function(k) { if (pulled[k] === undefined) delete state[k]; else state[k] = pulled[k]; });
-      report.errors.push(c.name + '：狀態沒寫回 Google Sheet（' + e.message + '），下一輪再試');
+      report.errors.push(c.name + '：狀態沒寫回 Google Sheet（' + e.message + '），下次同步再試');
     }
   }
   return finished;
@@ -1835,10 +1809,9 @@ function notionSyncPayoutRows(ext, rows, report, started) {
 // 一個平台的 Notion 頁面（放在你的頁面裡，跟「進行中團務」並列）；時間用完時回傳 false
 function notionSyncChannel(c, pages, report, started) {
   var ext = loadChunked(c.notionKey);
-  if (ext.off) return true; // 頁面在 Notion 刪掉了：不再同步（選單「立即讀取通知信」會重新建立）
   try {
-    if (ext.page && ext.root === pages.root && notionPageGone(ext.page)) { ext = { off: true }; return true; }
-    if (!ext.page || ext.root !== pages.root) {
+    // 還沒建、換了對帳頁、或頁面在 Notion 被刪掉了 → 建一個新的（按了同步就是要看到這個頁面）
+    if (!ext.page || ext.root !== pages.root || notionPageGone(ext.page)) {
       ext = { root: pages.root, page: notionCreatePage(pages.root, c.title, c.emoji) };
       ext.sum = notionAppendBlocks(ext.page, [notionCallout([['同步中…']], c.emoji)])[0];
       saveChunked(c.notionKey, ext); // 馬上記住，避免中途出錯時重複建立
@@ -1847,93 +1820,63 @@ function notionSyncChannel(c, pages, report, started) {
     if (!notionSyncChannelRows(c, ext, rows, report, started)) return false;
     var payouts = c.payouts ? extReadSheet(KOCA_PAYOUT_SHEET, KOCA_PAYOUT_HEADERS) : [];
     if ((payouts.length || ext.payouts) && !notionSyncPayoutRows(ext, payouts, report, started)) return false;
-    notionUpdateSummary(ext, c.summary(rows, payouts));
+    notionUpdateSummary(ext, c.summary(c, rows, payouts));
     return true;
   } finally {
     saveChunked(c.notionKey, ext);
   }
 }
-function notionSyncChannels(pages, report, started) {
-  var channels = emailChannels();
-  for (var i = 0; i < channels.length; i++) {
-    try {
-      if (!notionSyncChannel(channels[i], pages, report, started)) { report.pending = true; return; }
-    } catch (e) {
-      report.errors.push(channels[i].title + '：' + e.message);
-      if (e.status === 401) return;
-    }
-  }
-}
-
-// ── 自動讀取 ──
-// Notion 對帳還沒設定好時，通知信照樣讀進 Google Sheet
-function emailOnlyRun(res) {
-  if (!PropertiesService.getScriptProperties().getProperty(EMAIL_ON_KEY)) return res;
-  var cache = CacheService.getScriptCache();
-  if (cache.get('notion_sync_running')) return res;
-  cache.put('notion_sync_running', '1', 330);
-  res.email = emailNewReport();
-  try { scanOrderEmails(res.email, EMAIL_TIME_BUDGET_MS); }
-  catch (e) { res.email.errors.push(e.message); }
-  finally { cache.remove('notion_sync_running'); }
-  return res;
-}
-// 自動同步（每 10 分鐘）沒開時打開；在選單停止過就不動，回傳 false
-function ensureSyncTrigger() {
-  if (PropertiesService.getScriptProperties().getProperty(SYNC_STOPPED_KEY)) return false;
-  var has = ScriptApp.getProjectTriggers().some(function(t) { return t.getHandlerFunction() === 'syncNotion'; });
-  if (!has) ScriptApp.newTrigger('syncNotion').timeBased().everyMinutes(NOTION_SYNC_MINUTES).create();
-  return true;
-}
-function emailNotify(title, msg, toastOnly) {
-  if (!toastOnly) {
-    try { SpreadsheetApp.getUi().alert(title, msg, SpreadsheetApp.getUi().ButtonSet.OK); return msg; } catch (ignore) {}
-  }
-  try { getMainSpreadsheetOrThrow().toast(msg, title, 10); } catch (ignore) {}
+function emailNotify(title, msg) {
+  try { SpreadsheetApp.getUi().alert(title, msg, SpreadsheetApp.getUi().ButtonSet.OK); return msg; } catch (ignore) {}
+  try { getMainSpreadsheetOrThrow().toast(msg, title, 10); } catch (ignore) {} // 從 Apps Script 編輯器執行時沒有對話框
   console.log(title + '：' + msg);
   return msg;
 }
+// 上一版留下的設定（自動讀信、兩個平台一起讀）
+function emailCleanupOldKeys() {
+  var sp = PropertiesService.getScriptProperties();
+  Object.keys(sp.getProperties()).forEach(function(k) {
+    if (/^__(EMAIL_ON|EMAIL_SINCE|EMAIL_PARSER|SYNC_STOPPED)__$/.test(k) || /^__EMAIL_SEEN_(N__|\d+)$/.test(k)) sp.deleteProperty(k);
+  });
+}
 
-// ── 選單 ──
-function emailOrdersNow() {
-  var title = '賣貨便／KOCA 通知信';
+// ── 選單：賣貨便、KOCA 各自讀信、各自同步到 Notion ──
+function myshipSyncNow() { return emailChannelNow('myship'); }
+function kocaSyncNow() { return emailChannelNow('koca'); }
+function emailChannelNow(id) {
+  var c = emailChannels().filter(function(x) { return x.id === id; })[0];
+  var title = c.name + '：讀取通知信並同步';
   var sp = PropertiesService.getScriptProperties();
   var cache = CacheService.getScriptCache();
-  if (cache.get('notion_sync_running')) return emailNotify(title, '自動同步正在進行中，請過 1～2 分鐘再試一次。');
+  if (cache.get('notion_sync_running')) return emailNotify(title, '另一個同步正在進行中，請過 1～2 分鐘再按一次。');
   cache.put('notion_sync_running', '1', 360);
   var started = Date.now();
   var report = { errors: [], pending: false, email: emailNewReport(), notionExt: { created: 0, updated: 0, pulled: 0 } };
-  var notionMsg, auto;
+  var notionMsg;
   try {
-    sp.setProperty(EMAIL_ON_KEY, '1');
-    scanOrderEmails(report.email, 200000);
+    removeSyncTriggers();
+    emailCleanupOldKeys();
+    scanOrderEmails(c, report.email, EMAIL_MENU_BUDGET_MS);
     var pages = notionPagesInfo();
     if (sp.getProperty(NOTION_TOKEN_KEY) && pages && sp.getProperty(NOTION_LAYOUT_KEY) === NOTION_LAYOUT) {
-      emailChannels().forEach(function(c) { if (loadChunked(c.notionKey).off) saveChunked(c.notionKey, {}); }); // 之前在 Notion 刪掉的頁面重新建立
-      notionSyncChannels(pages, report, started);
+      if (!notionSyncChannel(c, pages, report, started)) report.pending = true;
       var n = report.notionExt;
-      notionMsg = 'Notion「🏪 賣貨便訂單」「🛒 KOCA 訂單」：新增 ' + n.created + ' 筆、更新 ' + n.updated + ' 筆' +
+      notionMsg = 'Notion「' + c.emoji + ' ' + c.title + '」：新增 ' + n.created + ' 筆、更新 ' + n.updated + ' 筆' +
         (n.pulled ? '、把 Notion 改的 ' + n.pulled + ' 筆狀態寫回 Google Sheet' : '') + '。' +
         (report.viewsFailed ? '\n（有些表格的欄位順序沒有設定成功，可以在 Notion 自己拖曳調整；資料同步不受影響）' : '');
     } else {
-      notionMsg = 'Notion 對帳還沒設定好，先只記在 Google Sheet；設定好 Notion 對帳後會自動同步過去。';
+      notionMsg = 'Notion 對帳還沒設定好（或要重新設定），先只記在 Google Sheet。';
     }
-    auto = ensureSyncTrigger();
   } catch (e) {
     return emailNotify(title, '讀取失敗：' + e.message);
   } finally {
     cache.remove('notion_sync_running');
   }
-  return emailNotify(title, emailSummaryText(report.email) + '\n\n' +
-    '記在主控表的「' + MYSHIP_SHEET + '」「' + KOCA_SHEET + '」' + (report.email.payouts || getMainSpreadsheetOrThrow().getSheetByName(KOCA_PAYOUT_SHEET) ? '「' + KOCA_PAYOUT_SHEET + '」' : '') + '分頁（兩個平台分開，不會算進 TWT 各團的對帳）。\n' +
-    notionMsg + '\n\n' +
-    (auto ? '之後每 ' + NOTION_SYNC_MINUTES + ' 分鐘自動讀取新的通知信。' : '自動同步目前是停止的（選單「Notion 對帳：停止自動同步」），之後要讀新的信請再按一次這個選單。') +
+  var sheets = '「' + c.sheet + '」' + (c.payouts && getMainSpreadsheetOrThrow().getSheetByName(KOCA_PAYOUT_SHEET) ? '「' + KOCA_PAYOUT_SHEET + '」' : '');
+  return emailNotify(title, emailSummaryText(c, report.email) + '\n\n' +
+    '記在主控表的' + sheets + '分頁（跟 TWT 各團的對帳分開）。\n' + notionMsg +
     (report.errors.length ? '\n\n有 ' + report.errors.length + ' 筆沒同步成功：' + report.errors[0] : '') +
-    (report.pending ? '\n\n資料比較多，剩下的會在下一輪自動補上。' : ''));
-}
-function emailOrdersStop() {
-  PropertiesService.getScriptProperties().deleteProperty(EMAIL_ON_KEY);
-  emailNotify('賣貨便／KOCA 通知信', '已停止自動讀取（已經記下的訂單保留）。要再開始，按「賣貨便／KOCA：立即讀取通知信」。', true);
+    (report.pending && !report.email.pending ? '\n\n資料比較多，還沒同步完：再按一次會接著做。' : ''));
 }
 
 // ── doGet ──
