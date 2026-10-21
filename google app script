@@ -1104,7 +1104,7 @@ function syncNotion(e) {
 var MYSHIP_SHEET = '賣貨便訂單';
 var KOCA_SHEET = 'KOCA 訂單';
 var KOCA_PAYOUT_SHEET = 'KOCA 提領';
-var EMAIL_PARSER_VERSION = '3';                // 讀信規則改了就換號碼：下次同步時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
+var EMAIL_PARSER_VERSION = '4';                // 讀信規則改了就換號碼：下次同步時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
 var EMAIL_OVERLAP_SEC = 2 * 86400;             // 每次往前多看兩天，晚到的信也不會漏
 var EMAIL_MENU_BUDGET_MS = 200000;             // 讀信最多 3 分 20 秒，剩下的再按一次接著讀
 // 各平台讀到哪裡：{ since: 最後一封信的時間（秒）, seen: 最近讀過的信（往前多看的兩天裡不再重讀）, parser: 讀信規則的版本 }
@@ -1323,7 +1323,7 @@ function parseKocaEmail(subject, lines, date) {
   }
   return d;
 }
-// 訂購商品：商品名稱、選項：xx　x1、NT$100
+// 訂購商品：商品名稱、選項：xx　x1、NT$100；以前的信是一行「商品名稱 910x1」（單價 x 數量）
 function kocaItems(lines) {
   var s = emailIndex(lines, /^(訂購商品|購買商品|商品明細|商品資訊)\s*[:：]?$/);
   if (s < 0) return '';
@@ -1342,6 +1342,9 @@ function kocaItems(lines) {
       if (cur) cur.qty = Number(l.replace(/\D/g, ''));
     } else if (EMAIL_MONEY_RE.test(l)) {
       if (cur) cur.price = emailMoney(l);
+    } else if ((m = l.match(/^(.+?)\s+(?:NT\s*\$\s*)?([\d,]+)\s*[x×]\s*(\d+)$/i))) {
+      cur = { name: m[1], price: emailMoney(m[2]), qty: Number(m[3]) };
+      items.push(cur);
     } else {
       m = l.match(/^(.*?)\s+(NT\s*\$\s*[\d,]+)$/i);
       cur = { name: m ? m[1] : l };
@@ -1354,16 +1357,20 @@ function kocaItems(lines) {
   }).join('\n');
 }
 // 訂單完成信的「進帳明細」：訂單金額、運費、平台服務費（2%）、金流服務費、…、進帳總金額
+// 現在的信：標籤一行、NT$金額一行；以前的信：「平台服務費 (0.02)：-19」同一行、沒有 NT$
 function kocaSettlement(lines) {
   var s = emailIndex(lines, /^進帳明細$/);
   if (s < 0) return null;
   var e = emailIndex(lines, /^進帳總金額/, s + 1);
   var out = { platform: null, payment: null, other: null, income: emailMoney(emailField(lines, '進帳總金額', s)), text: [] };
-  var isValue = function(l) { return EMAIL_MONEY_RE.test(l) || /^[-－—–]$/.test(l); };
+  var VALUE = '-?\\s*(?:NT\\s*\\$|\\$|＄)?\\s*[\\d,]+(?:\\.\\d+)?|[-－—–]';
+  var isValue = function(l) { return new RegExp('^(?:' + VALUE + ')$', 'i').test(l); };
   var end = e < 0 ? Math.min(lines.length, s + 20) : e;
   for (var i = s + 1; i < end; i++) {
-    var label = lines[i], val, m = label.match(/^(.*?)\s+(-?\s*(?:NT\s*\$|\$|＄)\s*[\d,]+(?:\.\d+)?|[-－—–])$/i);
-    if (m) { label = m[1]; val = m[2]; }
+    var label = lines[i], val;
+    var m = label.match(new RegExp('^(.+?)\\s*[:：]\\s*(' + VALUE + ')$', 'i')) ||
+      label.match(new RegExp('^(.*?)\\s+(-?\\s*(?:NT\\s*\\$|\\$|＄)\\s*[\\d,]+(?:\\.\\d+)?|[-－—–])$', 'i'));
+    if (m) { label = m[1].trim(); val = m[2]; }
     else if (i + 1 < end && !isValue(label) && isValue(lines[i + 1])) { val = lines[++i]; }
     else continue;
     if (/訂單金額/.test(label)) continue;
@@ -1689,9 +1696,10 @@ function notionKocaSummary(c, rows, payouts) {
   var done = rows.filter(function(r) { return extNum(r['進帳金額']) != null; });
   var open = rows.filter(function(r) { return extNum(r['進帳金額']) == null && !/取消|退/.test(String(r['狀態'] || '')); });
   var other = emailSum(done, '其他扣款');
-  var settled = done.length ? '總金額 ' + fmtMoney(emailSum(done, '總金額')) + ' − 運費 ' + fmtMoney(emailSum(done, '運費')) +
-    ' − 平台服務費 ' + fmtMoney(emailSum(done, '平台服務費')) + ' − 金流服務費 ' + fmtMoney(emailSum(done, '金流服務費')) +
-    (other ? ' − 其他扣款 ' + fmtMoney(other) : '') + ' ＝ 進帳 ' + fmtMoney(emailSum(done, '進帳金額')) + '（' + done.length + ' 筆）' : '還沒有';
+  // 各項金額並列（KOCA 以前的信「總金額」不含運費，所以不寫成相減的算式）
+  var settled = done.length ? done.length + ' 筆・總金額 ' + fmtMoney(emailSum(done, '總金額')) + '・運費 ' + fmtMoney(emailSum(done, '運費')) +
+    '・平台服務費 ' + fmtMoney(emailSum(done, '平台服務費')) + '・金流服務費 ' + fmtMoney(emailSum(done, '金流服務費')) +
+    (other ? '・其他扣款 ' + fmtMoney(other) : '') + '・進帳 ' + fmtMoney(emailSum(done, '進帳金額')) : '還沒有';
   var fee = emailSum(payouts, '提領手續費');
   return notionCallout([
     ['訂單　', true], [emailStatusLine(rows, KOCA_STATUS_OPTIONS)],
