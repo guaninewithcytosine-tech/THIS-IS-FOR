@@ -1133,7 +1133,7 @@ function emailChannels() {
       sheet: MYSHIP_SHEET, headers: MYSHIP_HEADERS, numbers: ['商品金額', '運費', '訂單總額'],
       wraps: ['商品明細', '收件資訊', '買家回饋', '訂單備註'], notionKey: '__NOTION_MYSHIP_', title: '賣貨便訂單', emoji: '🏪',
       spec: notionMyshipSpec, wanted: notionMyshipWanted, summary: notionMyshipSummary },
-    { id: 'koca', name: 'KOCA', query: '{from:koca.shop "koca.shop" 酷卡宇宙 小卡宇宙 酷卡 KOCA}', sheet: KOCA_SHEET, headers: KOCA_HEADERS,
+    { id: 'koca', name: 'KOCA', query: 'from:koca.shop', sheet: KOCA_SHEET, headers: KOCA_HEADERS,
       numbers: ['商品小計', '運費', '總金額', '平台服務費', '金流服務費', '其他扣款', '進帳金額'],
       wraps: ['商品明細', '費用明細'], notionKey: '__NOTION_KOCA_', title: 'KOCA 訂單', emoji: '🛒',
       spec: notionKocaSpec, wanted: notionKocaWanted, summary: notionKocaSummary, payouts: true }
@@ -1396,8 +1396,8 @@ function emailParse(m) {
   var text = lines.join('\n');
   var p = { channel: '', subject: subject, hasOrderNo: /訂單(?:編號|號碼)/.test(text) };
   if (/sp88\.com|7-11\.com\.tw/i.test(from) && /賣貨便/.test(subject)) { p.channel = 'myship'; p.data = parseMyshipEmail(subject, lines, html); }
-  // KOCA 酷卡宇宙（以前叫小卡宇宙），寄件地址 info@koca.shop
-  else if (/koca|酷卡|小卡宇宙/i.test(from + ' ' + subject + ' ' + text)) { p.channel = 'koca'; p.data = parseKocaEmail(subject, lines, m.getDate()); }
+  // KOCA（酷卡宇宙，以前叫小卡宇宙）：只讀寄件地址是 koca.shop 的信
+  else if (/@(?:[\w-]+\.)*koca\.shop$/i.test(((from.match(/<([^>]+)>/) || [])[1] || from).trim())) { p.channel = 'koca'; p.data = parseKocaEmail(subject, lines, m.getDate()); }
   return p;
 }
 function emailNewReport() {
