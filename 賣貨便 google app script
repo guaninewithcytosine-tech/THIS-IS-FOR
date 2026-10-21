@@ -1,0 +1,408 @@
+// ══════════════════════════════════════════
+// 賣貨便訂單 · Google Apps Script
+// 放在 Google Sheet「賣貨便訂單」裡（擴充功能 → Apps Script），跟 TWT 代購、KOCA 的程式分開
+// 只做一件事：從 Gmail 讀取賣貨便（no-reply@sp88.com）的訂單通知信，記在這個檔案的「訂單」分頁
+// ・訂單成立通知 → 新增一筆（待出貨）；買家完成取貨等通知 → 更新狀態
+// ・同一筆訂單不會重複；狀態只用比上次新的信，在 Notion 改的狀態不會被重讀到的舊信蓋回去
+// ・這個檔案會放到雲端硬碟的「賣貨便」資料夾
+// 不會自動讀信：要更新時按選單「賣貨便 → 讀取通知信」
+// Notion 由「訂單總覽」統一同步：讀完信後，到「訂單總覽」按「同步到 Notion」
+// 第一次按的時候 Google 會要求允許讀取 Gmail。只讀信：不會寄信、刪信，也不會改已讀狀態或標籤
+// ══════════════════════════════════════════
+var TZ = 'Asia/Taipei';
+var FILE_NAME = '賣貨便訂單';
+var FOLDER_NAME = '賣貨便';
+var ORDER_TAB = '訂單';
+var MAIL_QUERY = '{from:sp88.com from:7-11.com.tw}';
+var HEADERS = ['訂單編號', '狀態', '訂單日期', '賣場', '買家', '收件資訊', '商品明細', '商品金額', '運費', '訂單總額',
+  '付款方式', '配送方式', '買家回饋', '訂單備註', '最後通知時間', '更新時間（系統用）'];
+var NUMBER_COLS = ['商品金額', '運費', '訂單總額'];
+var WRAP_COLS = ['商品明細', '收件資訊', '買家回饋', '訂單備註'];
+var PARSER_VERSION = '4';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
+var OVERLAP_SEC = 2 * 86400;        // 每次往前多看兩天，晚到的信也不會漏
+var BUDGET_MS = 270000;             // 一次最多讀 4.5 分鐘，剩下的再按一次接著讀
+// 讀到哪裡：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本、資料夾
+var KEY_SINCE = '__MAIL_SINCE__', KEY_SEEN = '__MAIL_SEEN_', KEY_PARSER = '__MAIL_PARSER__', KEY_FOLDER = '__FOLDER__';
+
+// ── 選單 ──
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('賣貨便')
+    .addItem('讀取通知信', 'readMailNow')
+    .addToUi();
+}
+
+function readMailNow() {
+  var title = '賣貨便：讀取通知信';
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return notify(title, '正在讀取中，請過 1～2 分鐘再按一次。');
+  var er = newReport(), ss, folderMsg = '';
+  try {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+    prepareFile(ss);
+    folderMsg = moveIntoFolder(ss);
+    scanMail(ss, er, BUDGET_MS);
+  } catch (e) {
+    return notify(title, '讀取失敗：' + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+  return notify(title, summaryText(er) + (folderMsg ? '\n\n' + folderMsg : '') +
+    '\n\n要更新 Notion：到 Google Sheet「訂單總覽」按「訂單總覽 → 同步到 Notion」。');
+}
+
+function notify(title, msg) {
+  try { SpreadsheetApp.getUi().alert(title, msg, SpreadsheetApp.getUi().ButtonSet.OK); return msg; } catch (ignore) {}
+  try { SpreadsheetApp.getActiveSpreadsheet().toast(msg, title, 10); } catch (ignore) {} // 從 Apps Script 編輯器執行時沒有對話框
+  console.log(title + '：' + msg);
+  return msg;
+}
+
+// ── 這個檔案：「訂單」分頁、檔名、資料夾 ──
+function prepareFile(ss) {
+  if (!ss.getSheetByName(ORDER_TAB)) {
+    var sheets = ss.getSheets();
+    // 新建的空白試算表：把預設的分頁改名成「訂單」
+    if (sheets.length === 1 && sheets[0].getLastRow() === 0) sheets[0].setName(ORDER_TAB);
+    writeRows(ss, ORDER_TAB, HEADERS, [], NUMBER_COLS, WRAP_COLS);
+  }
+  if (/^(未命名|Untitled)/i.test(ss.getName())) ss.rename(FILE_NAME);
+}
+
+// 放到「賣貨便」資料夾（之後被「訂單總覽」整理到別的地方也沒關係，會記住是哪個資料夾）
+function moveIntoFolder(ss) {
+  try {
+    var file = DriveApp.getFileById(ss.getId());
+    var folder = myFolder(file);
+    var parents = file.getParents();
+    while (parents.hasNext()) if (parents.next().getId() === folder.getId()) return '';
+    file.moveTo(folder);
+    return '這個檔案已經放到雲端硬碟的「' + FOLDER_NAME + '」資料夾。';
+  } catch (e) {
+    return ''; // 搬不動不影響讀信
+  }
+}
+function myFolder(file) {
+  var sp = PropertiesService.getScriptProperties();
+  var id = sp.getProperty(KEY_FOLDER);
+  if (id) { try { var saved = DriveApp.getFolderById(id); if (!saved.isTrashed()) return saved; } catch (ignore) {} }
+  var folder = null, parents = file.getParents();
+  while (parents.hasNext() && !folder) { var p = parents.next(); if (p.getName() === FOLDER_NAME) folder = p; }
+  if (!folder) {
+    var found = DriveApp.getFoldersByName(FOLDER_NAME);
+    while (found.hasNext() && !folder) { var f = found.next(); if (!f.isTrashed()) folder = f; }
+  }
+  if (!folder) folder = DriveApp.createFolder(FOLDER_NAME);
+  sp.setProperty(KEY_FOLDER, folder.getId());
+  return folder;
+}
+
+// ── 表格讀寫 ──
+function getHeaderMap(headers) {
+  var map = {};
+  headers.forEach(function(h, i) { if (h !== '' && h !== null && h !== undefined) map[String(h).trim()] = i; });
+  return map;
+}
+// 一個分頁讀成 [{ 欄名: 值 }]
+function readRows(ss, name, headers) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) return [];
+  var lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return [];
+  var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  var head = getHeaderMap(values[0]);
+  return values.slice(1).filter(function(r) { return r.some(function(c) { return c !== '' && c !== null; }); }).map(function(r) {
+    var o = {};
+    headers.forEach(function(h) { o[h] = head[h] === undefined ? '' : r[head[h]]; });
+    return o;
+  });
+}
+function writeRows(ss, name, headers, rows, numberCols, wrapCols) {
+  var sheet = ss.getSheetByName(name) || ss.insertSheet(name);
+  var width = headers.length;
+  var total = Math.max(rows.length + 1, sheet.getLastRow(), 2);
+  var values = [headers.slice()].concat(rows.map(function(o) { return headers.map(function(h) { return o[h] == null ? '' : o[h]; }); }));
+  while (values.length < total) values.push(new Array(width).fill(''));
+  // 文字欄設成純文字（訂單編號、日期不會被改成數字或日期）；相鄰的文字欄一次設定，數字欄保持預設格式
+  for (var c = 0; c < width; c++) {
+    if (numberCols.indexOf(headers[c]) >= 0) continue;
+    var end = c;
+    while (end + 1 < width && numberCols.indexOf(headers[end + 1]) < 0) end++;
+    sheet.getRange(1, c + 1, total, end - c + 1).setNumberFormat('@');
+    c = end;
+  }
+  sheet.getRange(1, 1, total, width).setValues(values); // 一次寫入，多出來的舊列同時清空
+  sheet.getRange(1, 1, 1, width).setFontWeight('bold').setBackground('#e5e7eb');
+  headers.forEach(function(h, c) {
+    if (h.indexOf('（系統用）') >= 0) sheet.getRange(1, c + 1).setBackground('#f3f4f6').setFontColor('#9ca3af');
+    if (wrapCols.indexOf(h) >= 0) sheet.getRange(2, c + 1, total - 1, 1).setWrap(true);
+  });
+  sheet.setFrozenRows(1);
+  // 之前的版本有「信件連結」欄：清掉（你自己加的欄位不動）
+  var last = sheet.getLastColumn();
+  if (last > width) {
+    sheet.getRange(1, width + 1, 1, last - width).getValues()[0].forEach(function(h, i) {
+      h = String(h || '').trim();
+      if (h === '信件連結' || headers.indexOf(h) >= 0) sheet.getRange(1, width + 1 + i, Math.max(1, sheet.getLastRow()), 1).clearContent();
+    });
+  }
+  return sheet;
+}
+// 大一點的紀錄分段存在 Script Properties（每段 8000 字）
+function loadChunked(prefix) {
+  var props = PropertiesService.getScriptProperties();
+  var n = Number(props.getProperty(prefix + 'N__') || 0), text = '';
+  for (var i = 0; i < n; i++) text += props.getProperty(prefix + i) || '';
+  try { return text ? JSON.parse(text) : {}; } catch (e) { return {}; }
+}
+function saveChunked(prefix, obj) {
+  var props = PropertiesService.getScriptProperties();
+  var text = JSON.stringify(obj), chunks = [];
+  for (var i = 0; i < text.length; i += 8000) chunks.push(text.slice(i, i + 8000));
+  var old = Number(props.getProperty(prefix + 'N__') || 0);
+  var put = {};
+  chunks.forEach(function(c, i) { put[prefix + i] = c; });
+  put[prefix + 'N__'] = String(chunks.length);
+  props.setProperties(put);
+  for (var j = chunks.length; j < old; j++) props.deleteProperty(prefix + j);
+}
+
+// ── 信件內容 → 一行一行的文字（表格的每一格、每個區塊各一行）──
+function emailHtmlLines(html) {
+  var s = String(html || '')
+    .replace(/<(style|script|head|title)\b[\s\S]*?<\/\1\s*>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/<br\b[^>]*>/gi, '\n')
+    .replace(/<\/?(?:p|div|tr|td|th|li|ul|ol|table|tbody|thead|tfoot|h[1-6]|section|article|header|footer|blockquote|center|dl|dt|dd|hr)\b[^>]*>/gi, '\n')
+    .replace(/<[^>]*>/g, ' ');
+  return emailPlainLines(emailDecode(s));
+}
+function emailPlainLines(text) {
+  return String(text || '').replace(/[​-‍⁠﻿­]/g, '').split(/\r?\n/).map(function(l) { return l.replace(/\s+/g, ' ').trim(); }).filter(Boolean);
+}
+function emailDecode(s) {
+  var named = { nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", times: '×', middot: '·', hellip: '…', ndash: '–', mdash: '—', yen: '¥' };
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, function(m, e) {
+    if (e.charAt(0) === '#') {
+      var code = /^#x/i.test(e) ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      try { return String.fromCodePoint(code); } catch (x) { return m; }
+    }
+    var k = e.toLowerCase();
+    return named.hasOwnProperty(k) ? named[k] : m;
+  });
+}
+function emailEsc(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function emailIndex(lines, re, from) {
+  for (var i = Math.max(0, from || 0); i < lines.length; i++) if (re.test(lines[i])) return i;
+  return -1;
+}
+// 欄位的值：「標籤：值」「標籤 值」在同一行，或標籤自己一行、值在下一行
+function emailField(lines, label, from) {
+  var re = new RegExp('^' + emailEsc(label) + '(?:\\s*[:：]\\s*(.*)|\\s+(.+))?$');
+  for (var i = Math.max(0, from || 0); i < lines.length; i++) {
+    var m = lines[i].match(re);
+    if (!m) continue;
+    var v = (m[1] || m[2] || '').trim();
+    return v || lines[i + 1] || '';
+  }
+  return '';
+}
+// 標籤後面的幾行（到 endRe 或 max 行為止）
+function emailBlock(lines, label, endRe, max) {
+  var re = new RegExp('^' + emailEsc(label) + '\\s*[:：]?\\s*(.*)$');
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(re);
+    if (!m) continue;
+    var out = m[1] ? [m[1].trim()] : [];
+    for (var j = i + 1; j < lines.length && out.length < max && !endRe.test(lines[j]); j++) out.push(lines[j]);
+    return out;
+  }
+  return [];
+}
+var EMAIL_MONEY_RE = /^-?\s*(?:NT\s*\$|\$|＄)\s*[\d,]+(?:\.\d+)?$/i;
+// NT$1,234 → 1234；-NT$38 → -38；沒有數字 → null
+function emailMoney(s) {
+  var m = String(s == null ? '' : s).replace(/,/g, '').match(/(-)?\s*(?:NT\s*\$|NTD|\$|＄)?\s*(\d+(?:\.\d+)?)/i);
+  return m ? Number(m[2]) * (m[1] ? -1 : 1) : null;
+}
+function emailDate(s) {
+  var m = String(s || '').match(/(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?/);
+  if (!m) return '';
+  var d = m[1] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[3]).slice(-2);
+  return m[4] ? d + ' ' + ('0' + m[4]).slice(-2) + ':' + m[5] : d;
+}
+function fmtTime(date) { return Utilities.formatDate(date, TZ, 'yyyy-MM-dd HH:mm'); }
+
+// ── 賣貨便的信 ──
+function myshipStatus(kind) {
+  if (/取消/.test(kind)) return '已取消';
+  if (/退貨|退款/.test(kind)) return '退貨／退款';
+  if (/未取/.test(kind)) return '未取貨';
+  if (/取貨|取件/.test(kind)) return '已取貨';
+  if (/到店|到貨|抵達|送達/.test(kind)) return '已到店';
+  if (/撥款/.test(kind)) return '已撥款';
+  if (/寄件|出貨|交寄/.test(kind)) return '已出貨';
+  if (/成立|新訂單/.test(kind)) return '待出貨';
+  return '';
+}
+function parseMyshipEmail(subject, lines, html) {
+  var text = lines.join('\n');
+  var no = text.match(/訂單編號\s*[:：]?\s*([A-Z]{1,4}\d{8,})/);
+  if (!no) return null;
+  var kind = String(subject || '').replace(/^[\s\S]*?賣貨便\s*[:：]?\s*/, '').replace(/通知\s*$/, '').trim();
+  var d = { orderNo: no[1], status: myshipStatus(kind), fields: {} };
+  if (d.status !== '待出貨') return d; // 取貨、取消等通知只有訂單編號：更新已經記下的訂單
+  // 自己在賣貨便買東西時收到的信不算：賣家收到的信會請你安排出貨
+  if (!/有新的訂單|安排出貨|交貨便代碼/.test(text)) return { skip: true };
+  d.full = true;
+  var recipient = emailBlock(lines, '收件者資訊', /^(付款方式|配送方式|商品名稱)/, 4);
+  var feedback = emailBlock(lines, '買家回饋資訊', /^(訂單備註|★)/, 10).map(function(l) { return l.replace(/^\d+\s*[.、)]\s*/, ''); });
+  var social = feedback.length && feedback[0].match(/[:：]\s*(.+)$/);
+  d.fields = {
+    '訂單日期': emailDate(emailField(lines, '訂單日期')),
+    '賣場': emailField(lines, '賣場名稱'),
+    '買家': (social && social[1].trim()) || recipient[0] || '',
+    '收件資訊': recipient.join(' '),
+    '商品明細': myshipItems(lines),
+    '商品金額': emailMoney(emailField(lines, '商品總額')),
+    '運費': emailMoney(emailField(lines, '運費')),
+    '訂單總額': emailMoney(emailField(lines, '訂單總額')),
+    '付款方式': emailField(lines, '付款方式'),
+    '配送方式': emailField(lines, '配送方式'),
+    '買家回饋': feedback.join('；'),
+    '訂單備註': emailBlock(lines, '訂單備註', /^(★|寄送流程|提醒|如在家|如前往|親愛的|此為系統|任何問題)/, 3).join(' ')
+  };
+  return d;
+}
+// 商品表格：商品名稱｜單價｜數量｜小計
+function myshipItems(lines) {
+  var h = -1;
+  for (var i = 0; i + 1 < lines.length; i++) if (lines[i] === '商品名稱' && lines[i + 1] === '單價') { h = i; break; }
+  if (h < 0) return '';
+  var end = emailIndex(lines, /^商品總額/, h);
+  if (end < 0) end = Math.min(lines.length, h + 40);
+  var j = h + 2;
+  while (j < end && /^(數量|小計)$/.test(lines[j])) j++;
+  var items = [], cur = null;
+  for (; j < end; j++) {
+    var l = lines[j];
+    if (cur && EMAIL_MONEY_RE.test(l)) { if (cur.price == null) cur.price = emailMoney(l); else cur.sub = emailMoney(l); }
+    else if (cur && /^\d+$/.test(l) && cur.qty == null) cur.qty = Number(l);
+    else { cur = { name: l }; items.push(cur); }
+  }
+  return items.map(function(it) {
+    var money = it.sub != null ? it.sub : it.price;
+    return it.name + (it.qty ? ' x' + it.qty : '') + (money != null ? ' $' + money : '');
+  }).join('\n');
+}
+// 一封信 → { mine: 是不是賣貨便的通知信, data }
+function emailParse(m) {
+  var from = String(m.getFrom() || ''), subject = String(m.getSubject() || '');
+  if (!/sp88\.com|7-11\.com\.tw/i.test(from) || !/賣貨便/.test(subject)) return { mine: false };
+  var html = m.getBody() || '';
+  var lines = emailHtmlLines(html);
+  if (!lines.length) lines = emailPlainLines(m.getPlainBody());
+  return { mine: true, subject: subject, hasOrderNo: /訂單(?:編號|號碼)/.test(lines.join('\n')), data: parseMyshipEmail(subject, lines, html) };
+}
+
+// ── 讀信 ──
+function newReport() {
+  return { mails: 0, created: 0, updated: 0, unmatched: 0, skipped: 0, skippedSubjects: [], unknown: [], errors: [], pending: false, from: 0, to: 0 };
+}
+function loadStore(ss) {
+  var rows = readRows(ss, ORDER_TAB, HEADERS), byNo = {};
+  rows.forEach(function(r) { if (r['訂單編號']) byNo[String(r['訂單編號'])] = r; });
+  return { ss: ss, rows: rows, byNo: byNo, dirty: false };
+}
+function saveStore(store) {
+  if (store.dirty) writeRows(store.ss, ORDER_TAB, HEADERS, store.rows, NUMBER_COLS, WRAP_COLS);
+}
+// 一封信寫進表格（在記憶體裡，最後一起寫入）
+function applyMail(store, p, sec, er) {
+  if (!p.mine) return;
+  er.mails++;
+  if (!er.from || sec < er.from) er.from = sec;
+  if (sec > er.to) er.to = sec;
+  var d = p.data;
+  if (!d) { if (p.hasOrderNo) er.unknown.push(p.subject); return; }
+  if (d.skip) { er.skipped++; er.skippedSubjects.push(p.subject); return; }
+  var row = store.byNo[d.orderNo];
+  if (!row) {
+    // 只有取貨、取消這類通知、找不到原本的訂單：訂單成立的信被刪掉了，或是自己當買家的訂單
+    if (!d.full) { er.unmatched++; return; }
+    row = {};
+    HEADERS.forEach(function(h) { row[h] = ''; });
+    row['訂單編號'] = d.orderNo;
+    store.rows.push(row);
+    store.byNo[d.orderNo] = row;
+    store.dirty = true;
+    er.created++;
+  }
+  if (!d.status) er.unknown.push(p.subject);
+  Object.keys(d.fields).forEach(function(h) {
+    var v = d.fields[h];
+    if (v === '' || v == null || HEADERS.indexOf(h) < 0) return;
+    if (String(row[h]) !== String(v)) { row[h] = v; store.dirty = true; }
+  });
+  // 狀態只用比上次新的信：在 Notion 手動改的狀態，不會被重讀到的舊信蓋回去
+  var last = Number(row['更新時間（系統用）']) || 0;
+  if (d.status && sec > last) {
+    if (row['狀態'] && row['狀態'] !== d.status) er.updated++;
+    row['狀態'] = d.status;
+    row['更新時間（系統用）'] = String(sec);
+    row['最後通知時間'] = fmtTime(new Date(sec * 1000));
+    store.dirty = true;
+  }
+}
+// 讀新的通知信。第一次（或讀信規則改了之後）讀全部的信；之後從上次讀到的地方往前多看兩天
+function scanMail(ss, er, budgetMs) {
+  var started = Date.now();
+  var sp = PropertiesService.getScriptProperties();
+  var fresh = sp.getProperty(KEY_PARSER) !== PARSER_VERSION;
+  var since = fresh ? 0 : Number(sp.getProperty(KEY_SINCE) || 0);
+  if (!since) fresh = true;
+  var after = fresh ? 0 : Math.max(0, since - OVERLAP_SEC);
+  var seen = fresh ? {} : loadChunked(KEY_SEEN);
+  var threads = [];
+  for (var start = 0; start < 5000; start += 100) {
+    var batch = GmailApp.search(MAIL_QUERY + (after ? ' after:' + after : ''), start, 100);
+    threads = threads.concat(batch);
+    if (batch.length < 100) break;
+  }
+  var items = [];
+  if (threads.length) {
+    GmailApp.getMessagesForThreads(threads).forEach(function(list) {
+      list.forEach(function(m) {
+        var sec = Math.floor(m.getDate().getTime() / 1000);
+        if (sec >= after && !seen[m.getId()]) items.push({ msg: m, sec: sec });
+      });
+    });
+  }
+  items.sort(function(a, b) { return a.sec - b.sec; });
+  var store = loadStore(ss), latest = since;
+  for (var i = 0; i < items.length; i++) {
+    if (Date.now() - started > budgetMs) { er.pending = true; break; } // 從舊到新讀，剩下的再按一次接著讀
+    var it = items[i];
+    try { applyMail(store, emailParse(it.msg), it.sec, er); }
+    catch (e) { er.errors.push((it.msg.getSubject() || '') + '：' + e.message); }
+    seen[it.msg.getId()] = it.sec;
+    if (it.sec > latest) latest = it.sec;
+  }
+  saveStore(store); // 寫入失敗會丟出錯誤：讀到哪裡不會記下，下次重讀
+  var keep = {};
+  Object.keys(seen).forEach(function(id) { if (seen[id] >= latest - OVERLAP_SEC - 3600) keep[id] = seen[id]; });
+  saveChunked(KEY_SEEN, keep);
+  sp.setProperty(KEY_SINCE, String(latest));
+  sp.setProperty(KEY_PARSER, PARSER_VERSION);
+}
+function summaryText(er) {
+  var lines = [];
+  if (!er.mails) lines.push('沒有新的賣貨便通知信。');
+  else lines.push('讀了 ' + er.mails + ' 封賣貨便通知信（' + fmtTime(new Date(er.from * 1000)).slice(0, 10) + ' ～ ' + fmtTime(new Date(er.to * 1000)).slice(0, 10) + '）：新增 ' + er.created + ' 筆訂單、更新 ' + er.updated + ' 筆狀態。');
+  if (er.unmatched) lines.push('有 ' + er.unmatched + ' 封取貨、取消之類的通知找不到原本的訂單（訂單成立的信不在信箱裡，或是你自己當買家的訂單），沒有記。');
+  if (er.skipped) lines.push('有 ' + er.skipped + ' 封看起來是你自己當買家的訂單，沒有記：' + er.skippedSubjects.slice(0, 3).join('、') + (er.skippedSubjects.length > 3 ? ' 等' : '') + '。如果其實是你賣出的訂單，請告訴我。');
+  if (er.unknown.length) lines.push('看不懂的通知信（請告訴我，我再加上）：' + er.unknown.slice(0, 3).join('、') + (er.unknown.length > 3 ? ' 等 ' + er.unknown.length + ' 封' : ''));
+  if (er.errors.length) lines.push(er.errors.length + ' 封讀取失敗：' + er.errors[0]);
+  if (er.pending) lines.push('信比較多，還沒讀完：再按一次會接著讀。');
+  return lines.join('\n');
+}
