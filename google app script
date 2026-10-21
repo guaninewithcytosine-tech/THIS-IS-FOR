@@ -284,6 +284,10 @@ function tidySettingsSheet() {
     var catalog = readCatalogFromSettings();
     var report = ensureCampaignSheetsFromCatalog(catalog);
     writeCatalog(catalog);
+    // 已結束的團也補上「團務資訊」分頁（賣貨便連結）
+    readStoredTours(getMainSpreadsheetOrThrow()).tours.forEach(function(t) {
+      if (t.status === 'deleted') { try { writeTourInfo(tourSpreadsheet(t, false), t); } catch (ignore) {} }
+    });
     refreshCampaignIndex(report);
     SpreadsheetApp.flush();
     var msg = '整理完成：' + getCatalogTours(catalog).length + ' 個團已放到「' + TOUR_SHEET + '」';
@@ -697,9 +701,11 @@ function notionPageGone(pageId) {
     throw e;
   }
 }
+// parts：[文字, 粗體, 連結網址]
 function notionRich(parts) {
   return parts.filter(function(p) { return p[0]; }).map(function(p) {
-    var t = { type: 'text', text: { content: p[0] } };
+    var t = { type: 'text', text: { content: String(p[0]).slice(0, 1900) } };
+    if (p[2]) t.text.link = { url: p[2] };
     if (p[1]) t.annotations = { bold: true };
     return t;
   });
@@ -855,7 +861,8 @@ function notionSummaryBlock(c, s) {
     ['團體　', true], [c.group || '—'], ['　｜　狀態　', true], [STATUS_LABELS[c.status] || c.status], ['　｜　團務進度　', true], [c.progress || '—'],
     ['\n訂單　', true], [s.count + ' 筆・總額 ' + fmtMoney(s.total)],
     ['\n付款　', true], ['已付款 ' + s.paid + '・未付款 ' + s.unpaid + '・金額不符 ' + s.mismatch + (s.refund ? '・退款 ' + s.refund : '')],
-    ['\n二補　', true], [second]
+    ['\n二補　', true], [second],
+    ['\n賣貨便　', true], c.sellLink ? [c.sellLink, false, isWebLink(c.sellLink) ? c.sellLink : null] : ['—']
   ], '📊');
 }
 
@@ -1005,7 +1012,8 @@ function syncNotion() {
       var name = getCatalogTourName(t), ssId = allProps[propKeyCampaign(name)];
       if (!ssId || seen[ssId]) return;
       seen[ssId] = true;
-      camps.push({ ssId: ssId, name: name, status: String(t.status || 'open').toLowerCase(), group: t.group || '', progress: tourProgressLabel(t), tour: t });
+      camps.push({ ssId: ssId, name: name, status: String(t.status || 'open').toLowerCase(), group: t.group || '', progress: tourProgressLabel(t),
+        sellLink: String(t.sellLink || '').trim(), tour: t });
     });
     var activeKids, endedKids;
     try {
@@ -1875,7 +1883,7 @@ function writeCatalog(catalog, options) {
     ended.push(t);
   });
 
-  tours.forEach(function(t) { writeTourProducts(t); });
+  tours.forEach(function(t) { writeTourInfo(writeTourProducts(t), t); });
   writeTable(ss, TOUR_SHEET, TOUR_HEADERS, tours.concat(ended).map(tourToRow), TOUR_NUMBER_COLS, TOUR_WRAP_COLS);
   writeSystemSettings(ss, (catalog && catalog.boardColumns) || {});
   // 舊版分頁轉換完成後移除
@@ -2029,6 +2037,26 @@ function writeTourProducts(t) {
   var ss = tourSpreadsheet(t, sections.length > 0);
   if (ss) writeTable(ss, PRODUCT_SHEET, PRODUCT_HEADERS, sectionsToRows(sections), PRODUCT_NUMBER_COLS, []);
   try { CacheService.getScriptCache().put('prod_' + t.id, JSON.stringify(sections), PRODUCT_CACHE_TTL); } catch (ignore) {}
+  return ss;
+}
+
+// 網址是 http(s) 開頭才做成可以點的連結
+function isWebLink(s) { return /^https?:\/\/\S+$/i.test(String(s || '').trim()); }
+
+// 各團自己的 Google Sheet 裡的「團務資訊」分頁：團務名稱、賣貨便連結（沒變就不寫）
+var INFO_SHEET = '團務資訊';
+function writeTourInfo(ss, t) {
+  if (!ss) return;
+  var link = String(t.sellLink || '').trim();
+  var rows = [['項目', '內容'], ['團務名稱', getCatalogTourName(t)], ['賣貨便連結', link]];
+  var sheet = ss.getSheetByName(INFO_SHEET);
+  if (sheet && sheet.getLastRow() >= 3 && JSON.stringify(sheet.getRange(1, 1, 3, 2).getValues()) === JSON.stringify(rows)) return;
+  if (!sheet) sheet = ss.insertSheet(INFO_SHEET);
+  sheet.getRange(1, 1, 3, 2).setNumberFormat('@').setValues(rows);
+  sheet.getRange(1, 1, 1, 2).setFontWeight('bold').setBackground('#e5e7eb');
+  sheet.getRange(2, 1, 2, 1).setFontWeight('bold');
+  if (isWebLink(link)) sheet.getRange(3, 2).setRichTextValues([[SpreadsheetApp.newRichTextValue().setText(link).setLinkUrl(link).build()]]);
+  sheet.autoResizeColumns(1, 2);
 }
 
 // 已結束的團：商品清單裡的圖片欄清空（商品本身保留）
@@ -2201,7 +2229,7 @@ function writeSystemSettings(ss, bc) {
 // ══════════════════════════════════════════
 // 團務索引表單：每個團的 Google Sheet 連結與訂單數字（狀態等設定看「團務資料」）
 // ══════════════════════════════════════════
-var INDEX_HEADERS = ['團務名稱', '訂單數', '訂單總額', '已付款', '未付款', '金額不符', '二補待收', '備註'];
+var INDEX_HEADERS = ['團務名稱', '訂單數', '訂單總額', '已付款', '未付款', '金額不符', '二補待收', '賣貨便連結', '備註'];
 var INDEX_NUMBER_COUNT = 6; // 訂單數 ~ 二補待收
 
 // 一個團在索引表單上的數字（金額不符、退款不算進已付款或未付款）
@@ -2276,7 +2304,7 @@ function refreshCampaignIndex(report, orders) {
       var key = propKeyCampaign(getCatalogTourName(t));
       if (!key || listed[key] || !props[key]) return;
       listed[key] = true;
-      rows.push({ name: key, ssId: props[key], ended: t.status === 'deleted' });
+      rows.push({ name: key, ssId: props[key], ended: t.status === 'deleted', link: String(t.sellLink || '').trim() });
     });
   Object.keys(props).forEach(function(k) {
     if (!isInternalPropKey(k) && !listed[k]) rows.push({ name: k, ssId: props[k], ended: true });
@@ -2288,8 +2316,14 @@ function refreshCampaignIndex(report, orders) {
   indexStamp(sheet);
   if (rows.length) {
     sheet.getRange(2, 1, rows.length, width).setValues(rows.map(function(r) {
-      return [''].concat(indexNumbers(byCamp[r.ssId]), [errors[r.name] || (r.ended ? '已結束' : '')]);
+      return [''].concat(indexNumbers(byCamp[r.ssId]), [r.link || '', errors[r.name] || (r.ended ? '已結束' : '')]);
     }));
+    // 賣貨便連結可以直接點
+    var linkCol = INDEX_HEADERS.indexOf('賣貨便連結') + 1;
+    sheet.getRange(2, linkCol, rows.length, 1).setNumberFormat('@');
+    rows.forEach(function(r, i) {
+      if (isWebLink(r.link)) sheet.getRange(i + 2, linkCol).setRichTextValues([[SpreadsheetApp.newRichTextValue().setText(r.link).setLinkUrl(r.link).build()]]);
+    });
     // 團名直接連到該團的 Google Sheet
     sheet.getRange(2, 1, rows.length, 1).setRichTextValues(rows.map(function(r) {
       return [SpreadsheetApp.newRichTextValue().setText(r.name).setLinkUrl('https://docs.google.com/spreadsheets/d/' + r.ssId + '/edit').build()];
