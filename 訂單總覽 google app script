@@ -787,7 +787,7 @@ function readCampaignOrders(ssId) {
     };
   });
 }
-// 金額不符、退款各自分開，不算進已付款或未付款；received＝已付款的訂單金額＋已收款的二補（實際入帳）
+// 金額不符、退款各自分開，不算進已付款或未付款；received＝已付款的訂單金額（二補是從賣貨便補收的，算在賣貨便那邊，這裡不算）
 function campaignStats(orders) {
   var s = { count: 0, total: 0, received: 0, paid: 0, unpaid: 0, mismatch: 0, refund: 0, second: 0, secondPaid: 0 };
   orders.forEach(function(o) {
@@ -799,7 +799,7 @@ function campaignStats(orders) {
     else if (pay === '退款') s.refund++;
     else s.unpaid++;
     if ((Number(o.secondPayment) || 0) > 0) {
-      if (normalizeSecondStatus(o.secondPayStatus) === '已收款') { s.secondPaid++; s.received += Number(o.secondPayment) || 0; } else s.second++;
+      if (normalizeSecondStatus(o.secondPayStatus) === '已收款') s.secondPaid++; else s.second++;
     }
   });
   return s;
