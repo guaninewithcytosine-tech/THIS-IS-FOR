@@ -1,15 +1,15 @@
 // ══════════════════════════════════════════
 // 訂單總覽 · Google Apps Script（主控）
 // 放在 Google Sheet「訂單總覽」裡（擴充功能 → Apps Script）
-// 只負責讀取、統整：讀 TWT 代購、賣貨便、KOCA 三個 Google Sheet，把三個平台的訂單統整到這個檔案
+// 只負責讀取、統整：讀 TWT 代購、賣貨便、KOCA 三個 Google Sheet，把三個平台的統計統整到這個檔案
 // ・TWT 代購的網站、開團、下單、對帳、同步 Notion → TWT 代購管理表自己的程式
 // ・賣貨便、KOCA 讀通知信、同步 Notion → 各自的 Google Sheet 自己的程式
 // 三個來源的 Google Sheet 連結在這個檔案的「來源」分頁（自動尋找，也可以自己貼）
-// 這個檔案裡的分頁（從三個平台讀來，每次更新整張重寫；要修改請到各平台自己的 Google Sheet）：
-// ・總覽：三個平台並排的簡單比較（訂單數、金額、狀態、最後更新），細節在各平台自己的分頁
-// ・TWT 代購：各團的統計，和所有團（進行中、已結束）的訂單
-// ・賣貨便：各狀態的筆數，和所有訂單
-// ・KOCA：各狀態的筆數、平台服務費、金流服務費、進帳、每一筆提領，和所有訂單
+// 這個檔案只放統計（從三個平台讀來，每次更新整張重寫；每一筆訂單的細節留在各平台自己的 Google Sheet）：
+// ・總覽：三個平台並排的簡單比較（訂單數、金額、狀態、最後更新）
+// ・TWT 代購：各團的統計
+// ・賣貨便：各狀態的筆數和金額
+// ・KOCA：各狀態的筆數和金額、平台服務費、金流服務費、進帳、提領
 // 三個平台各有自己獨立的一頁，不會放在同一頁裡
 // Notion（選用）：只負責你指定的頁面最上面的「三個平台總覽」。各平台自己的頁面由各平台的 Google Sheet 同步
 // 三個平台各自分開，不會混在一起計算（TWT 的團雖然用賣貨便出貨，賣貨便的訂單不會算進 TWT 的團）
@@ -585,11 +585,8 @@ function updateOverview() {
 
 // ══════════════════════════════════════════
 // 這個檔案裡的分頁：把三個平台的訂單統整過來
-// 平台的 Google Sheet 裡的資料原樣讀進來（不改資料、不算平台之間的合計），每次更新整張重寫
+// 只放統計（不算平台之間的合計），每次更新整張重寫
 // ══════════════════════════════════════════
-var MIRROR_TWT_HEADERS = ['團務', '團務狀態', '訂單編號', '下單時間', '社群帳號', '訂單明細', '系統總計', '匯款金額', '匯款後五碼', '付款狀態', '二補金額', '二補收款狀態'];
-var MIRROR_TWT_NUMBERS = ['系統總計', '匯款金額', '二補金額'];
-var MIRROR_WRAP = ['訂單明細', '商品明細', '收件資訊', '買家回饋', '訂單備註', '費用明細'];
 // 寫一個分頁（整張重寫）：由幾個區塊從上往下排，區塊中間空一行
 // 文字區塊：{ text: ['第一行（粗體）', '第二行', …] }；表格區塊：{ headers, rows, numbers: [數字欄], wrap: [自動換行的欄] }
 // 文字欄設成純文字（訂單編號、日期不會被改成數字或日期），數字欄保持數字
@@ -626,61 +623,53 @@ function dropOldTabs(book) {
     if (String(old.getRange(1, 1).getValue()).trim() === OLD_TABS[name]) book.deleteSheet(old);
   });
 }
-function cellOut(v) { return v instanceof Date ? fmtTime(v) : (v == null ? '' : v); }
-function shownHeaders(headers) { return headers.filter(function(h) { return h.indexOf('（系統用）') < 0; }); }
 function isTwtActive(c) { return c.status !== 'deleted'; }
 // 更新這個檔案裡一個平台的分頁和總覽用的數字；回傳要給你看的文字
 function mirrorPlatform(id, src, report) {
   var book = SpreadsheetApp.getActiveSpreadsheet();
   return id === 'twt' ? mirrorTwt(src, book, report) : mirrorChannel(channelById(id), src, book);
 }
-// TWT 代購：一頁。最上面是各團的統計，下面是所有團的訂單（進行中的團排在前面，每筆訂單有一欄「團務」）
+// TWT 代購：一頁，只有統計：每個團一列（進行中的團排在前面）。每一筆訂單的細節在 TWT 代購管理表和各團的 Google Sheet
 function mirrorTwt(src, book, report) {
   var camps = readTwtCampaigns(src);
   camps = camps.filter(isTwtActive).concat(camps.filter(function(c) { return !isTwtActive(c); }));
-  var rows = [], all = [], liveCount = 0, total = { count: 0, total: 0, paid: 0, unpaid: 0, mismatch: 0, second: 0 }, shown = 0;
+  var all = [], liveCount = 0, orderCount = 0, total = { count: 0, total: 0, paid: 0, unpaid: 0, mismatch: 0, second: 0 }, shown = 0;
   camps.forEach(function(c) {
     var orders;
     try { orders = readCampaignOrders(c.ssId); }
     catch (e) { report.errors.push(c.name + '：' + e.message); return; }
-    var st = campaignStats(orders), label = STATUS_LABELS[c.status] || c.status;
-    all.push([c.name, label, st.count, st.total, st.paid, st.unpaid, st.mismatch, st.second]);
+    var st = campaignStats(orders);
+    all.push([c.name, STATUS_LABELS[c.status] || c.status, st.count, st.total, st.paid, st.unpaid, st.mismatch, st.second]);
     if (isTwtActive(c)) {
       liveCount++;
       Object.keys(total).forEach(function(k) { total[k] += st[k]; });
     }
-    orders.forEach(function(o) {
-      var hasSecond = (Number(o.secondPayment) || 0) > 0;
-      rows.push([c.name, label, o.orderId, o.timestamp ? fmtTime(new Date(o.timestamp)) : '', o.socialName, o.orderDetails,
-        o.totalAmount || '', o.remitAmount || '', o.bank5, payLabel(o.payStatus), hasSecond ? Number(o.secondPayment) : '',
-        hasSecond ? normalizeSecondStatus(o.secondPayStatus) : '']);
-    });
+    orderCount += st.count;
     shown++;
   });
   total.campCount = liveCount;
   writeBlocks(book, TAB_TWT, [
-    { text: ['TWT 代購', '從「TWT 代購管理表」讀來，每次更新整張重寫；要修改請到 TWT 代購管理表。',
+    { text: ['TWT 代購', '這一頁只有統計。每一筆訂單的細節在「TWT 代購管理表」和各團自己的 Google Sheet。',
       '進行中 ' + liveCount + ' 團・訂單 ' + total.count + ' 筆・總額 ' + fmtMoney(total.total) + '・已付款 ' + total.paid + '・未付款 ' + total.unpaid +
       (total.mismatch ? '・金額不符 ' + total.mismatch : '') + (total.second ? '・二補待收 ' + total.second : '')] },
-    { headers: ['團務', '狀態', '訂單數', '訂單總額', '已付款', '未付款', '金額不符', '二補待收'], rows: all, numbers: ['訂單數', '訂單總額', '已付款', '未付款', '金額不符', '二補待收'] },
-    { headers: MIRROR_TWT_HEADERS, rows: rows, numbers: MIRROR_TWT_NUMBERS, wrap: MIRROR_WRAP }
+    { headers: ['團務', '狀態', '訂單數', '訂單總額', '已付款', '未付款', '金額不符', '二補待收'], rows: all, numbers: ['訂單數', '訂單總額', '已付款', '未付款', '金額不符', '二補待收'] }
   ]);
   dropOldTabs(book);
   saveStats('twt', total);
-  return rows.length + ' 筆訂單（' + shown + ' 個團）';
+  return orderCount + ' 筆訂單（' + shown + ' 個團）';
 }
-// 賣貨便、KOCA：各一頁。最上面是各狀態的筆數（KOCA 還有平台服務費、金流服務費、進帳、每一筆提領），下面是所有訂單
+// 賣貨便、KOCA：各一頁，只有統計：各狀態的筆數和金額（KOCA 還有平台服務費、金流服務費、進帳、提領）。每一筆訂單的細節在它們自己的 Google Sheet
 function mirrorChannel(c, src, book) {
   if (!src.getSheetByName(ORDER_TAB)) throw new Error('「' + c.file + '」裡沒有「' + ORDER_TAB + '」分頁：請先在那個檔案按「' + c.name + ' → 讀取通知信」');
   var rows = readRows(src, ORDER_TAB, c.headers), payouts = c.payouts ? readRows(src, PAYOUT_TAB, KOCA_PAYOUT_HEADERS) : [];
-  var headers = shownHeaders(c.headers), st = channelStats(c, rows, payouts), money = c.payouts ? '總金額' : '訂單總額';
+  var st = channelStats(c, rows, payouts), money = c.payouts ? '總金額' : '訂單總額';
   var statusRows = [], seen = {};
   c.options.map(function(o) { return o.name; }).concat(Object.keys(st.status)).forEach(function(name) {
     if (seen[name] || !st.status[name]) return;
     seen[name] = true;
     statusRows.push([name, st.status[name], emailSum(rows.filter(function(r) { return (String(r['狀態'] || '').trim() || '未知') === name; }), money)]);
   });
-  var blocks = [{ text: [c.name, '從「' + c.file + '」讀來，每次更新整張重寫；要修改請到「' + c.file + '」。',
+  var blocks = [{ text: [c.name, '這一頁只有統計。每一筆訂單的細節在「' + c.file + '」。',
     c.payouts ? '共 ' + st.count + ' 筆・已完成的進帳 ' + fmtMoney(st.income) + '・已提領入帳 ' + fmtMoney(st.payout)
       : '共 ' + st.count + ' 筆・訂單總額 ' + fmtMoney(st.total) + '（含運費 ' + fmtMoney(st.shipping) + '；不含已取消、退貨）'] },
     { headers: ['狀態', '筆數', money], rows: statusRows, numbers: ['筆數', money] }];
@@ -689,11 +678,9 @@ function mirrorChannel(c, src, book) {
       rows: [['已完成的訂單', st.done.count, st.done.total, st.done.shipping, st.done.platform, st.done.payment, st.done.other, st.done.income],
         ['還沒完成的訂單（完成後才知道實際扣多少）', st.open.count, st.open.total, '', '', '', '', '']],
       numbers: ['筆數', '總金額', '運費', '平台服務費', '金流服務費', '其他扣款', '進帳金額'] });
-    var ph = KOCA_PAYOUT_HEADERS;
-    blocks.push({ headers: ph, rows: payouts.map(function(r) { return ph.map(function(h) { return cellOut(r[h]); }); })
-      .concat([['已入帳 ' + st.payouts.count + ' 次', st.payouts.amount, st.payouts.fee, st.payouts.net, '']]), numbers: ['提領金額', '提領手續費', '入帳金額'] });
+    blocks.push({ headers: ['KOCA 提領', '次數', '提領金額', '提領手續費', '入帳金額'],
+      rows: [['已入帳', st.payouts.count, st.payouts.amount, st.payouts.fee, st.payouts.net]], numbers: ['次數', '提領金額', '提領手續費', '入帳金額'] });
   }
-  blocks.push({ headers: headers, rows: rows.map(function(r) { return headers.map(function(h) { return cellOut(r[h]); }); }), numbers: c.numbers, wrap: MIRROR_WRAP });
   writeBlocks(book, pageName(c.id), blocks);
   dropOldTabs(book);
   saveStats(c.id, { count: st.count, status: st.status, total: st.total, shipping: st.shipping, income: st.income, payout: st.payout });
@@ -714,7 +701,7 @@ function summaryRows(stats) {
 function writeSummary() {
   var book = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = writeBlocks(book, TAB_SUMMARY, [
-    { text: ['訂單總覽', '三個平台各自計算，不會混在一起。細節在各自的分頁（TWT 代購、賣貨便、KOCA）：從各平台自己的 Google Sheet 讀來，每次更新整張重寫；要修改請到各平台的 Google Sheet。'] },
+    { text: ['訂單總覽', '三個平台各自計算，不會混在一起。這個檔案只放統計，各平台有自己的一頁（TWT 代購、賣貨便、KOCA）；每一筆訂單的細節留在各平台自己的 Google Sheet。每次更新整張重寫，要修改請到各平台的 Google Sheet。'] },
     { headers: ['平台', '訂單數', '金額', '最後更新', '狀態'], rows: summaryRows(loadStats()), numbers: ['訂單數'] }
   ]);
   if (book.getSheets()[0].getName() !== TAB_SUMMARY) { try { book.setActiveSheet(sheet); book.moveActiveSheet(1); } catch (ignore) {} } // 排在最前面
