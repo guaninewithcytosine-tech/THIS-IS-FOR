@@ -1010,10 +1010,10 @@ function notionMyshipWanted(o) {
   };
 }
 function notionMyshipSummary(c, rows, payouts, url) {
-  var live = rows.filter(function(r) { return !/取消|退/.test(String(r['狀態'] || '')); });
+  var picked = rows.filter(function(r) { return /^(已取貨|已撥款)$/.test(String(r['狀態'] || '').trim()); }); // 入帳只算已取貨（已撥款也是取過貨的）
   return notionCallout([
     ['訂單　', true], [rows.length ? rows.length + ' 筆：' + statusLine(countStatus(rows), MYSHIP_STATUS_OPTIONS) : '還沒有訂單'],
-    ['\n金額　', true], [live.length ? '訂單總額 ' + fmtMoney(emailSum(live, '商品金額')) + '（實收，已扣掉運費；不含已取消、退貨）' : '—'],
+    ['\n金額　', true], [rows.length ? '已取貨的入帳 ' + fmtMoney(emailSum(picked, '商品金額')) + '（只算已取貨，運費不算）' : '—'],
     ['\n通知信　', true], [mailLine(c, rows)]
   ].concat(notionSheetLine(c, url), [[STATUS_HINT]]), '🏪');
 }

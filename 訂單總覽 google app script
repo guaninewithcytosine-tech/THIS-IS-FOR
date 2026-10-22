@@ -564,7 +564,7 @@ function overviewBlock(stats) {
   var at = function(s) { return s ? '（' + s.at.slice(5) + ' 同步）' : ''; };
   return notionCallout([
     ['TWT 代購　', true], [t ? twtLine(t) + at(t) : '還沒同步'],
-    ['\n賣貨便　', true], [m ? (m.count ? m.count + ' 筆：' + statusLine(m.status, MYSHIP_STATUS_OPTIONS) + '・訂單總額 ' + fmtMoney(m.total) + '（實收，已扣運費；不含取消、退貨）' : '還沒有訂單') + at(m) : '還沒同步'],
+    ['\n賣貨便　', true], [m ? (m.count ? m.count + ' 筆：' + statusLine(m.status, MYSHIP_STATUS_OPTIONS) + '・已取貨的入帳 ' + fmtMoney(m.picked || 0) : '還沒有訂單') + at(m) : '還沒同步'],
     ['\nKOCA　', true], [k ? (k.count ? k.count + ' 筆：' + statusLine(k.status, KOCA_STATUS_OPTIONS) + '・已完成的進帳 ' + fmtMoney(k.income) : '還沒有訂單') +
       (k.payout ? '・已提領入帳 ' + fmtMoney(k.payout) : '') + at(k) : '還沒同步'],
     ['\n三個平台各自計算，不會混在一起；要更新時在 Google Sheet「訂單總覽」按「訂單總覽 → 更新全部」']
@@ -671,7 +671,7 @@ function mirrorChannel(c, src, book) {
   });
   var blocks = [{ text: [c.name, '這一頁只有統計。每一筆訂單的細節在「' + c.file + '」。',
     c.payouts ? '共 ' + st.count + ' 筆・已完成的進帳 ' + fmtMoney(st.income) + '・已提領入帳 ' + fmtMoney(st.payout)
-      : '共 ' + st.count + ' 筆・訂單總額 ' + fmtMoney(st.total) + '（實收，已扣掉運費；不含已取消、退貨）'] },
+      : '共 ' + st.count + ' 筆・已取貨的入帳 ' + fmtMoney(st.picked) + '（只算已取貨，商品金額，運費不算）'] },
     { headers: ['狀態', '筆數', label], rows: statusRows, numbers: ['筆數', label] }];
   if (c.payouts) {
     blocks.push({ headers: ['KOCA 費用', '筆數', '總金額', '運費', '平台服務費', '金流服務費', '其他扣款', '進帳金額'],
@@ -683,7 +683,7 @@ function mirrorChannel(c, src, book) {
   }
   writeBlocks(book, pageName(c.id), blocks);
   dropOldTabs(book);
-  saveStats(c.id, { count: st.count, status: st.status, total: st.total, shipping: st.shipping, income: st.income, payout: st.payout });
+  saveStats(c.id, { count: st.count, status: st.status, total: st.total, picked: st.picked, shipping: st.shipping, income: st.income, payout: st.payout });
   return rows.length + ' 筆訂單' + (c.payouts ? '、' + payouts.length + ' 筆提領' : '');
 }
 // 「總覽」：三個平台並排的簡單比較（沒有把平台加在一起的合計），細節在各平台自己的分頁
@@ -694,7 +694,7 @@ function summaryRows(stats) {
   return [
     ['TWT 代購', t ? t.count : '', t ? money(t.received) : '', at(t),
       t ? '進行中 ' + t.campCount + ' 團・已付款 ' + t.paid + '・未付款 ' + t.unpaid + (t.mismatch ? '・金額不符 ' + t.mismatch : '') + (t.second ? '・二補待收 ' + t.second : '') : ''],
-    ['賣貨便', m ? m.count : '', m ? money(m.total) : '', at(m), m ? statusLine(m.status, MYSHIP_STATUS_OPTIONS) : ''],
+    ['賣貨便', m ? m.count : '', m ? money(m.picked) : '', at(m), m ? statusLine(m.status, MYSHIP_STATUS_OPTIONS) : ''],
     ['KOCA', k ? k.count : '', k ? money(k.income) : '', at(k),
       k ? statusLine(k.status, KOCA_STATUS_OPTIONS) + (k.payout ? '・已提領入帳 ' + fmtMoney(k.payout) : '') : '']
   ];
@@ -814,11 +814,14 @@ function countStatus(rows) {
   rows.forEach(function(r) { var s = String(r['狀態'] || '').trim() || '未知'; count[s] = (count[s] || 0) + 1; });
   return count;
 }
+// 賣貨便的入帳：只算已取貨（已撥款也是取過貨的）的商品金額，運費不算
+function isPickedUp(r) { return /^(已取貨|已撥款)$/.test(String(r['狀態'] || '').trim()); }
 function emailSum(rows, col) { return rows.reduce(function(t, r) { return t + (Number(r[col]) || 0); }, 0); }
 function channelStats(c, rows, payouts) {
   var live = rows.filter(function(r) { return !/取消|退/.test(String(r['狀態'] || '')); });
   var s = { count: rows.length, status: countStatus(rows), total: emailSum(live, c.payouts ? '總金額' : '商品金額'), shipping: emailSum(live, '運費'),
     income: emailSum(rows, '進帳金額'), payout: emailSum(payouts, '入帳金額') };
+  if (!c.payouts) s.picked = emailSum(rows.filter(isPickedUp), '商品金額');
   if (c.payouts) {
     var done = rows.filter(function(r) { return extNum(r['進帳金額']) != null; });
     var open = live.filter(function(r) { return extNum(r['進帳金額']) == null; });
