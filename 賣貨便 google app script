@@ -6,7 +6,7 @@
 // ・同一筆訂單不會重複；狀態只用比上次新的信，在 Notion 改的狀態不會被重讀到的舊信蓋回去
 // ・這個檔案會放到雲端硬碟的「賣貨便」資料夾
 // 不會自動讀信：要更新時按選單「賣貨便 → 讀取通知信」
-// Notion 由「訂單總覽」統一同步：讀完信後，到「訂單總覽」按「同步到 Notion」
+// 統整由「訂單總覽」負責（它會把這個檔案的訂單讀過去，也同步到 Notion）：讀完信後，到「訂單總覽」按「更新全部」
 // 第一次按的時候 Google 會要求允許讀取 Gmail。只讀信：不會寄信、刪信，也不會改已讀狀態或標籤
 // 讀的是「按下按鈕的那個 Google 帳號」的信箱。以前賣貨便綁在別的帳號時：把這個檔案共用給那個帳號（編輯者），
 // 用那個帳號打開這個檔案按「讀取通知信」，就會把那個信箱裡的訂單也記進來。每個帳號各自記得讀到哪裡，同一筆訂單不會重複
@@ -53,7 +53,7 @@ function readMailNow() {
     lock.releaseLock();
   }
   return notify(title, (er.account ? '帳號 ' + er.account + '：' : '') + summaryText(er) + (folderMsg ? '\n\n' + folderMsg : '') +
-    '\n\n要更新 Notion：到 Google Sheet「訂單總覽」按「訂單總覽 → 同步到 Notion」。');
+    '\n\n要更新「訂單總覽」：到 Google Sheet「訂單總覽」按「訂單總覽 → 更新全部」。');
 }
 
 function notify(title, msg) {

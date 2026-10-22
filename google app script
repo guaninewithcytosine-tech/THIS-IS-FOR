@@ -300,7 +300,7 @@ function tidySettingsSheet() {
       handed.forEach(function(h) {
         notes.push(h.name + '的訂單在 Google Sheet「' + h.file + '」：' + h.url + '\n請在那個檔案的「擴充功能 → Apps Script」貼上「' + h.name + '」的程式。');
       });
-      if (cleanupOldSettings()) notes.push('Notion 改由「訂單總覽」同步，這裡之前的 Notion、讀信設定已經清掉。');
+      if (cleanupOldSettings()) notes.push('統整（包含 Notion）改由「訂單總覽」負責，這裡之前的 Notion、讀信設定已經清掉。');
     }
     var moved = 0;
     try { moved = organizeTwtFolder(); } catch (ignore) {}
