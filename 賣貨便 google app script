@@ -311,10 +311,7 @@ function myshipItems(lines) {
     else if (cur && /^\d+$/.test(l) && cur.qty == null) cur.qty = Number(l);
     else { cur = { name: l }; items.push(cur); }
   }
-  return items.map(function(it) {
-    var money = it.sub != null ? it.sub : it.price;
-    return it.name + (it.qty ? ' x' + it.qty : '') + (money != null ? ' $' + money : '');
-  }).join('\n');
+  return items.map(function(it) { return it.name + (it.qty ? ' x' + it.qty : ''); }).join('\n'); // 價格在「商品金額」欄
 }
 // 一封信 → { mine: 是不是賣貨便的通知信, data }
 function emailParse(m) {
@@ -330,10 +327,20 @@ function emailParse(m) {
 function newReport() {
   return { account: me(), mails: 0, created: 0, updated: 0, unmatched: 0, matched: 0, skipped: 0, skippedSubjects: [], unknown: [], errors: [], pending: false, from: 0, to: 0 };
 }
+// 商品明細只放品名和數量（「元卡*2 x1」）；價格在「商品金額」「商品小計」欄。
+// 之前的版本把價格也寫在後面（「元卡*2 x1 $230」）：拿掉
+function plainItems(text) {
+  return String(text == null ? '' : text).split('\n').map(function(l) { return l.replace(/(\sx\d+)\s+\$\s*[\d,]+(?:\.\d+)?\s*$/, '$1'); }).join('\n');
+}
 function loadStore(ss) {
   var rows = readRows(ss, ORDER_TAB, HEADERS), byNo = {};
-  rows.forEach(function(r) { if (r['訂單編號']) byNo[String(r['訂單編號'])] = r; });
-  return { ss: ss, rows: rows, byNo: byNo, dirty: false, waiting: loadChunked(KEY_PENDING), waitingDirty: false };
+  var dirty = false;
+  rows.forEach(function(r) {
+    if (r['訂單編號']) byNo[String(r['訂單編號'])] = r;
+    var plain = plainItems(r['商品明細']);
+    if (plain !== String(r['商品明細'] == null ? '' : r['商品明細'])) { r['商品明細'] = plain; dirty = true; } // 以前記的商品明細有價格：拿掉
+  });
+  return { ss: ss, rows: rows, byNo: byNo, dirty: dirty, waiting: loadChunked(KEY_PENDING), waitingDirty: false };
 }
 function saveStore(store) {
   if (store.dirty) writeRows(store.ss, ORDER_TAB, HEADERS, store.rows, NUMBER_COLS, WRAP_COLS);
@@ -950,7 +957,7 @@ function notionMyshipWanted(o) {
     status: String(o['狀態'] || ''),
     orderNo: String(o['訂單編號'] || ''),
     shop: notionText(o['賣場'], 200),
-    items: notionText(o['商品明細']),
+    items: notionText(plainItems(o['商品明細'])),
     subtotal: extNum(o['商品金額']),
     date: extNotionDate(o['訂單日期'])
   };
