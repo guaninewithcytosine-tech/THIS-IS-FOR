@@ -818,7 +818,7 @@ function countStatus(rows) {
 function isPickedUp(r) { return /^(已取貨|已撥款)$/.test(String(r['狀態'] || '').trim()); }
 function emailSum(rows, col) { return rows.reduce(function(t, r) { return t + (Number(r[col]) || 0); }, 0); }
 function channelStats(c, rows, payouts) {
-  var live = rows.filter(function(r) { return !/取消|退/.test(String(r['狀態'] || '')); });
+  var live = rows.filter(function(r) { return !/取消|退|未取/.test(String(r['狀態'] || '')); }); // 取消、退貨、沒取貨的都不算成立
   var s = { count: rows.length, status: countStatus(rows), total: emailSum(live, c.payouts ? '總金額' : '商品金額'), shipping: emailSum(live, '運費'),
     income: emailSum(rows, '進帳金額'), payout: emailSum(payouts, '入帳金額') };
   if (!c.payouts) s.picked = emailSum(rows.filter(isPickedUp), '商品金額');

@@ -22,7 +22,7 @@ var HEADERS = ['訂單編號', '狀態', '訂單日期', '賣場', '買家', '�
   '付款方式', '配送方式', '買家回饋', '訂單備註', '最後通知時間', '更新時間（系統用）'];
 var NUMBER_COLS = ['商品金額', '運費', '訂單總額'];
 var WRAP_COLS = ['商品明細', '單價', '收件資訊', '買家回饋', '訂單備註'];
-var PARSER_VERSION = '5';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
+var PARSER_VERSION = '6';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
 var OVERLAP_SEC = 2 * 86400;        // 每次往前多看兩天，晚到的信也不會漏
 var BUDGET_MS = 270000;             // 一次最多讀 4.5 分鐘，剩下的再按一次接著讀
 // 每個帳號各自記（User Properties）：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本
@@ -257,11 +257,14 @@ function fmtTime(date) { return Utilities.formatDate(date, TZ, 'yyyy-MM-dd HH:mm
 // ── 賣貨便的信 ──
 function myshipStatus(kind) {
   if (/取消/.test(kind)) return '已取消';
-  if (/退貨|退款/.test(kind)) return '退貨／退款';
-  if (/未取/.test(kind)) return '未取貨';
-  if (/取貨|取件/.test(kind)) return '已取貨';
-  if (/到店|到貨|抵達|送達/.test(kind)) return '已到店';
+  // 取貨提醒（還在門市等）：不是取貨完成，也不是棄單
+  if (/即將|提醒|儘速|盡速|請於|請儘快|請盡快|剩餘|快到期|將到期/.test(kind)) return /取貨|取件|到店|到貨|門市/.test(kind) ? '已到店' : '';
+  if (/未取|未領|逾期|棄單|期限已過|超過.*期限/.test(kind)) return '未取貨'; // 沒有取貨、被棄單退回：訂單不成立
+  if (/退貨|退款|退回|退件|退還/.test(kind)) return '退貨／退款';
   if (/撥款/.test(kind)) return '已撥款';
+  if (/已取貨|完成取貨|取貨完成|已取件|完成取件|取件完成/.test(kind)) return '已取貨';
+  if (/到店|到貨|抵達|送達/.test(kind)) return '已到店';
+  if (/取貨|取件/.test(kind)) return '已取貨';
   if (/寄件|出貨|交寄/.test(kind)) return '已出貨';
   if (/成立|新訂單/.test(kind)) return '待出貨';
   return '';
@@ -272,6 +275,8 @@ function parseMyshipEmail(subject, lines, html) {
   if (!no) return null;
   var kind = String(subject || '').replace(/^[\s\S]*?賣貨便\s*[:：]?\s*/, '').replace(/通知\s*$/, '').trim();
   var d = { orderNo: no[1], status: myshipStatus(kind), fields: {} };
+  // 標題看不出來時，內文寫著逾期沒取貨、棄單退回，也算沒取貨
+  if (!d.status && /逾期未取|未於.{0,12}取貨|棄單|未取貨.{0,10}退回/.test(text)) d.status = '未取貨';
   if (d.status !== '待出貨') return d; // 取貨、取消等通知只有訂單編號：更新已經記下的訂單
   // 自己在賣貨便買東西時收到的信不算：賣家收到的信會請你安排出貨
   if (!/有新的訂單|安排出貨|交貨便代碼/.test(text)) return { skip: true };
