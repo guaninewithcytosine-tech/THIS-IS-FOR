@@ -22,7 +22,7 @@ var HEADERS = ['訂單編號', '狀態', '訂單日期', '賣場', '買家', '�
   '付款方式', '配送方式', '買家回饋', '訂單備註', '最後通知時間', '更新時間（系統用）'];
 var NUMBER_COLS = ['商品金額', '運費', '訂單總額'];
 var WRAP_COLS = ['商品明細', '單價', '收件資訊', '買家回饋', '訂單備註'];
-var PARSER_VERSION = '7';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
+var PARSER_VERSION = '8';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
 var OVERLAP_SEC = 2 * 86400;        // 每次往前多看兩天，晚到的信也不會漏
 var BUDGET_MS = 270000;             // 一次最多讀 4.5 分鐘，剩下的再按一次接著讀
 // 每個帳號各自記（User Properties）：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本
@@ -270,23 +270,13 @@ function myshipStatus(kind) {
   if (/成立|新訂單/.test(kind)) return '待出貨';
   return '';
 }
-function parseMyshipEmail(subject, lines, html) {
-  var text = lines.join('\n');
-  var no = text.match(/訂單編號\s*[:：]?\s*([A-Z]{1,4}\d{8,})/);
-  if (!no) return null;
-  var kind = String(subject || '').replace(/^[\s\S]*?賣貨便\s*[:：]?\s*/, '').replace(/通知\s*$/, '').trim();
-  var d = { orderNo: no[1], status: myshipStatus(kind), fields: {} };
-  // 標題看不出來時，內文寫著逾期沒取貨、棄單退回，也算沒取貨
-  if (!d.status && /逾期未取|未於.{0,12}取貨|棄單|未取貨.{0,10}退回/.test(text)) d.status = '未取貨';
-  if (d.status !== '待出貨') return d; // 取貨、取消等通知只有訂單編號：更新已經記下的訂單
-  // 自己在賣貨便買東西時收到的信不算：賣家收到的信會請你安排出貨
-  if (!/有新的訂單|安排出貨|交貨便代碼/.test(text)) return { skip: true };
-  d.full = true;
+// 信裡的訂單資料（訂單成立通知、退件到店通知都有同樣的表格）
+function myshipOrderFields(lines) {
   var recipient = emailBlock(lines, '收件者資訊', /^(付款方式|配送方式|商品名稱)/, 4);
   var feedback = emailBlock(lines, '買家回饋資訊', /^(訂單備註|★)/, 10).map(function(l) { return l.replace(/^\d+\s*[.、)]\s*/, ''); });
   var social = feedback.length && feedback[0].match(/[:：]\s*(.+)$/);
   var cols = itemColumns(myshipItems(lines));
-  d.fields = {
+  return {
     '訂單日期': emailDate(emailField(lines, '訂單日期')),
     '賣場': emailField(lines, '賣場名稱'),
     '買家': (social && social[1].trim()) || recipient[0] || '',
@@ -301,6 +291,26 @@ function parseMyshipEmail(subject, lines, html) {
     '買家回饋': feedback.join('；'),
     '訂單備註': emailBlock(lines, '訂單備註', /^(★|寄送流程|提醒|如在家|如前往|親愛的|此為系統|任何問題)/, 3).join(' ')
   };
+}
+// 退件通知裡只有賣家才會看到的字：貨退回你寄件的門市，要你去取回（買家收到的退件通知沒有這段）
+var MYSHIP_SELLER_RETURN_RE = /賣家仍未前往取件|賣家需自行來電|簽收單據免費取回|貨退回原寄件門市/;
+function parseMyshipEmail(subject, lines, html) {
+  var text = lines.join('\n');
+  // 訂單編號：信裡「訂單編號：」後面；沒有這個欄位的通知，用標題「訂單(CM…)」或內文「訂單 CM…」
+  var no = text.match(/訂單編號\s*[:：]?\s*([A-Z]{1,4}\d{8,})/) || String(subject || '').match(/[(（]\s*([A-Z]{1,4}\d{8,})\s*[)）]/) || text.match(/訂單\s*([A-Z]{2}\d{8,})/);
+  if (!no) return null;
+  var kind = String(subject || '').replace(/^[\s\S]*?賣貨便\s*[:：]?\s*/, '').replace(/通知\s*$/, '').trim();
+  var d = { orderNo: no[1], status: myshipStatus(kind), fields: {} };
+  // 標題看不出來時，內文寫著逾期沒取貨、棄單退回，也算沒取貨
+  if (!d.status && /逾期未取|未於.{0,12}取貨|棄單|未取貨.{0,10}退回/.test(text)) d.status = '未取貨';
+  d.returned = /退件/.test(kind);
+  // 我出貨、被退件：信裡有完整的訂單資料，訂單成立的信不在這個信箱時，用這封信補上這筆訂單（已經有的欄位不改）
+  if (d.returned && MYSHIP_SELLER_RETURN_RE.test(text)) { d.full = true; d.fillOnly = true; d.fields = myshipOrderFields(lines); return d; }
+  if (d.status !== '待出貨') return d; // 取貨、取消等通知只有訂單編號：更新已經記下的訂單
+  // 自己在賣貨便買東西時收到的信不算：賣家收到的信會請你安排出貨
+  if (!/有新的訂單|安排出貨|交貨便代碼/.test(text)) return { skip: true };
+  d.full = true;
+  d.fields = myshipOrderFields(lines);
   return d;
 }
 // 商品表格：商品名稱｜單價｜數量｜小計。回傳每樣商品 { name, qty, unit（單價）}
@@ -340,7 +350,7 @@ function emailParse(m) {
 
 // ── 讀信 ──
 function newReport() {
-  return { account: me(), mails: 0, created: 0, updated: 0, unmatched: 0, matched: 0, skipped: 0, skippedSubjects: [], unknown: [], errors: [], pending: false, from: 0, to: 0 };
+  return { account: me(), mails: 0, created: 0, updated: 0, unmatched: 0, matched: 0, skipped: 0, skippedSubjects: [], returnedOther: [], unknown: [], errors: [], pending: false, from: 0, to: 0 };
 }
 // 商品明細只放品名和數量（「元卡*2 x1」）；價格在「商品金額」「商品小計」欄。
 // 之前的版本把價格也寫在後面（「元卡*2 x1 $230」）：拿掉
@@ -416,7 +426,7 @@ function applyMail(store, p, sec, er) {
     if (!d.full) {
       var w = store.waiting[d.orderNo];
       if (d.status && (!w || sec > w[1])) { store.waiting[d.orderNo] = [d.status, sec]; store.waitingDirty = true; }
-      er.unmatched++;
+      if (d.returned) er.returnedOther.push(p.subject); else er.unmatched++; // 找不到訂單的退件：看起來是你買東西被退的
       return;
     }
     row = {};
@@ -431,6 +441,7 @@ function applyMail(store, p, sec, er) {
   Object.keys(d.fields).forEach(function(h) {
     var v = d.fields[h];
     if (v === '' || v == null || HEADERS.indexOf(h) < 0) return;
+    if (d.fillOnly && row[h] !== '' && row[h] != null) return; // 退件通知只補沒有的欄位（買家名稱之類不要被信裡遮掉的名字蓋掉）
     if (String(row[h]) !== String(v)) { row[h] = v; store.dirty = true; }
   });
   // 狀態只用比上次新的信：在 Notion 手動改的狀態，不會被重讀到的舊信蓋回去
@@ -504,6 +515,7 @@ function summaryText(er) {
   else lines.push('讀了 ' + er.mails + ' 封賣貨便通知信（' + fmtTime(new Date(er.from * 1000)).slice(0, 10) + ' ～ ' + fmtTime(new Date(er.to * 1000)).slice(0, 10) + '）：新增 ' + er.created + ' 筆訂單、更新 ' + er.updated + ' 筆狀態。');
   if (er.matched) lines.push('補上 ' + er.matched + ' 筆之前先記著的取貨、取消通知。');
   if (er.unmatched) lines.push('有 ' + er.unmatched + ' 封取貨、取消之類的通知還找不到原本的訂單，先記著：訂單成立的信如果在另一個帳號的信箱，用那個帳號讀信時會自動補上。');
+  if (er.returnedOther.length) lines.push('有 ' + er.returnedOther.length + ' 封退件通知找不到訂單，也沒有賣家才會有的「去門市取回」說明，看起來是你買東西被退的，沒有記：' + er.returnedOther.slice(0, 3).join('、') + (er.returnedOther.length > 3 ? ' 等' : '') + '。如果其實是你出貨被退的，請把標題告訴我。');
   if (er.skipped) lines.push('有 ' + er.skipped + ' 封看起來是你自己當買家的訂單，沒有記：' + er.skippedSubjects.slice(0, 3).join('、') + (er.skippedSubjects.length > 3 ? ' 等' : '') + '。如果其實是你賣出的訂單，請告訴我。');
   if (er.unknown.length) lines.push('看不懂的通知信（請告訴我，我再加上）：' + er.unknown.slice(0, 3).join('、') + (er.unknown.length > 3 ? ' 等 ' + er.unknown.length + ' 封' : ''));
   if (er.errors.length) lines.push(er.errors.length + ' 封讀取失敗：' + er.errors[0]);
