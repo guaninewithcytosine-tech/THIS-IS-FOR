@@ -1003,57 +1003,61 @@ function channelPage(c, pages) {
 function notionKocaSpec() {
   return {
     title: '訂單',
+    // 金額只放訂單總額、手續費、進帳金額（運費、平台服務費、金流服務費等細項留在這個 Google Sheet）
+    drop: ['商品小計', '運費', '總金額', '平台服務費', '金流服務費', '其他扣款', '費用明細'],
     fields: [
       ['buyer', '買家', 'title'],
       ['status', '狀態', 'select', KOCA_STATUS_OPTIONS],
       ['orderNo', '訂單編號', 'text'],
       ['items', '商品', 'text'],
       ['prices', '單價', 'text'],
-      ['subtotal', '商品小計', 'number'],
-      ['shipping', '運費', 'number'],
-      ['total', '總金額', 'number'],
-      ['platformFee', '平台服務費', 'number'],
-      ['paymentFee', '金流服務費', 'number'],
-      ['otherFee', '其他扣款', 'number'],
+      ['total', '訂單總額', 'number'],
+      ['fee', '手續費', 'number'],
       ['income', '進帳金額', 'number'],
-      ['fees', '費用明細', 'text'],
       ['date', '訂單日期', 'date']
     ],
     views: [{ name: '依狀態', groupBy: '狀態',
-      columns: ['買家', '狀態', '訂單編號', '商品', '單價', '總金額', '運費', '平台服務費', '金流服務費', '其他扣款', '進帳金額', '費用明細', '訂單日期'] }]
+      columns: ['買家', '狀態', '訂單編號', '商品', '單價', '訂單總額', '手續費', '進帳金額', '訂單日期'] }]
   };
 }
+// 訂單總額（不含買家付的運費）、手續費（平台服務費＋金流服務費＋其他扣款）、進帳金額：訂單總額 − 手續費 ＝ 進帳金額
+// 信裡有寫明各項費用就照信；沒寫明時，手續費用「總金額 − 運費 − 進帳金額」算出來。還沒完成的訂單還不知道手續費和進帳
+function kocaAmounts(o) {
+  var income = extNum(o['進帳金額']), gross = extNum(o['總金額']), ship = extNum(o['運費']);
+  var parts = [o['平台服務費'], o['金流服務費'], o['其他扣款']].map(extNum);
+  var recorded = parts.some(function(v) { return v != null; }) ? parts.reduce(function(t, v) { return t + (v || 0); }, 0) : null;
+  if (income == null) return { total: gross == null ? null : gross - (ship || 0), fee: null, income: null };
+  if (recorded != null) return { total: income + recorded, fee: recorded, income: income };
+  if (gross != null && ship != null) {
+    if (gross - ship >= income) return { total: gross - ship, fee: gross - ship - income, income: income };
+    if (gross >= income) return { total: gross, fee: gross - income, income: income }; // 以前的信：總金額不含運費
+  }
+  return { total: gross, fee: null, income: income };
+}
 function notionKocaWanted(o) {
+  var a = kocaAmounts(o);
   return {
     buyer: notionText(o['買家'] || '（未填）', 200),
     status: String(o['狀態'] || ''),
     orderNo: String(o['訂單編號'] || ''),
     items: notionText(plainItems(o['商品明細'])),
     prices: notionText(String(o['單價'] == null ? '' : o['單價'])),
-    subtotal: extNum(o['商品小計']),
-    shipping: extNum(o['運費']),
-    total: extNum(o['總金額']),
-    platformFee: extNum(o['平台服務費']),
-    paymentFee: extNum(o['金流服務費']),
-    otherFee: extNum(o['其他扣款']),
-    income: extNum(o['進帳金額']),
-    fees: notionText(o['費用明細'], 500),
+    total: a.total,
+    fee: a.fee,
+    income: a.income,
     date: extNotionDate(o['訂單日期'])
   };
 }
 function notionKocaSummary(c, rows, payouts, url) {
-  var done = rows.filter(function(r) { return extNum(r['進帳金額']) != null; });
-  var open = rows.filter(function(r) { return extNum(r['進帳金額']) == null && !/取消|退/.test(String(r['狀態'] || '')); });
-  var other = emailSum(done, '其他扣款');
-  // 各項金額並列（KOCA 以前的信「總金額」不含運費，所以不寫成相減的算式）
-  var settled = done.length ? done.length + ' 筆・總金額 ' + fmtMoney(emailSum(done, '總金額')) + '・運費 ' + fmtMoney(emailSum(done, '運費')) +
-    '・平台服務費 ' + fmtMoney(emailSum(done, '平台服務費')) + '・金流服務費 ' + fmtMoney(emailSum(done, '金流服務費')) +
-    (other ? '・其他扣款 ' + fmtMoney(other) : '') + '・進帳 ' + fmtMoney(emailSum(done, '進帳金額')) : '還沒有';
+  var amounts = rows.map(function(r) { return { r: r, a: kocaAmounts(r) }; });
+  var sum = function(list, key) { return list.reduce(function(t, x) { return t + (x.a[key] || 0); }, 0); };
+  var done = amounts.filter(function(x) { return x.a.income != null; });
+  var open = amounts.filter(function(x) { return x.a.income == null && !/取消|退/.test(String(x.r['狀態'] || '')); });
   var fee = emailSum(payouts, '提領手續費');
   return notionCallout([
     ['訂單　', true], [rows.length ? rows.length + ' 筆：' + statusLine(countStatus(rows), KOCA_STATUS_OPTIONS) : '還沒有訂單'],
-    ['\n已完成的訂單　', true], [settled],
-    ['\n還沒完成　', true], [open.length ? open.length + ' 筆・總金額 ' + fmtMoney(emailSum(open, '總金額')) + '（完成後才知道實際扣多少費用）' : '—'],
+    ['\n已完成的訂單　', true], [done.length ? done.length + ' 筆・訂單總額 ' + fmtMoney(sum(done, 'total')) + '・手續費 ' + fmtMoney(sum(done, 'fee')) + '・進帳 ' + fmtMoney(sum(done, 'income')) : '還沒有'],
+    ['\n還沒完成　', true], [open.length ? open.length + ' 筆・訂單總額 ' + fmtMoney(sum(open, 'total')) + '（完成後才知道手續費和進帳）' : '—'],
     ['\n提領　', true], [payouts.length ? '已入帳 ' + fmtMoney(emailSum(payouts, '入帳金額')) + '（' + payouts.length + ' 次' + (fee ? '，提領手續費 ' + fmtMoney(fee) : '') + '）' : '還沒有'],
     ['\n通知信　', true], [mailLine(c, rows)]
   ].concat(notionSheetLine(c, url), [[STATUS_HINT]]), '🛒');
