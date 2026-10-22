@@ -63,11 +63,12 @@ var KOCA_STATUS_OPTIONS = [
 ];
 
 // 三個來源：「來源」分頁的列、雲端硬碟裡的資料夾、自動尋找的方式
+// match：「來源」分頁 A 欄的名稱只要有這個字就算這個平台（多一個空格、寫成「賣貨便 訂單」也找得到）
 function sources() {
   return [
-    { id: 'twt', name: 'TWT 代購', label: 'TWT 代購管理表', oldLabels: ['TWT 代購主控表'], folders: ['TWT 代購', 'TWT_開團表單'] },
-    { id: 'myship', name: '賣貨便', label: '賣貨便訂單', file: '賣貨便訂單', folders: ['賣貨便'] },
-    { id: 'koca', name: 'KOCA', label: 'KOCA 訂單', file: 'KOCA 訂單', folders: ['KOCA'] }
+    { id: 'twt', name: 'TWT 代購', label: 'TWT 代購管理表', match: /twt|代購/i, folders: ['TWT 代購', 'TWT_開團表單'] },
+    { id: 'myship', name: '賣貨便', label: '賣貨便訂單', file: '賣貨便訂單', match: /賣貨便/, folders: ['賣貨便'] },
+    { id: 'koca', name: 'KOCA', label: 'KOCA 訂單', file: 'KOCA 訂單', match: /koca/i, folders: ['KOCA'] }
   ];
 }
 // 賣貨便、KOCA 的欄位（跟它們自己的 Google Sheet 一樣）
@@ -227,17 +228,24 @@ function sourceSheet() {
   if (/^(未命名|Untitled)/i.test(ss.getName())) ss.rename(TOP_FOLDER);
   return sheet;
 }
+// 「來源」分頁裡屬於這個平台的列（名稱有平台的字就算，打錯一點也找得到）；一列都沒有時回傳空陣列
+function sourceRows(sheet, id) {
+  var src = sources().filter(function(s) { return s.id === id; })[0], out = [];
+  var col = sheet.getRange(1, 1, Math.max(1, sheet.getLastRow()), 1).getValues();
+  for (var i = 1; i < col.length; i++) if (src.match.test(String(col[i][0]))) out.push(i + 1);
+  return out;
+}
+// 這個平台在「來源」分頁的列；名稱不是標準寫法時改成標準寫法，一列都沒有時加一列
 function sourceRow(sheet, id) {
-  var src = sources().filter(function(s) { return s.id === id; })[0], label = src.label;
-  var n = Math.max(1, sheet.getLastRow());
-  var col = sheet.getRange(1, 1, n, 1).getValues();
-  for (var i = 1; i < col.length; i++) {
-    var text = String(col[i][0]).trim();
-    if (text === label) return i + 1;
-    if ((src.oldLabels || []).indexOf(text) >= 0) { sheet.getRange(i + 1, 1).setValue(label); return i + 1; } // 舊的名稱改成新的
+  var label = sources().filter(function(s) { return s.id === id; })[0].label;
+  var rows = sourceRows(sheet, id);
+  if (rows.length) {
+    if (String(sheet.getRange(rows[0], 1).getValue()).trim() !== label) sheet.getRange(rows[0], 1).setNumberFormat('@').setValue(label);
+    return rows[0];
   }
-  sheet.getRange(n + 1, 1).setValue(label);
-  return n + 1;
+  var row = Math.max(1, sheet.getLastRow()) + 1;
+  sheet.getRange(row, 1).setNumberFormat('@').setValue(label);
+  return row;
 }
 function setSourceCell(id, col, value) {
   try {
@@ -255,12 +263,21 @@ function extractSheetId(text) {
 function sourceIds(detect) {
   var sheet = sourceSheet(), out = {};
   sources().forEach(function(s) {
-    var row = sourceRow(sheet, s.id);
-    var id = extractSheetId(sheet.getRange(row, 2).getValue());
+    var row = sourceRow(sheet, s.id), id = '', rows = sourceRows(sheet, s.id);
+    // 同一個平台有好幾列時（例如多打了一列），用第一個有連結的
+    rows.forEach(function(r) {
+      var v = extractSheetId(sheet.getRange(r, 2).getValue());
+      if (!id && v) id = v;
+    });
+    if (id && rows.length > 1 && !extractSheetId(sheet.getRange(row, 2).getValue())) sheet.getRange(row, 2).setNumberFormat('@').setValue(sheetUrl(id));
     if (!id && detect) {
       id = s.id === 'twt' ? detectTwt(s) : detectByName(s.file);
       if (id) sheet.getRange(row, 2).setNumberFormat('@').setValue(sheetUrl(id));
     }
+    // 多出來、沒有連結的列清掉（只留第一列）
+    rows.slice(1).forEach(function(r) {
+      if (!String(sheet.getRange(r, 2).getValue()).trim() && !String(sheet.getRange(r, 3).getValue()).trim()) sheet.getRange(r, 1, 1, SOURCE_HEADERS.length).clearContent();
+    });
     if (id) out[s.id] = id;
   });
   return out;
