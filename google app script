@@ -2,7 +2,7 @@
 // TWT 代購平台 · Google Apps Script 後端（orderId + 自動建團表版）
 // 適配目前賣家後台：catalog、登入、訂單讀取、對帳、二補、圖片上傳/回收
 // saveCatalog 會自動為每個非現貨開團建立獨立 Google Sheet（訂單、商品清單），並在 TWT 代購管理表更新「團務資料」與「團務索引表單」
-// 只有 TWT 代購自己的功能。Notion 由「訂單總覽」的程式統整；賣貨便、KOCA 各自有自己的 Google Sheet 和程式
+// TWT 代購自己的功能，包含把各團同步到 Notion（選用）。賣貨便、KOCA 各自有自己的 Google Sheet 和程式；「訂單總覽」把三個平台統整在一起
 // ══════════════════════════════════════════
  
 // 後台密碼只從「系統設定」B1 讀取，不再有寫死的預設密碼。
@@ -271,6 +271,9 @@ function buildPriorityDataText(cardSort, cardSortMode, cardCount) {
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('TWT 代購')
     .addItem('整理系統設定', 'tidySettingsSheet')
+    .addSeparator()
+    .addItem('同步到 Notion', 'notionSyncNow')
+    .addItem('設定 Notion（選用）', 'notionSetup')
     .addToUi();
 }
 
@@ -300,7 +303,7 @@ function tidySettingsSheet() {
       handed.forEach(function(h) {
         notes.push(h.name + '的訂單在 Google Sheet「' + h.file + '」：' + h.url + '\n請在那個檔案的「擴充功能 → Apps Script」貼上「' + h.name + '」的程式。');
       });
-      if (cleanupOldSettings()) notes.push('統整（包含 Notion）改由「訂單總覽」負責，這裡之前的 Notion、讀信設定已經清掉。');
+      if (cleanupOldSettings()) notes.push('這裡之前的賣貨便、KOCA 讀信和 Notion 設定已經清掉（TWT 代購自己的 Notion 設定保留）。賣貨便、KOCA 要同步 Notion，請在它們自己的 Google Sheet 按「設定 Notion」。');
     }
     var moved = 0;
     try { moved = organizeTwtFolder(); } catch (ignore) {}
@@ -388,7 +391,8 @@ function isOldChannelTab(sheet) {
 function cleanupOldSettings() {
   var sp = PropertiesService.getScriptProperties(), n = 0;
   Object.keys(sp.getProperties()).forEach(function(k) {
-    if (/^__(NOTION|EMAIL|SHEET_|SYNC_)/.test(k)) { sp.deleteProperty(k); n++; }
+    // TWT 代購自己的 Notion 設定（權杖、頁面、各團的頁面、同步紀錄）保留；賣貨便、KOCA 的交給它們自己的檔案
+    if (/^__(EMAIL|SHEET_|SYNC_)/.test(k) || /^__NOTION_(MYSHIP|KOCA)_/.test(k) || /^__NOTION_(LAYOUT|DB|DS|ENDED)__$/.test(k)) { sp.deleteProperty(k); n++; }
   });
   removeOldTriggers();
   return n;
@@ -2690,3 +2694,767 @@ function extractDriveId(u) {
   m = u.match(/\/d\/([\w-]+)/); if (m) return m[1];
   return '';
 }
+
+// ══════════════════════════════════════════
+// Notion（選用）：TWT 代購的各團同步到 Notion
+// 按選單「TWT 代購 → 設定 Notion（選用）」貼上存取權杖和要放的 Notion 頁面連結；之後按「TWT 代購 → 同步到 Notion」
+// 你指定的頁面裡有「🛍️ TWT 代購」，裡面有兩個頁面（之前已經建立的會直接沿用，沒有才建立）：
+// ・📋 進行中團務：每個團一個獨立頁面（圖示顏色代表狀態）
+// ・📦 已結束團務：團在後台刪除（已結束）後，整個頁面搬到這裡保留，之後不再同步
+// 每個團的頁面：最上面是摘要（團體、狀態、團務進度、訂單、付款、二補），下面是一個「訂單與二補」表格，用分頁切換：
+// ・訂單：每筆訂單一列，依付款狀態分組（未付款、金額不符在前面），有二補金額欄
+// ・二補：已經在後台算好二補的訂單（重量、國際運費、包材費、二補金額都直接讀 Google Sheet 的「匯率與二補」），依收款狀態分組
+// 雙向同步：付款狀態、二補收款狀態（在 Notion 改了會寫回該團的 Google Sheet）。其他欄位由 Google Sheet 寫到 Notion
+// 賣貨便、KOCA 的頁面由它們自己的 Google Sheet 同步，跟 TWT 的訂單、對帳分開
+// 使用 Notion API 2025-09-03。Notion 現在把「整合」改稱「連接」。
+// ══════════════════════════════════════════
+var NOTION_API = 'https://api.notion.com/v1/';
+var NOTION_VERSION = '2025-09-03';
+var NOTION_TOKEN_KEY = '__NOTION_TOKEN__';
+var NOTION_PAGES_KEY = '__NOTION_PAGES__';      // { root, twt, active, ended, overview, twtSum }
+var NOTION_CAMPS_KEY = '__NOTION_CAMPS_';       // TWT 各團在 Notion 的頁面與表格
+var NOTION_STATE_KEY = '__NOTION_STATE_';       // TWT 每筆訂單上次同步時兩邊一致的狀態：{ 訂單編號: { p: 付款狀態, s: 二補收款狀態 } }
+var NOTION_TIME_BUDGET_MS = 270000;             // 單次最多跑 4.5 分鐘，剩下的再按一次同步接著做
+var TWT_TITLE = 'TWT 代購';
+var NOTION_ACTIVE_TITLE = '進行中團務';
+var NOTION_ENDED_TITLE = '已結束團務';
+var NOTION_TABLE_TITLE = '訂單與二補';
+var NOTION_STATUS_ICONS = { open: '🟢', closed: '🟡', sorting: '🔵', instock: '🟣', ended: '⚪', deleted: '⚫' };
+var NOTION_PAY_OPTIONS = [{ name: '未付款', color: 'red' }, { name: '金額不符', color: 'orange' }, { name: '已付款', color: 'green' }, { name: '退款', color: 'gray' }];
+var NOTION_SECOND_OPTIONS = [{ name: '未收款', color: 'red' }, { name: '已收款', color: 'green' }];
+var NOTION_MATCH_FORMULA = 'if(empty(prop("匯款金額")), "", if(prop("匯款金額") == prop("系統總計"), "相符", "不符"))';
+var NOTION_WRAP_COLUMNS = ['明細', '商品', '收件資訊', '備註', '費用明細']; // 這些欄位在表格裡自動換行
+
+function notionSchema(fields) {
+  var out = {};
+  fields.forEach(function(f) {
+    var type = f[2], cfg = f[3];
+    out[f[1]] = type === 'title' ? { title: {} }
+      : type === 'text' ? { rich_text: {} }
+      : type === 'date' ? { date: {} }
+      : type === 'number' ? { number: { format: cfg || 'number_with_commas' } }
+      : { select: { options: cfg || [] } };
+  });
+  return out;
+}
+function notionPropValue(type, v) {
+  if (type === 'title') return { title: richText(v) };
+  if (type === 'text') return { rich_text: richText(v) };
+  if (type === 'number') return { number: v == null || v === '' ? null : v };
+  if (type === 'date') return { date: v ? { start: v } : null };
+  return { select: v ? { name: v } : null };
+}
+function notionReadValue(type, x) {
+  if (type === 'title' || type === 'text') return readText(x);
+  if (type === 'number') return readNumber(x);
+  if (type === 'date') return (x && x.date && x.date.start) || '';
+  return readSelect(x);
+}
+// 沒給的欄位（undefined）不寫
+function notionProps(fields, w) {
+  var out = {};
+  fields.forEach(function(f) { if (w[f[0]] !== undefined) out[f[1]] = notionPropValue(f[2], w[f[0]]); });
+  return out;
+}
+function notionRead(fields, page) {
+  var p = (page && page.properties) || {}, out = {};
+  fields.forEach(function(f) { out[f[0]] = notionReadValue(f[2], p[f[1]]); });
+  return out;
+}
+// 只回傳跟 Notion 上不一樣的欄位；都一樣時回傳 null
+function notionChanged(fields, want, have) {
+  var out = {}, changed = false;
+  fields.forEach(function(f) {
+    var k = f[0];
+    if (want[k] === undefined) return;
+    var same = f[2] === 'date' ? sameTime(want[k], have[k]) : sameValue(want[k], have[k]);
+    if (!same) { out[f[1]] = notionPropValue(f[2], want[k]); changed = true; }
+  });
+  return changed ? out : null;
+}
+function notionText(s, max) { return String(s == null ? '' : s).slice(0, max || 1900); }
+function numOrNull(v) { var n = Number(v); return (v === '' || v == null || !isFinite(n) || n === 0) ? null : n; }
+function richText(s) { return s ? [{ type: 'text', text: { content: s } }] : []; }
+function readText(x) { return ((x && (x.title || x.rich_text)) || []).map(function(t) { return t.plain_text || (t.text && t.text.content) || ''; }).join(''); }
+function readSelect(x) { return (x && x.select && x.select.name) || ''; }
+function readNumber(x) { return (x && typeof x.number === 'number') ? x.number : null; }
+function sameValue(a, b) { return String(a == null ? '' : a) === String(b == null ? '' : b); }
+function sameTime(a, b) {
+  if (!a || !b) return !a && !b;
+  return Math.floor(new Date(a).getTime() / 60000) === Math.floor(new Date(b).getTime() / 60000);
+}
+function notionFetch(method, path, body) {
+  var token = PropertiesService.getScriptProperties().getProperty(NOTION_TOKEN_KEY);
+  if (!token) throw new Error('尚未設定 Notion 存取權杖');
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var options = {
+      method: method,
+      headers: { Authorization: 'Bearer ' + token, 'Notion-Version': NOTION_VERSION },
+      muteHttpExceptions: true
+    };
+    if (body) { options.contentType = 'application/json'; options.payload = JSON.stringify(body); }
+    var res = UrlFetchApp.fetch(NOTION_API + path, options);
+    var code = res.getResponseCode();
+    if (code === 429 || code >= 500) {
+      var headers = res.getHeaders() || {};
+      var wait = Number(headers['Retry-After'] || headers['retry-after'] || 0) || (attempt + 1);
+      Utilities.sleep(Math.min(30, wait) * 1000);
+      continue;
+    }
+    var json = {};
+    try { json = JSON.parse(res.getContentText() || '{}'); } catch (ignore) {}
+    if (code >= 400) {
+      var msg = code === 401 ? 'Notion 存取權杖不正確或已失效'
+        : code === 404 ? 'Notion 找不到這個頁面或資料庫：請在 Notion 頁面右上角「⋯ → 連接」加入你建立的連接'
+        : 'Notion ' + code + '：' + (json.message || '');
+      var err = new Error(msg);
+      err.status = code;
+      throw err;
+    }
+    return json;
+  }
+  throw new Error('Notion 目前太忙，稍後再試');
+}
+// 從 Notion 連結取出頁面 ID（最後一段 32 碼）
+function extractNotionId(text) {
+  var clean = String(text || '').split('?')[0].replace(/-/g, '');
+  var all = clean.match(/[0-9a-f]{32}/gi);
+  if (!all) return '';
+  var id = all[all.length - 1].toLowerCase();
+  return id.slice(0, 8) + '-' + id.slice(8, 12) + '-' + id.slice(12, 16) + '-' + id.slice(16, 20) + '-' + id.slice(20);
+}
+function notionBareId(id) { return String(id || '').replace(/-/g, ''); }
+function notionCreatePage(parentId, title, emoji) {
+  var body = { parent: { type: 'page_id', page_id: parentId }, properties: { title: { title: richText(title) } } };
+  if (emoji) body.icon = { type: 'emoji', emoji: emoji };
+  return notionFetch('post', 'pages', body).id;
+}
+// 在頁面最下面加區塊，回傳新區塊的 ID
+function notionAppendBlocks(parentId, children) {
+  var res = notionFetch('patch', 'blocks/' + parentId + '/children', { children: children });
+  return (res.results || []).map(function(b) { return b.id; });
+}
+// 在頁面最上面加一個區塊；Notion 不接受時改加在最下面
+function notionInsertTop(parentId, block) {
+  try {
+    var res = notionFetch('patch', 'blocks/' + parentId + '/children', { children: [block], position: { type: 'start' } });
+    return ((res.results || [])[0] || {}).id;
+  } catch (e) {
+    if (e.status !== 400) throw e;
+    return notionAppendBlocks(parentId, [block])[0];
+  }
+}
+function notionBlockGone(blockId) {
+  try {
+    var b = notionFetch('get', 'blocks/' + blockId);
+    return !!(b.in_trash || b.archived);
+  } catch (e) {
+    if (e.status === 404) return true;
+    throw e;
+  }
+}
+function notionPageGone(pageId) {
+  try {
+    var pg = notionFetch('get', 'pages/' + pageId);
+    return !!(pg.in_trash || pg.archived);
+  } catch (e) {
+    if (e.status === 404) return true;
+    throw e;
+  }
+}
+// 頁面裡的區塊：[{ id, type, title（子頁面、表格的名稱）, text（摘要框的文字）}]
+function notionChildren(pageId) {
+  var out = [], cursor = null;
+  do {
+    var res = notionFetch('get', 'blocks/' + pageId + '/children?page_size=100' + (cursor ? '&start_cursor=' + encodeURIComponent(cursor) : ''));
+    (res.results || []).forEach(function(b) {
+      if (b.in_trash || b.archived) return;
+      out.push({ id: b.id, type: b.type,
+        title: (b.child_page && b.child_page.title) || (b.child_database && b.child_database.title) || '',
+        text: b.callout ? readText({ rich_text: b.callout.rich_text }) : '' });
+    });
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor);
+  return out;
+}
+function findChild(kids, type, title) {
+  return kids.filter(function(k) { return k.type === type && (title === undefined || k.title === title); })[0] || null;
+}
+// 某個頁面裡的子頁面：{ 頁面ID（去掉 -）: 標題 }
+function notionChildPages(pageId) {
+  var out = {};
+  notionChildren(pageId).forEach(function(k) { if (k.type === 'child_page') out[notionBareId(k.id)] = k.title; });
+  return out;
+}
+// 表格的資料來源
+function notionDataSource(dbId) {
+  var db = notionFetch('get', 'databases/' + dbId);
+  return db.data_sources && db.data_sources[0] && db.data_sources[0].id;
+}
+// 沿用頁面裡已經有的表格：{ db, ds }；沒有就回傳 null
+function notionFindTable(kids, title) {
+  var hit = findChild(kids, 'child_database', title);
+  if (!hit) return null;
+  var ds = notionDataSource(hit.id);
+  return ds ? { db: hit.id, ds: ds } : null;
+}
+// parts：[文字, 粗體, 連結網址]
+function notionRich(parts) {
+  return parts.filter(function(p) { return p[0]; }).map(function(p) {
+    var t = { type: 'text', text: { content: String(p[0]).slice(0, 1900) } };
+    if (p[2]) t.text.link = { url: p[2] };
+    if (p[1]) t.annotations = { bold: true };
+    return t;
+  });
+}
+function notionCallout(parts, emoji) {
+  return { object: 'block', type: 'callout', callout: { rich_text: notionRich(parts), icon: { type: 'emoji', emoji: emoji }, color: 'gray_background' } };
+}
+function notionHash(s) {
+  var h = 0;
+  for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+// 摘要框：有變才更新；在 Notion 刪掉了就不再加回來（holder[key] 變成 false）
+function notionUpdateCallout(holder, key, block) {
+  var id = holder[key], hash = notionHash(JSON.stringify(block.callout));
+  if (!id || holder[key + 'Hash'] === hash) return;
+  try {
+    notionFetch('patch', 'blocks/' + id, { callout: block.callout });
+    holder[key + 'Hash'] = hash;
+  } catch (e) {
+    if ((e.status !== 404 && e.status !== 400) || !notionBlockGone(id)) throw e;
+    holder[key] = false;
+  }
+}
+// 在某個頁面裡建一個表格（內嵌），回傳 { db, ds, formulaOk }
+function notionCreateTable(parentPageId, title, schema, withFormula) {
+  var db = notionFetch('post', 'databases', {
+    parent: { type: 'page_id', page_id: parentPageId },
+    title: [{ type: 'text', text: { content: title } }],
+    is_inline: true,
+    initial_data_source: { properties: schema }
+  });
+  var dsId = db.data_sources && db.data_sources[0] && db.data_sources[0].id;
+  if (!dsId) dsId = notionDataSource(db.id);
+  if (!dsId) throw new Error('Notion 表格建立了，但找不到它的資料來源');
+  var formulaOk = true;
+  if (withFormula) {
+    try {
+      notionFetch('patch', 'data_sources/' + dsId, { properties: { '金額相符': { formula: { expression: NOTION_MATCH_FORMULA } } } });
+    } catch (e) {
+      formulaOk = false; // 公式欄可以之後在 Notion 自己加，不影響同步
+    }
+  }
+  return { db: db.id, ds: dsId, formulaOk: formulaOk };
+}
+// 排好某個資料來源的分頁與欄位順序。只影響外觀：失敗時回傳 false，資料照樣同步
+function notionArrangeViews(dbId, dsId, views, primary) {
+  try {
+    var src = notionFetch('get', 'data_sources/' + dsId);
+    var ids = {};
+    Object.keys(src.properties || {}).forEach(function(name) { ids[name] = src.properties[name].id; });
+    var list = notionFetch('get', 'views?database_id=' + encodeURIComponent(dbId));
+    var mine = [];
+    (list.results || []).forEach(function(ref) {
+      var v = notionFetch('get', 'views/' + ref.id);
+      var vds = v.data_source_id ? notionBareId(v.data_source_id) : '';
+      if (vds ? vds === notionBareId(dsId) : primary) mine.push(ref.id);
+    });
+    views.forEach(function(v, i) {
+      var shown = v.columns.filter(function(n) { return ids[n]; });
+      var props = shown.map(function(n) {
+        var c = { property_id: ids[n], visible: true };
+        if (NOTION_WRAP_COLUMNS.indexOf(n) >= 0) c.wrap = true;
+        return c;
+      }).concat(Object.keys(ids).filter(function(n) { return shown.indexOf(n) < 0; }).map(function(n) {
+        return { property_id: ids[n], visible: false };
+      }));
+      var group = v.groupBy && ids[v.groupBy] ? { type: 'select', property_id: ids[v.groupBy], sort: { type: 'manual' }, hide_empty_groups: true } : null;
+      notionSaveView(mine[i] || null, dbId, dsId, v, props, group);
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+// 先用完整設定；Notion 不接受時改用另一種寫法，或拿掉分組／篩選再試
+function notionSaveView(viewId, dbId, dsId, v, props, group) {
+  var tries = [];
+  [true, false].forEach(function(extras) {
+    [{ type: 'table', properties: props }, { table: { properties: props } }].forEach(function(cfg) {
+      if (!extras && !group && !v.filter && tries.length) return;
+      var c = JSON.parse(JSON.stringify(cfg));
+      if (extras && group) (c.table || c).group_by = group;
+      var body = { configuration: c };
+      if (v.name) body.name = v.name;
+      if (extras && v.filter) body.filter = v.filter;
+      tries.push(body);
+    });
+  });
+  var lastErr;
+  for (var i = 0; i < tries.length; i++) {
+    var body = tries[i];
+    try {
+      if (viewId) return notionFetch('patch', 'views/' + viewId, body);
+      body.data_source_id = dsId; body.database_id = dbId; body.type = 'table'; body.position = { type: 'end' };
+      return notionFetch('post', 'views', body);
+    } catch (e) {
+      if (e.status !== 400) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+// 讀出一個表格的所有列：{ key: { id, values, edited（Notion 最後編輯時間）} }
+function notionQueryAll(dsId, fields, keyFn) {
+  var out = {}, cursor = null;
+  do {
+    var body = { page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+    var res = notionFetch('post', 'data_sources/' + dsId + '/query', body);
+    (res.results || []).forEach(function(pg) {
+      if (pg.object !== 'page' || pg.in_trash || pg.archived) return;
+      var v = notionRead(fields, pg), key = keyFn(pg, v);
+      if (key && !out[key]) out[key] = { id: pg.id, values: v, edited: pg.last_edited_time || '' };
+    });
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor);
+  return out;
+}
+function notionKeyOf(keyField) { return function(pg, v) { return v[keyField]; }; }
+// 大一點的紀錄分段存在 Script Properties（每段 8000 字）
+function loadChunked(prefix) {
+  var props = PropertiesService.getScriptProperties();
+  var n = Number(props.getProperty(prefix + 'N__') || 0), text = '';
+  for (var i = 0; i < n; i++) text += props.getProperty(prefix + i) || '';
+  try { return text ? JSON.parse(text) : {}; } catch (e) { return {}; }
+}
+function saveChunked(prefix, obj) {
+  var props = PropertiesService.getScriptProperties();
+  var text = JSON.stringify(obj), chunks = [];
+  for (var i = 0; i < text.length; i += 8000) chunks.push(text.slice(i, i + 8000));
+  var old = Number(props.getProperty(prefix + 'N__') || 0);
+  var put = {};
+  chunks.forEach(function(c, i) { put[prefix + i] = c; });
+  put[prefix + 'N__'] = String(chunks.length);
+  props.setProperties(put);
+  for (var j = chunks.length; j < old; j++) props.deleteProperty(prefix + j);
+}
+function loadJson(key) {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty(key) || 'null'); } catch (e) { return null; }
+}
+function saveJson(key, obj) { PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(obj)); }
+function fmtMoney(n) { return '$' + String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+
+// ── TWT 代購自己的資料 ──
+// 團務資料裡有 Google Sheet 的團（含已結束的團）
+function twtCampaigns() {
+  var allProps = PropertiesService.getScriptProperties().getProperties(), camps = [], seen = {};
+  readStoredTours(getMainSpreadsheetOrThrow()).tours.forEach(function(t) {
+    var name = getCatalogTourName(t), ssId = allProps[propKeyCampaign(name)];
+    if (!ssId || seen[ssId]) return;
+    seen[ssId] = true;
+    camps.push({ ssId: ssId, name: name, status: String(t.status || 'open').toLowerCase(), group: t.group || '', progress: tourProgressLabel(t),
+      sellLink: String(t.sellLink || '').trim() });
+  });
+  return camps;
+}
+function oneKey(k) { var o = {}; o[k] = true; return o; }
+// 一個團的訂單（含二補）；沒有訂單編號的舊訂單先補上
+function loadCampaignOrders(ssId) {
+  var orders = getAllOrders({ onlyIds: oneKey(ssId) });
+  if (orders.some(function(o) { return !o.orderId; })) withShortLock(function() { fillMissingOrderIds(orders); });
+  return orders;
+}
+// 寫入 Google Sheet 時才短暫排隊，不會擋住買家下單
+function withShortLock(fn) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) throw new Error('系統忙碌中，請稍後再同步一次');
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+function notionPagesInfo() { return loadJson(NOTION_PAGES_KEY); }
+// 寫回 Google Sheet：用訂單編號找到那一列；舊的二補列沒有訂單編號時用手機號碼找
+function writeOrderCell(ssId, sheetName, orderId, column, value, phone) {
+  var sheet = SpreadsheetApp.openById(ssId).getSheetByName(sheetName);
+  if (!sheet || sheet.getLastRow() < 2) return false;
+  var rows = sheet.getDataRange().getValues();
+  var h = getHeaderMap(rows[0]);
+  var idCol = h['訂單編號'], phoneCol = h['手機號碼'];
+  if (h[column] === undefined) return false;
+  var digits = String(phone || '').replace(/\D/g, '');
+  var target = -1, i;
+  if (idCol !== undefined && orderId) {
+    for (i = 1; i < rows.length; i++) if (String(rows[i][idCol]) === String(orderId)) { target = i; break; }
+  }
+  if (target < 0 && digits && phoneCol !== undefined) {
+    for (i = 1; i < rows.length; i++) {
+      var noId = idCol === undefined || !String(rows[i][idCol] || '');
+      if (noId && String(rows[i][phoneCol]).replace(/\D/g, '') === digits) { target = i; break; }
+    }
+  }
+  if (target < 0) return false;
+  sheet.getRange(target + 1, h[column] + 1).setValue(value);
+  return true;
+}
+
+function notionOrderSpec() {
+  return {
+    title: NOTION_TABLE_TITLE, keyField: 'orderId',
+    fields: [
+      ['title', '社群帳號', 'title'],
+      ['pay', '付款狀態', 'select', NOTION_PAY_OPTIONS],
+      ['bank5', '匯款後五碼', 'text'],
+      ['remit', '匯款金額', 'number'],
+      ['total', '系統總計', 'number'],
+      ['secondTotal', '二補金額', 'number'],
+      ['time', '下單時間', 'date'],
+      ['details', '明細', 'text'],
+      ['weight', '訂單重量(kg)', 'number', 'number'],
+      ['intl', '國際運費', 'number'],
+      ['pack', '包材費', 'number'],
+      ['second', '二補收款狀態', 'select', NOTION_SECOND_OPTIONS],
+      ['orderId', '訂單編號', 'text']
+    ],
+    views: [
+      { name: '訂單', groupBy: '付款狀態',
+        columns: ['社群帳號', '付款狀態', '匯款後五碼', '匯款金額', '系統總計', '金額相符', '二補金額', '下單時間', '明細'] },
+      { name: '二補', groupBy: '二補收款狀態',
+        columns: ['社群帳號', '明細', '訂單重量(kg)', '國際運費', '包材費', '二補金額', '二補收款狀態'],
+        filter: { or: [{ property: '二補金額', number: { is_not_empty: true } }, { property: '訂單重量(kg)', number: { is_not_empty: true } }] } }
+    ]
+  };
+}
+function payValueForSheet(label) {
+  if (label === '已付款') return 'paid';
+  if (label === '未付款') return 'pending';
+  return label;
+}
+// 兩邊不一樣時，看上次同步的值判斷是哪一邊改的；兩邊都改時以 Notion 為準
+// 沒有同步紀錄（第一次接手之前建立的表格）時以 Google Sheet 為準：後台改過的付款狀態不會被 Notion 上舊的值蓋掉
+function resolveTwoWay(sheetVal, notionVal, baseVal) {
+  if (sheetVal === notionVal) return sheetVal;
+  if (baseVal === undefined) return sheetVal;
+  if (notionVal !== baseVal && sheetVal === baseVal) return notionVal;
+  if (sheetVal !== baseVal && notionVal === baseVal) return sheetVal;
+  return notionVal;
+}
+function notionOrderWanted(o) {
+  return {
+    title: notionText(o.socialName || '（未填）', 200),
+    pay: payLabel(o.payStatus),
+    bank5: notionText(o.bank5, 20),
+    remit: numOrNull(o.remitAmount),
+    total: numOrNull(o.totalAmount),
+    secondTotal: numOrNull(o.secondPayment),
+    time: o.timestamp || '',
+    details: notionText(o.orderDetails),
+    weight: numOrNull(o.weight),
+    intl: numOrNull(o.intlShipping),
+    pack: numOrNull(o.packagingFee),
+    second: normalizeSecondStatus(o.secondPayStatus),
+    orderId: o.orderId
+  };
+}
+// 團務頁最上面的摘要
+function notionSummaryBlock(c, s) {
+  var second = (s.second || s.secondPaid) ? '待收 ' + s.second + ' 筆・已收 ' + s.secondPaid + ' 筆' : '還沒有（在後台算好二補後會自動出現在「二補」分頁）';
+  return notionCallout([
+    ['團體　', true], [c.group || '—'], ['　｜　狀態　', true], [STATUS_LABELS[c.status] || c.status], ['　｜　團務進度　', true], [c.progress || '—'],
+    ['\n訂單　', true], [s.count + ' 筆・總額 ' + fmtMoney(s.total)],
+    ['\n付款　', true], ['已付款 ' + s.paid + '・未付款 ' + s.unpaid + '・金額不符 ' + s.mismatch + (s.refund ? '・退款 ' + s.refund : '')],
+    ['\n二補　', true], [second],
+    ['\n賣貨便　', true], c.sellLink ? [c.sellLink, false, isWebLink(c.sellLink) ? c.sellLink : null] : ['—']
+  ], '📊');
+}
+// 團務頁裡的「訂單與二補」表格：讀出所有訂單；還沒建或在 Notion 被刪掉時（重新）建立
+function notionLoadOrders(entry, orders, state, report) {
+  var spec = notionOrderSpec();
+  if (entry.orders) {
+    try { return notionQueryAll(entry.orders.ds, spec.fields, notionKeyOf(spec.keyField)); }
+    catch (e) { if (e.status !== 404) throw e; }
+    orders.forEach(function(o) { delete state[o.orderId]; }); // 表格被刪掉 → 重建，訂單全部重新放進去
+  }
+  var t = notionCreateTable(entry.page, spec.title, notionSchema(spec.fields), true);
+  entry.orders = { db: t.db, ds: t.ds };
+  if (!notionArrangeViews(t.db, t.ds, spec.views, true)) report.viewsFailed = true;
+  return {};
+}
+// 同步「訂單與二補」裡的訂單（付款狀態、二補收款狀態雙向）；時間用完時回傳 false
+function syncOrderRows(rows, ds, fields, orders, state, report, started) {
+  for (var i = 0; i < orders.length; i++) {
+    var o = orders[i];
+    if (!o.orderId) continue;
+    if (Date.now() - started > NOTION_TIME_BUDGET_MS) return false;
+    var st = state[o.orderId] || {};
+    var want = notionOrderWanted(o);
+    var page = rows[o.orderId];
+    try {
+      if (!page) {
+        if (st.p !== undefined) continue; // 同步過、但在 Notion 被刪掉 → 尊重刪除，不再建立
+        notionFetch('post', 'pages', { parent: { type: 'data_source_id', data_source_id: ds }, properties: notionProps(fields, want) });
+        report.created++;
+        state[o.orderId] = { p: want.pay, s: want.second };
+        Utilities.sleep(340);
+        continue;
+      }
+      var pay = resolveTwoWay(want.pay, page.values.pay, st.p);
+      var second = resolveTwoWay(want.second, page.values.second, st.s);
+      // 寫回失敗時會丟出錯誤：這筆不更新 Notion、不更新同步紀錄，下次同步重試（不會把 Notion 的修改蓋掉）
+      if (pay !== want.pay || second !== want.second) {
+        withShortLock(function() {
+          if (pay !== want.pay && !writeOrderCell(o.spreadsheetId, ORDER_SHEET, o.orderId, '付款狀態', payValueForSheet(pay))) throw new Error('找不到訂單列');
+          if (second !== want.second && !writeOrderCell(o.spreadsheetId, SECOND_SHEET, o.orderId, '二補收款狀態', second, o.phone)) throw new Error('找不到二補列');
+        });
+      }
+      if (pay !== want.pay || second !== want.second) {
+        report.pulled += (pay !== want.pay ? 1 : 0) + (second !== want.second ? 1 : 0);
+        o.payStatus = payValueForSheet(pay);
+        o.secondPayStatus = second;
+        want.pay = pay; want.second = second;
+      }
+      var patch = notionChanged(fields, want, page.values);
+      if (patch) {
+        notionFetch('patch', 'pages/' + page.id, { properties: patch });
+        report.updated++;
+        Utilities.sleep(340);
+      }
+      state[o.orderId] = { p: pay, s: second };
+    } catch (e) {
+      report.errors.push((o.socialName || o.orderId) + '：' + e.message);
+      if (e.status === 401) throw e; // 權杖有問題，後面的也不會成功
+    }
+  }
+  return true;
+}
+// 同步一個團的頁面；時間用完時回傳 false
+function notionSyncCampaign(c, entry, orders, state, report, started) {
+  if (entry.sum === undefined) entry.sum = notionInsertTop(entry.page, notionCallout([['同步中…']], '📊'));
+  var rows = notionLoadOrders(entry, orders, state, report);
+  if (!syncOrderRows(rows, entry.orders.ds, notionOrderSpec().fields, orders, state, report, started)) return false;
+  notionUpdateCallout(entry, 'sum', notionSummaryBlock(c, campaignStats(orders)));
+  return true;
+}
+// 之前（TWT 代購管理表的程式）建立的團務頁：沿用裡面的摘要和表格
+function adoptCampaignPage(entry) {
+  var kids = notionChildren(entry.page);
+  var sum = kids.filter(function(k) { return k.type === 'callout' && /團體/.test(k.text); })[0];
+  if (sum) entry.sum = sum.id;
+  var table = notionFindTable(kids, NOTION_TABLE_TITLE);
+  if (table) entry.orders = table;
+}
+// 團務頁的標題與圖示（圖示顏色代表狀態）
+function notionUpdateCampaignPage(c, entry) {
+  var icon = NOTION_STATUS_ICONS[c.status] || '📄';
+  if (entry.title === c.name && entry.icon === icon) return;
+  notionFetch('patch', 'pages/' + entry.page, { properties: { title: { title: richText(c.name) } }, icon: { type: 'emoji', emoji: icon } });
+  entry.title = c.name; entry.icon = icon;
+}
+function twtLine(s) {
+  return '進行中 ' + s.camps.length + ' 團・訂單 ' + s.count + ' 筆・總額 ' + fmtMoney(s.total) +
+    '・已付款 ' + s.paid + '・未付款 ' + s.unpaid + (s.mismatch ? '・金額不符 ' + s.mismatch : '') + (s.second ? '・二補待收 ' + s.second : '');
+}
+function twtSummaryBlock(s) {
+  var parts = [['進行中的團　', true], [s.camps.length ? twtLine(s) : '目前沒有']];
+  s.camps.slice(0, 40).forEach(function(c) {
+    parts.push(['\n' + c.name + '　', true]);
+    parts.push(['訂單 ' + c.count + ' 筆・總額 ' + fmtMoney(c.total) + '・未付款 ' + c.unpaid + (c.mismatch ? '・金額不符 ' + c.mismatch : '') + (c.second ? '・二補待收 ' + c.second : '')]);
+  });
+  if (s.camps.length > 40) parts.push(['\n…還有 ' + (s.camps.length - 40) + ' 個團']);
+  return notionCallout(parts, '🛍️');
+}
+// 已經有的頁面照名稱沿用，沒有的才建立
+function ensureLayout() {
+  var pages = notionPagesInfo() || {};
+  var root = pages.root;
+  var kids;
+  try { kids = notionChildren(root); }
+  catch (e) { if (e.status === 404) e.message = '找不到你指定的 Notion 頁面，請再按一次「TWT 代購 → 設定 Notion（選用）」'; throw e; }
+  if (!pages.twt || notionPageGone(pages.twt)) {
+    var t = findChild(kids, 'child_page', TWT_TITLE);
+    pages.twt = t ? t.id : notionCreatePage(root, TWT_TITLE, '🛍️');
+    pages.twtSum = undefined;
+    saveJson(NOTION_PAGES_KEY, pages);
+  }
+  var twtKids = notionChildren(pages.twt);
+  if (pages.twtSum === undefined) {
+    var sum = twtKids.filter(function(k) { return k.type === 'callout' && /進行中/.test(k.text); })[0];
+    pages.twtSum = sum ? sum.id : notionInsertTop(pages.twt, notionCallout([['同步中…']], '🛍️'));
+  }
+  [['active', NOTION_ACTIVE_TITLE, '📋'], ['ended', NOTION_ENDED_TITLE, '📦']].forEach(function(x) {
+    if (pages[x[0]]) {
+      // 記著的頁面還在：不在「TWT 代購」裡（之前直接放在你的頁面裡）就搬進去
+      var pg = null;
+      try { pg = notionFetch('get', 'pages/' + pages[x[0]]); } catch (e) { if (e.status !== 404) throw e; }
+      if (pg && !pg.in_trash && !pg.archived) {
+        if (!pg.parent || notionBareId(pg.parent.page_id) !== notionBareId(pages.twt)) {
+          notionFetch('post', 'pages/' + pages[x[0]] + '/move', { parent: { type: 'page_id', page_id: pages.twt } });
+        }
+        return;
+      }
+    }
+    var inTwt = findChild(twtKids, 'child_page', x[1]), inRoot = findChild(kids, 'child_page', x[1]);
+    if (inTwt) pages[x[0]] = inTwt.id;
+    else if (inRoot) {
+      // 之前直接放在你的頁面裡：搬進「TWT 代購」
+      notionFetch('post', 'pages/' + inRoot.id + '/move', { parent: { type: 'page_id', page_id: pages.twt } });
+      pages[x[0]] = inRoot.id;
+    } else pages[x[0]] = notionCreatePage(pages.twt, x[1], x[2]);
+  });
+  saveJson(NOTION_PAGES_KEY, pages);
+  return pages;
+}
+// TWT 代購的各團同步到 Notion；回傳要給你看的文字
+function syncTwt(pages, report, started) {
+  _catalogMemo = null;
+  var camps = twtCampaigns(), live = [], liveIds = [], liveOrders = [];
+  var map = loadChunked(NOTION_CAMPS_KEY), state = loadChunked(NOTION_STATE_KEY);
+  var n = { campaigns: 0, orders: 0, ended: 0 };
+  try {
+    var activeKids = notionChildPages(pages.active), endedKids = notionChildPages(pages.ended);
+    var used = {};
+    Object.keys(map).forEach(function(k) { if (map[k] && map[k].page) used[notionBareId(map[k].page)] = true; });
+    for (var i = 0; i < camps.length; i++) {
+      if (Date.now() - started > NOTION_TIME_BUDGET_MS) { report.pending = true; break; }
+      var c = camps[i], active = c.status !== 'deleted';
+      var entry = map[c.ssId], campOrders = [];
+      try {
+        if (!entry || !entry.page) {
+          // 之前建立的同名頁面就沿用，沒有才建立
+          var hit = null;
+          [activeKids, endedKids].forEach(function(kids) {
+            Object.keys(kids).forEach(function(k) { if (!hit && !used[k] && kids[k] === c.name) hit = k; });
+          });
+          if (hit) {
+            entry = map[c.ssId] = { page: hit, title: c.name };
+            adoptCampaignPage(entry);
+          } else {
+            var icon = NOTION_STATUS_ICONS[c.status] || '📄';
+            var pageId = notionCreatePage(active ? pages.active : pages.ended, c.name, icon);
+            entry = map[c.ssId] = { page: pageId, title: c.name, icon: icon };
+            (active ? activeKids : endedKids)[notionBareId(pageId)] = c.name;
+          }
+          used[notionBareId(entry.page)] = true;
+          saveChunked(NOTION_CAMPS_KEY, map); // 馬上記住，避免中途出錯時重複建立
+        }
+        var key = notionBareId(entry.page);
+        if (!(key in activeKids) && !(key in endedKids)) continue; // 這個團的頁面在 Notion 被刪掉或移走了 → 不再同步
+        entry.ended = key in endedKids;
+
+        if (!(!active && entry.frozen)) {
+          // 進行中的團每次同步；剛結束的團最後再同步一次，之後就不動了
+          campOrders = loadCampaignOrders(c.ssId);
+          var done = notionSyncCampaign(c, entry, campOrders, state, report, started);
+          saveChunked(NOTION_CAMPS_KEY, map);
+          if (!done) { report.pending = true; break; }
+          if (active) {
+            n.campaigns++; n.orders += campOrders.length;
+            var s = campaignStats(campOrders);
+            s.name = c.name;
+            live.push(s);
+            liveIds.push(c.ssId);
+            liveOrders = liveOrders.concat(campOrders);
+          }
+        }
+        notionUpdateCampaignPage(c, entry);
+        if (entry.ended === active) {
+          // 放到對的地方：進行中 →「進行中團務」；已結束 →「已結束團務」（整個頁面連同訂單一起搬）
+          notionFetch('post', 'pages/' + entry.page + '/move', { parent: { type: 'page_id', page_id: active ? pages.active : pages.ended } });
+          entry.ended = !active;
+          if (!active && !entry.frozen) n.ended++;
+        } else if (!active && !entry.frozen) {
+          n.ended++;
+        }
+        if (active) delete entry.frozen;
+        else if (!entry.frozen) {
+          entry.frozen = true;
+          // 之後不再同步：清掉這個團的同步紀錄（Script Properties 有容量上限）
+          delete entry.sumHash;
+          campOrders.forEach(function(o) { delete state[o.orderId]; });
+        }
+        saveChunked(NOTION_CAMPS_KEY, map);
+      } catch (e) {
+        report.errors.push(c.name + '：' + e.message);
+        if (e.status === 401) throw e;
+      }
+    }
+  } finally {
+    saveChunked(NOTION_CAMPS_KEY, map);
+    saveChunked(NOTION_STATE_KEY, state);
+  }
+  if (!report.pending) {
+    // 「TWT 代購」頁面最上面的摘要
+    var total = { camps: live, count: 0, total: 0, paid: 0, unpaid: 0, mismatch: 0, second: 0 };
+    live.forEach(function(s) { ['count', 'total', 'paid', 'unpaid', 'mismatch', 'second'].forEach(function(k) { total[k] += s[k]; }); });
+    try { notionUpdateCallout(pages, 'twtSum', twtSummaryBlock(total)); saveJson(NOTION_PAGES_KEY, pages); }
+    catch (e) { report.errors.push('「' + TWT_TITLE + '」頁面的摘要：' + e.message); }
+  }
+  // 順便更新團務索引表單的數字（包含在 Notion 改的付款狀態、自動算好的二補）
+  try { withShortLock(function() { updateCampaignIndexRows(liveIds, liveOrders); }); } catch (ignore) {}
+  return '同步 ' + n.campaigns + ' 個團、' + n.orders + ' 筆訂單（新增 ' + report.created + '、更新 ' + report.updated + ' 筆' +
+    (report.pulled ? '；把 Notion 改的 ' + report.pulled + ' 筆付款／二補狀態寫回 Google Sheet' : '') + '）' +
+    (n.ended ? '；' + n.ended + ' 個團移到「' + NOTION_ENDED_TITLE + '」' : '');
+}
+
+// 設定 Notion，設定好就同步一次
+function notionSetup() {
+  var ui = SpreadsheetApp.getUi();
+  var props = PropertiesService.getScriptProperties();
+  var oldToken = props.getProperty(NOTION_TOKEN_KEY), oldPages = notionPagesInfo();
+  var r1 = ui.prompt('TWT 代購：設定 Notion（1/2）', '貼上 Notion 連接的存取權杖（開發人員工具 → 連接 → 你建立的連接 → 設定／Configuration）' +
+    (oldToken ? '\n已經設定過的話可以留空，沿用之前的權杖。' : ''), ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  var token = String(r1.getResponseText() || '').trim() || oldToken;
+  if (!token) return ui.alert('沒有輸入存取權杖');
+  var r2 = ui.prompt('TWT 代購：設定 Notion（2/2）', '貼上要放「' + TWT_TITLE + '」的 Notion 頁面連結（這個頁面要先在右上角「⋯ → 連接」加入你建立的連接；賣貨便、KOCA 也放在同一個頁面）。' +
+    '\n之前已經在這個頁面建立的「' + NOTION_ACTIVE_TITLE + '」「' + NOTION_ENDED_TITLE + '」和各團的頁面會直接沿用。' + (oldPages && oldPages.root ? '\n留空就用之前的頁面。' : ''), ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK) return;
+  var linkText = String(r2.getResponseText() || '').trim();
+  var rootId = linkText ? extractNotionId(linkText) : (oldPages && oldPages.root) || '';
+  if (!rootId) return ui.alert('看不出這是 Notion 頁面連結，請在 Notion 頁面按「分享 → 複製連結」再貼上');
+  props.setProperty(NOTION_TOKEN_KEY, token);
+  try {
+    notionFetch('get', 'pages/' + rootId); // 先確認頁面已經加入連接
+  } catch (e) {
+    if (oldToken) props.setProperty(NOTION_TOKEN_KEY, oldToken); else props.deleteProperty(NOTION_TOKEN_KEY);
+    return ui.alert('設定失敗：' + e.message);
+  }
+  if (!oldPages || oldPages.root !== rootId) {
+    // 換了頁面：在新的頁面裡重新建（舊頁面裡的東西不動）
+    saveJson(NOTION_PAGES_KEY, { root: rootId });
+    saveChunked(NOTION_CAMPS_KEY, {});
+    saveChunked(NOTION_STATE_KEY, {});
+  }
+  ui.alert('TWT 代購：Notion 設定完成', notionSyncOnce(), ui.ButtonSet.OK);
+}
+function notionSyncNow() {
+  var msg = notionSyncOnce();
+  try { SpreadsheetApp.getUi().alert('TWT 代購：同步到 Notion', msg, SpreadsheetApp.getUi().ButtonSet.OK); return msg; } catch (ignore) {}
+  try { getMainSpreadsheetOrThrow().toast(msg, 'TWT 代購', 10); } catch (ignore) {}
+  return msg;
+}
+
+// 同步一次；回傳要給你看的文字。同一時間只跑一個（連按兩次時），不佔用下單用的鎖
+function notionSyncOnce() {
+  var sp = PropertiesService.getScriptProperties(), pages0 = notionPagesInfo();
+  if (!sp.getProperty(NOTION_TOKEN_KEY) || !pages0 || !pages0.root) return '還沒設定 Notion：請先按「TWT 代購 → 設定 Notion（選用）」。';
+  var cache = CacheService.getScriptCache();
+  if (cache.get('notion_sync_running')) return '同步正在進行中，請過 1～2 分鐘再按一次。';
+  cache.put('notion_sync_running', '1', 330);
+  var report = { created: 0, updated: 0, pulled: 0, errors: [], pending: false };
+  try {
+    var pages = ensureLayout();
+    var text = syncTwt(pages, report, Date.now());
+    return 'Notion「🛍️ ' + TWT_TITLE + '」：' + text + '。' +
+      (report.viewsFailed ? '\n（有些表格的欄位順序沒有設定成功，可以在 Notion 自己拖曳調整；資料同步不受影響）' : '') +
+      (report.formulaFailed ? '\n（「金額相符」公式欄沒有建立成功，可以之後在 Notion 自己新增）' : '') +
+      (report.errors.length ? '\n\n有 ' + report.errors.length + ' 筆沒同步成功：' + report.errors[0] : '') +
+      (report.pending ? '\n\n資料比較多，還沒同步完：再按一次會接著做。' : '') +
+      '\n\n要更新「訂單總覽」：到 Google Sheet「訂單總覽」按「訂單總覽 → 更新全部」。';
+  } catch (e) {
+    return 'Notion 同步失敗：' + e.message;
+  } finally {
+    cache.remove('notion_sync_running');
+  }
+}
+
