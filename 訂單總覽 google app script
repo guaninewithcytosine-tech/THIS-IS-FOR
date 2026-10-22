@@ -564,7 +564,7 @@ function overviewBlock(stats) {
   var at = function(s) { return s ? '（' + s.at.slice(5) + ' 同步）' : ''; };
   return notionCallout([
     ['TWT 代購　', true], [t ? twtLine(t) + at(t) : '還沒同步'],
-    ['\n賣貨便　', true], [m ? (m.count ? m.count + ' 筆：' + statusLine(m.status, MYSHIP_STATUS_OPTIONS) + '・訂單總額 ' + fmtMoney(m.total) + '（不含取消、退貨）' : '還沒有訂單') + at(m) : '還沒同步'],
+    ['\n賣貨便　', true], [m ? (m.count ? m.count + ' 筆：' + statusLine(m.status, MYSHIP_STATUS_OPTIONS) + '・商品金額 ' + fmtMoney(m.total) + '（不含運費、取消、退貨）' : '還沒有訂單') + at(m) : '還沒同步'],
     ['\nKOCA　', true], [k ? (k.count ? k.count + ' 筆：' + statusLine(k.status, KOCA_STATUS_OPTIONS) + '・已完成的進帳 ' + fmtMoney(k.income) : '還沒有訂單') +
       (k.payout ? '・已提領入帳 ' + fmtMoney(k.payout) : '') + at(k) : '還沒同步'],
     ['\n三個平台各自計算，不會混在一起；要更新時在 Google Sheet「訂單總覽」按「訂單總覽 → 更新全部」']
@@ -662,7 +662,7 @@ function mirrorTwt(src, book, report) {
 function mirrorChannel(c, src, book) {
   if (!src.getSheetByName(ORDER_TAB)) throw new Error('「' + c.file + '」裡沒有「' + ORDER_TAB + '」分頁：請先在那個檔案按「' + c.name + ' → 讀取通知信」');
   var rows = readRows(src, ORDER_TAB, c.headers), payouts = c.payouts ? readRows(src, PAYOUT_TAB, KOCA_PAYOUT_HEADERS) : [];
-  var st = channelStats(c, rows, payouts), money = c.payouts ? '總金額' : '訂單總額';
+  var st = channelStats(c, rows, payouts), money = c.payouts ? '總金額' : '商品金額';
   var statusRows = [], seen = {};
   c.options.map(function(o) { return o.name; }).concat(Object.keys(st.status)).forEach(function(name) {
     if (seen[name] || !st.status[name]) return;
@@ -671,7 +671,7 @@ function mirrorChannel(c, src, book) {
   });
   var blocks = [{ text: [c.name, '這一頁只有統計。每一筆訂單的細節在「' + c.file + '」。',
     c.payouts ? '共 ' + st.count + ' 筆・已完成的進帳 ' + fmtMoney(st.income) + '・已提領入帳 ' + fmtMoney(st.payout)
-      : '共 ' + st.count + ' 筆・訂單總額 ' + fmtMoney(st.total) + '（含運費 ' + fmtMoney(st.shipping) + '；不含已取消、退貨）'] },
+      : '共 ' + st.count + ' 筆・商品金額 ' + fmtMoney(st.total) + '（不含運費、已取消、退貨）'] },
     { headers: ['狀態', '筆數', money], rows: statusRows, numbers: ['筆數', money] }];
   if (c.payouts) {
     blocks.push({ headers: ['KOCA 費用', '筆數', '總金額', '運費', '平台服務費', '金流服務費', '其他扣款', '進帳金額'],
@@ -693,7 +693,7 @@ function summaryRows(stats) {
   return [
     ['TWT 代購', t ? t.count : '', t ? '訂單總額 ' + fmtMoney(t.total) : '', at(t),
       t ? '進行中 ' + t.campCount + ' 團・已付款 ' + t.paid + '・未付款 ' + t.unpaid + (t.mismatch ? '・金額不符 ' + t.mismatch : '') + (t.second ? '・二補待收 ' + t.second : '') : ''],
-    ['賣貨便', m ? m.count : '', m ? '訂單總額 ' + fmtMoney(m.total) : '', at(m), m ? statusLine(m.status, MYSHIP_STATUS_OPTIONS) : ''],
+    ['賣貨便', m ? m.count : '', m ? '商品金額 ' + fmtMoney(m.total) : '', at(m), m ? statusLine(m.status, MYSHIP_STATUS_OPTIONS) : ''],
     ['KOCA', k ? k.count : '', k ? '進帳 ' + fmtMoney(k.income) : '', at(k),
       k ? statusLine(k.status, KOCA_STATUS_OPTIONS) + (k.payout ? '・已提領入帳 ' + fmtMoney(k.payout) : '') : '']
   ];
@@ -816,7 +816,7 @@ function countStatus(rows) {
 function emailSum(rows, col) { return rows.reduce(function(t, r) { return t + (Number(r[col]) || 0); }, 0); }
 function channelStats(c, rows, payouts) {
   var live = rows.filter(function(r) { return !/取消|退/.test(String(r['狀態'] || '')); });
-  var s = { count: rows.length, status: countStatus(rows), total: emailSum(live, c.payouts ? '總金額' : '訂單總額'), shipping: emailSum(live, '運費'),
+  var s = { count: rows.length, status: countStatus(rows), total: emailSum(live, c.payouts ? '總金額' : '商品金額'), shipping: emailSum(live, '運費'),
     income: emailSum(rows, '進帳金額'), payout: emailSum(payouts, '入帳金額') };
   if (c.payouts) {
     var done = rows.filter(function(r) { return extNum(r['進帳金額']) != null; });

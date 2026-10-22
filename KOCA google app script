@@ -869,14 +869,17 @@ function writeCellsByKey(ss, tab, keyCol, col, values) {
   return done;
 }
 // 平台頁面裡的表格（which：orders 或 payouts）：讀出所有列；還沒建或在 Notion 被刪掉時（重新）建立
+// spec.drop：不要的欄位（之前的版本放過的）：已經建好的表格裡拿掉，只做一次
 function notionChannelTable(ext, which, spec, keyField, report) {
+  var drop = ['信件'].concat(spec.drop || []), mark = drop.join('|');
   if (ext[which]) {
     try {
       var rows = notionQueryAll(ext[which].ds, spec.fields, notionKeyOf(keyField));
-      // 之前的版本有「信件」連結欄：拿掉
-      if (!ext[which].noMail) {
-        try { notionFetch('patch', 'data_sources/' + ext[which].ds, { properties: { '信件': null } }); } catch (ignore) {}
-        ext[which].noMail = true;
+      if (ext[which].dropped !== mark) {
+        drop.forEach(function(name) {
+          try { notionFetch('patch', 'data_sources/' + ext[which].ds, { properties: oneProp(name) }); } catch (ignore) {} // 沒有這個欄位也沒關係
+        });
+        ext[which].dropped = mark;
       }
       return rows;
     }
@@ -884,10 +887,11 @@ function notionChannelTable(ext, which, spec, keyField, report) {
     ext[which === 'orders' ? 'state' : 'pstate'] = {}; // 表格被刪掉 → 重建，全部重新放進去
   }
   var t = notionCreateTable(ext.page, spec.title, notionSchema(spec.fields), false);
-  ext[which] = { db: t.db, ds: t.ds, noMail: true };
+  ext[which] = { db: t.db, ds: t.ds, dropped: mark };
   if (!notionArrangeViews(t.db, t.ds, spec.views, true)) report.viewsFailed = true;
   return {};
 }
+function oneProp(name) { var o = {}; o[name] = null; return o; }
 // Notion 那一列最後編輯的時間比這筆訂單最後一封通知信新
 function notionNewer(edited, sec) {
   var t = Date.parse(edited || '');

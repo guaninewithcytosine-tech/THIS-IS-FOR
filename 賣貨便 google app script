@@ -820,14 +820,17 @@ function writeCellsByKey(ss, tab, keyCol, col, values) {
   return done;
 }
 // 平台頁面裡的表格（which：orders 或 payouts）：讀出所有列；還沒建或在 Notion 被刪掉時（重新）建立
+// spec.drop：不要的欄位（之前的版本放過的）：已經建好的表格裡拿掉，只做一次
 function notionChannelTable(ext, which, spec, keyField, report) {
+  var drop = ['信件'].concat(spec.drop || []), mark = drop.join('|');
   if (ext[which]) {
     try {
       var rows = notionQueryAll(ext[which].ds, spec.fields, notionKeyOf(keyField));
-      // 之前的版本有「信件」連結欄：拿掉
-      if (!ext[which].noMail) {
-        try { notionFetch('patch', 'data_sources/' + ext[which].ds, { properties: { '信件': null } }); } catch (ignore) {}
-        ext[which].noMail = true;
+      if (ext[which].dropped !== mark) {
+        drop.forEach(function(name) {
+          try { notionFetch('patch', 'data_sources/' + ext[which].ds, { properties: oneProp(name) }); } catch (ignore) {} // 沒有這個欄位也沒關係
+        });
+        ext[which].dropped = mark;
       }
       return rows;
     }
@@ -835,10 +838,11 @@ function notionChannelTable(ext, which, spec, keyField, report) {
     ext[which === 'orders' ? 'state' : 'pstate'] = {}; // 表格被刪掉 → 重建，全部重新放進去
   }
   var t = notionCreateTable(ext.page, spec.title, notionSchema(spec.fields), false);
-  ext[which] = { db: t.db, ds: t.ds, noMail: true };
+  ext[which] = { db: t.db, ds: t.ds, dropped: mark };
   if (!notionArrangeViews(t.db, t.ds, spec.views, true)) report.viewsFailed = true;
   return {};
 }
+function oneProp(name) { var o = {}; o[name] = null; return o; }
 // Notion 那一列最後編輯的時間比這筆訂單最後一封通知信新
 function notionNewer(edited, sec) {
   var t = Date.parse(edited || '');
@@ -925,6 +929,8 @@ function channelPage(c, pages) {
 function notionMyshipSpec() {
   return {
     title: '訂單',
+    // 運費不是你的收入，訂單總額又含運費：不放。門市、付款方式、備註也不放
+    drop: ['運費', '訂單總額', '付款方式', '收件資訊', '備註'],
     fields: [
       ['buyer', '買家', 'title'],
       ['status', '狀態', 'select', MYSHIP_STATUS_OPTIONS],
@@ -932,15 +938,10 @@ function notionMyshipSpec() {
       ['shop', '賣場', 'text'],
       ['items', '商品', 'text'],
       ['subtotal', '商品金額', 'number'],
-      ['shipping', '運費', 'number'],
-      ['total', '訂單總額', 'number'],
-      ['pay', '付款方式', 'text'],
-      ['recipient', '收件資訊', 'text'],
-      ['note', '備註', 'text'],
       ['date', '訂單日期', 'date']
     ],
     views: [{ name: '依狀態', groupBy: '狀態',
-      columns: ['買家', '狀態', '訂單編號', '賣場', '商品', '訂單總額', '付款方式', '收件資訊', '備註', '訂單日期'] }]
+      columns: ['買家', '狀態', '訂單編號', '賣場', '商品', '商品金額', '訂單日期'] }]
   };
 }
 function notionMyshipWanted(o) {
@@ -951,11 +952,6 @@ function notionMyshipWanted(o) {
     shop: notionText(o['賣場'], 200),
     items: notionText(o['商品明細']),
     subtotal: extNum(o['商品金額']),
-    shipping: extNum(o['運費']),
-    total: extNum(o['訂單總額']),
-    pay: notionText(o['付款方式'], 100),
-    recipient: notionText(o['收件資訊'], 300),
-    note: notionText(extJoin([o['買家回饋'], o['訂單備註']], '\n')),
     date: extNotionDate(o['訂單日期'])
   };
 }
@@ -963,7 +959,7 @@ function notionMyshipSummary(c, rows, payouts, url) {
   var live = rows.filter(function(r) { return !/取消|退/.test(String(r['狀態'] || '')); });
   return notionCallout([
     ['訂單　', true], [rows.length ? rows.length + ' 筆：' + statusLine(countStatus(rows), MYSHIP_STATUS_OPTIONS) : '還沒有訂單'],
-    ['\n金額　', true], [live.length ? '訂單總額 ' + fmtMoney(emailSum(live, '訂單總額')) + '（含運費 ' + fmtMoney(emailSum(live, '運費')) + '；不含已取消、退貨）' : '—'],
+    ['\n金額　', true], [live.length ? '商品金額 ' + fmtMoney(emailSum(live, '商品金額')) + '（不含運費、已取消、退貨）' : '—'],
     ['\n通知信　', true], [mailLine(c, rows)]
   ].concat(notionSheetLine(c, url), [[STATUS_HINT]]), '🏪');
 }
