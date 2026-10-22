@@ -593,7 +593,16 @@ function notionFetch(method, path, body) {
       muteHttpExceptions: true
     };
     if (body) { options.contentType = 'application/json'; options.payload = JSON.stringify(body); }
-    var res = UrlFetchApp.fetch(NOTION_API + path, options);
+    var res;
+    try {
+      res = UrlFetchApp.fetch(NOTION_API + path, options);
+    } catch (e) {
+      // 這支程式之前授權時還沒有「連到外部服務」：要在 Apps Script 編輯器裡執行一次，重新授權
+      if (/external_request|UrlFetchApp/.test(String(e && e.message))) {
+        throw new Error('要連到 Notion，需要先授權這支程式「連到外部服務」。請打開「擴充功能 → Apps Script」，在上方的函式選單選「notionSyncNow」，按「執行」，在跳出的視窗按「檢閱權限」→ 選帳號 →「進階」→「前往…（不安全）」→「允許」，授權後再回來按一次。');
+      }
+      throw e;
+    }
     var code = res.getResponseCode();
     if (code === 429 || code >= 500) {
       var headers = res.getHeaders() || {};
