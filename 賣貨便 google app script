@@ -22,7 +22,7 @@ var HEADERS = ['訂單編號', '狀態', '訂單日期', '賣場', '買家', '�
   '付款方式', '配送方式', '買家回饋', '訂單備註', '最後通知時間', '更新時間（系統用）'];
 var NUMBER_COLS = ['商品金額', '運費', '訂單總額'];
 var WRAP_COLS = ['商品明細', '單價', '收件資訊', '買家回饋', '訂單備註'];
-var PARSER_VERSION = '8';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
+var PARSER_VERSION = '9';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
 var OVERLAP_SEC = 2 * 86400;        // 每次往前多看兩天，晚到的信也不會漏
 var BUDGET_MS = 270000;             // 一次最多讀 4.5 分鐘，剩下的再按一次接著讀
 // 每個帳號各自記（User Properties）：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本
@@ -403,8 +403,14 @@ function saveStore(store) {
   }
 }
 // 這筆訂單的狀態用這封信（比上次的信新才用）
+// 以前的讀信規則看錯的信（例如「退件到店」當成已到店、取貨提醒當成已取貨）：重讀同一封信時，用現在的讀法改過來。
+// 只改這幾種，手動改的狀態不會被蓋掉
+var MYSHIP_MISREAD = { '已到店': ['未取貨'], '已取貨': ['未取貨', '已到店'] };
 function setStatus(row, status, sec) {
-  if (!status || sec <= (Number(row['更新時間（系統用）']) || 0)) return false;
+  if (!status) return false;
+  var last = Number(row['更新時間（系統用）']) || 0;
+  var misread = sec === last && (MYSHIP_MISREAD[row['狀態']] || []).indexOf(status) >= 0;
+  if (sec <= last && !misread) return false;
   row['狀態'] = status;
   row['更新時間（系統用）'] = String(sec);
   row['最後通知時間'] = fmtTime(new Date(sec * 1000));
