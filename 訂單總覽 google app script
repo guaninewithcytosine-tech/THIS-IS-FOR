@@ -6,7 +6,7 @@
 // ・賣貨便、KOCA 讀通知信、同步 Notion → 各自的 Google Sheet 自己的程式
 // 三個來源的 Google Sheet 連結在這個檔案的「來源」分頁（自動尋找，也可以自己貼）
 // 這個檔案只放統計（從三個平台讀來，每次更新整張重寫；每一筆訂單的細節留在各平台自己的 Google Sheet）：
-// ・總覽：三個平台並排的簡單比較（訂單數、金額、狀態、最後更新）
+// ・總覽：三個平台並排的簡單比較（訂單數、入帳金額（純數字）、狀態、最後更新）
 // ・TWT 代購：各團的統計
 // ・賣貨便：各狀態的筆數和金額
 // ・KOCA：各狀態的筆數和金額、平台服務費、金流服務費、進帳、提領
@@ -633,7 +633,7 @@ function mirrorPlatform(id, src, report) {
 function mirrorTwt(src, book, report) {
   var camps = readTwtCampaigns(src);
   camps = camps.filter(isTwtActive).concat(camps.filter(function(c) { return !isTwtActive(c); }));
-  var all = [], liveCount = 0, orderCount = 0, total = { count: 0, total: 0, paid: 0, unpaid: 0, mismatch: 0, second: 0 }, shown = 0;
+  var all = [], liveCount = 0, orderCount = 0, total = { count: 0, total: 0, received: 0, paid: 0, unpaid: 0, mismatch: 0, second: 0 }, shown = 0;
   camps.forEach(function(c) {
     var orders;
     try { orders = readCampaignOrders(c.ssId); }
@@ -690,11 +690,12 @@ function mirrorChannel(c, src, book) {
 function summaryRows(stats) {
   var t = stats.twt, m = stats.myship, k = stats.koca;
   var at = function(x) { return x ? x.at.slice(5) : '還沒更新'; };
+  var money = function(n) { return n == null ? '' : n; }; // 入帳金額只放數字
   return [
-    ['TWT 代購', t ? t.count : '', t ? '訂單總額 ' + fmtMoney(t.total) : '', at(t),
+    ['TWT 代購', t ? t.count : '', t ? money(t.received) : '', at(t),
       t ? '進行中 ' + t.campCount + ' 團・已付款 ' + t.paid + '・未付款 ' + t.unpaid + (t.mismatch ? '・金額不符 ' + t.mismatch : '') + (t.second ? '・二補待收 ' + t.second : '') : ''],
-    ['賣貨便', m ? m.count : '', m ? '訂單總額 ' + fmtMoney(m.total) : '', at(m), m ? statusLine(m.status, MYSHIP_STATUS_OPTIONS) : ''],
-    ['KOCA', k ? k.count : '', k ? '進帳 ' + fmtMoney(k.income) : '', at(k),
+    ['賣貨便', m ? m.count : '', m ? money(m.total) : '', at(m), m ? statusLine(m.status, MYSHIP_STATUS_OPTIONS) : ''],
+    ['KOCA', k ? k.count : '', k ? money(k.income) : '', at(k),
       k ? statusLine(k.status, KOCA_STATUS_OPTIONS) + (k.payout ? '・已提領入帳 ' + fmtMoney(k.payout) : '') : '']
   ];
 }
@@ -702,11 +703,11 @@ function writeSummary() {
   var book = SpreadsheetApp.getActiveSpreadsheet();
   var sheet = writeBlocks(book, TAB_SUMMARY, [
     { text: ['訂單總覽', '三個平台各自計算，不會混在一起。這個檔案只放統計，各平台有自己的一頁（TWT 代購、賣貨便、KOCA）；每一筆訂單的細節留在各平台自己的 Google Sheet。每次更新整張重寫，要修改請到各平台的 Google Sheet。'] },
-    { headers: ['平台', '訂單數', '金額', '最後更新', '狀態'], rows: summaryRows(loadStats()), numbers: ['訂單數'] }
+    { headers: ['平台', '訂單數', '入帳金額', '最後更新', '狀態'], rows: summaryRows(loadStats()), numbers: ['訂單數', '入帳金額'] }
   ]);
   if (book.getSheets()[0].getName() !== TAB_SUMMARY) { try { book.setActiveSheet(sheet); book.moveActiveSheet(1); } catch (ignore) {} } // 排在最前面
   sheet.setColumnWidth(1, 160);
-  sheet.setColumnWidth(3, 170);
+  sheet.setColumnWidth(3, 120);
 }
 
 // ══════════════════════════════════════════
@@ -786,19 +787,19 @@ function readCampaignOrders(ssId) {
     };
   });
 }
-// 金額不符、退款各自分開，不算進已付款或未付款
+// 金額不符、退款各自分開，不算進已付款或未付款；received＝已付款的訂單金額＋已收款的二補（實際入帳）
 function campaignStats(orders) {
-  var s = { count: 0, total: 0, paid: 0, unpaid: 0, mismatch: 0, refund: 0, second: 0, secondPaid: 0 };
+  var s = { count: 0, total: 0, received: 0, paid: 0, unpaid: 0, mismatch: 0, refund: 0, second: 0, secondPaid: 0 };
   orders.forEach(function(o) {
     var pay = payLabel(o.payStatus);
     s.count++;
     s.total += Number(o.totalAmount) || 0;
-    if (pay === '已付款') s.paid++;
+    if (pay === '已付款') { s.paid++; s.received += Number(o.totalAmount) || 0; }
     else if (pay === '金額不符') s.mismatch++;
     else if (pay === '退款') s.refund++;
     else s.unpaid++;
     if ((Number(o.secondPayment) || 0) > 0) {
-      if (normalizeSecondStatus(o.secondPayStatus) === '已收款') s.secondPaid++; else s.second++;
+      if (normalizeSecondStatus(o.secondPayStatus) === '已收款') { s.secondPaid++; s.received += Number(o.secondPayment) || 0; } else s.second++;
     }
   });
   return s;
