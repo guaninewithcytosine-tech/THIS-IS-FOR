@@ -2,7 +2,7 @@
 // 訂單總覽 · Google Apps Script（主控）
 // 放在 Google Sheet「訂單總覽」裡（擴充功能 → Apps Script）
 // 只負責讀取、統整：讀 TWT 代購、賣貨便、KOCA 三個 Google Sheet，統整到 Notion
-// ・TWT 代購的網站、開團、下單、對帳 → TWT 代購主控表自己的程式
+// ・TWT 代購的網站、開團、下單、對帳 → TWT 代購管理表自己的程式
 // ・賣貨便、KOCA 讀通知信 → 各自的 Google Sheet 自己的程式
 // 三個來源的 Google Sheet 連結在這個檔案的「來源」分頁（第一次設定時自動尋找，也可以自己貼）
 // Notion（你指定的頁面）：
@@ -38,7 +38,7 @@ var NOTION_SECOND_OPTIONS = [{ name: '未收款', color: 'red' }, { name: '已�
 var NOTION_MATCH_FORMULA = 'if(empty(prop("匯款金額")), "", if(prop("匯款金額") == prop("系統總計"), "相符", "不符"))';
 var NOTION_WRAP_COLUMNS = ['明細', '商品', '收件資訊', '備註', '費用明細']; // 這些欄位在表格裡自動換行
 
-// TWT 代購主控表與各團 Google Sheet 的分頁、欄位（跟 TWT 代購的程式一樣）
+// TWT 代購管理表與各團 Google Sheet 的分頁、欄位（跟 TWT 代購的程式一樣）
 var TWT_TOUR_SHEET = '團務資料';
 var TWT_INDEX_SHEET = '團務索引表單';
 var TWT_INDEX_ID = '試算表ID（系統用）';
@@ -68,7 +68,7 @@ var KOCA_STATUS_OPTIONS = [
 // 三個來源：「來源」分頁的列、雲端硬碟裡的資料夾、自動尋找的方式
 function sources() {
   return [
-    { id: 'twt', name: 'TWT 代購', label: 'TWT 代購主控表', folders: ['TWT 代購', 'TWT_開團表單'] },
+    { id: 'twt', name: 'TWT 代購', label: 'TWT 代購管理表', oldLabels: ['TWT 代購主控表'], folders: ['TWT 代購', 'TWT_開團表單'] },
     { id: 'myship', name: '賣貨便', label: '賣貨便訂單', file: '賣貨便訂單', folders: ['賣貨便'] },
     { id: 'koca', name: 'KOCA', label: 'KOCA 訂單', file: 'KOCA 訂單', folders: ['KOCA'] }
   ];
@@ -137,10 +137,10 @@ function setupNow() {
     saveChunked(NOTION_STATE_KEY, {});
   }
 
-  // 找三個來源；找不到 TWT 代購主控表時請你貼連結
+  // 找三個來源；找不到 TWT 代購管理表時請你貼連結
   var ids = sourceIds(true);
   if (!ids.twt) {
-    var r3 = ui.prompt('TWT 代購主控表', '找不到 TWT 代購主控表。請貼上它的 Google Sheet 連結（不同步 TWT 代購就按取消）', ui.ButtonSet.OK_CANCEL);
+    var r3 = ui.prompt('TWT 代購管理表', '找不到 TWT 代購管理表。請貼上它的 Google Sheet 連結（不同步 TWT 代購就按取消）', ui.ButtonSet.OK_CANCEL);
     if (r3.getSelectedButton() === ui.Button.OK) {
       var id = extractSheetId(r3.getResponseText());
       var bad = id ? checkSource('twt', id) : '看不出這是 Google Sheet 連結';
@@ -222,10 +222,14 @@ function sourceSheet() {
   return sheet;
 }
 function sourceRow(sheet, id) {
-  var label = sources().filter(function(s) { return s.id === id; })[0].label;
+  var src = sources().filter(function(s) { return s.id === id; })[0], label = src.label;
   var n = Math.max(1, sheet.getLastRow());
   var col = sheet.getRange(1, 1, n, 1).getValues();
-  for (var i = 1; i < col.length; i++) if (String(col[i][0]).trim() === label) return i + 1;
+  for (var i = 1; i < col.length; i++) {
+    var text = String(col[i][0]).trim();
+    if (text === label) return i + 1;
+    if ((src.oldLabels || []).indexOf(text) >= 0) { sheet.getRange(i + 1, 1).setValue(label); return i + 1; } // 舊的名稱改成新的
+  }
   sheet.getRange(n + 1, 1).setValue(label);
   return n + 1;
 }
@@ -259,7 +263,7 @@ function sourceIds(detect) {
 function checkSource(id, ssId) {
   var ss;
   try { ss = SpreadsheetApp.openById(ssId); } catch (e) { return '打不開這個 Google Sheet'; }
-  if (id === 'twt') return ss.getSheetByName(TWT_TOUR_SHEET) ? '' : '這個 Google Sheet 裡沒有「' + TWT_TOUR_SHEET + '」分頁，不是 TWT 代購主控表';
+  if (id === 'twt') return ss.getSheetByName(TWT_TOUR_SHEET) ? '' : '這個 Google Sheet 裡沒有「' + TWT_TOUR_SHEET + '」分頁，不是 TWT 代購管理表';
   return ss.getSheetByName(ORDER_TAB) ? '' : '這個 Google Sheet 裡沒有「' + ORDER_TAB + '」分頁';
 }
 // 賣貨便、KOCA：檔名是「賣貨便訂單」「KOCA 訂單」、有「訂單」分頁的 Google Sheet（有好幾個時用最近更新的）
@@ -276,7 +280,7 @@ function detectByName(name) {
   } catch (ignore) {}
   return best ? best.getId() : '';
 }
-// TWT 代購主控表：「TWT 代購」資料夾裡有「團務資料」分頁的 Google Sheet
+// TWT 代購管理表：「TWT 代購」資料夾裡有「團務資料」分頁的 Google Sheet
 function detectTwt(s) {
   try {
     for (var i = 0; i < s.folders.length; i++) {
@@ -710,7 +714,7 @@ function notionQueryAll(dsId, fields, keyFn) {
 function notionKeyOf(keyField) { return function(pg, v) { return v[keyField]; }; }
 
 // ── Notion 版面：你的頁面 → 總覽、🛍️ TWT 代購（📋 進行中團務、📦 已結束團務）、🏪 賣貨便訂單、🛒 KOCA 訂單 ──
-// 已經有的頁面照名稱沿用（之前 TWT 代購主控表的程式建立的也一樣），沒有的才建立
+// 已經有的頁面照名稱沿用（之前 TWT 代購管理表的程式建立的也一樣），沒有的才建立
 function ensureLayout() {
   var pages = notionPagesInfo() || {};
   var root = pages.root;
@@ -791,7 +795,7 @@ function updateOverview(pages) {
 }
 
 // ══════════════════════════════════════════
-// TWT 代購：讀 TWT 代購主控表（團務資料、團務索引表單）和各團的 Google Sheet（訂單明細、匯率與二補）
+// TWT 代購：讀 TWT 代購管理表（團務資料、團務索引表單）和各團的 Google Sheet（訂單明細、匯率與二補）
 // 每個團一個頁面：最上面是摘要，下面是「訂單與二補」表格，用分頁切換「訂單」「二補」
 // 雙向：付款狀態、二補收款狀態（在 Notion 改了會寫回該團的 Google Sheet）；其他欄位由 Google Sheet 寫到 Notion
 // 團在後台刪除（已結束）後，整個頁面搬到「已結束團務」保留，之後不再同步
@@ -855,13 +859,13 @@ function safeIsoTime(v) {
   return isNaN(d.getTime()) ? '' : d.toISOString();
 }
 
-// TWT 代購主控表裡的團（含已結束的團）：[{ ssId, name, status, group, progress, sellLink }]
+// TWT 代購管理表裡的團（含已結束的團）：[{ ssId, name, status, group, progress, sellLink }]
 function readTwtCampaigns(ss) {
   var tourSheet = ss.getSheetByName(TWT_TOUR_SHEET), index = ss.getSheetByName(TWT_INDEX_SHEET);
-  if (!tourSheet) throw new Error('TWT 代購主控表裡找不到「' + TWT_TOUR_SHEET + '」分頁');
+  if (!tourSheet) throw new Error('TWT 代購管理表裡找不到「' + TWT_TOUR_SHEET + '」分頁');
   var head = index && index.getLastColumn() ? getHeaderMap(index.getRange(1, 1, 1, index.getLastColumn()).getValues()[0]) : {};
   if (head[TWT_INDEX_ID] === undefined) {
-    throw new Error('TWT 代購主控表的「' + TWT_INDEX_SHEET + '」還沒有各團的試算表ID：請先更新 TWT 代購主控表的程式，再按「TWT 代購 → 整理系統設定」');
+    throw new Error('TWT 代購管理表的「' + TWT_INDEX_SHEET + '」還沒有各團的試算表ID：請先更新 TWT 代購管理表的程式，再按「TWT 代購 → 整理系統設定」');
   }
   var idByName = {};
   readTable(index).forEach(function(get) {
@@ -1045,7 +1049,7 @@ function notionSyncCampaign(c, entry, orders, state, report, started) {
   notionUpdateCallout(entry, 'sum', notionSummaryBlock(c, campaignStats(orders)));
   return true;
 }
-// 之前（TWT 代購主控表的程式）建立的團務頁：沿用裡面的摘要和表格
+// 之前（TWT 代購管理表的程式）建立的團務頁：沿用裡面的摘要和表格
 function adoptCampaignPage(entry) {
   var kids = notionChildren(entry.page);
   var sum = kids.filter(function(k) { return k.type === 'callout' && /團體/.test(k.text); })[0];
@@ -1145,7 +1149,7 @@ function syncTwt(ss, pages, report, started) {
   return '同步 ' + n.campaigns + ' 個團、' + n.orders + ' 筆訂單（新增 ' + report.created + '、更新 ' + report.updated + ' 筆' +
     (report.pulled ? '；把 Notion 改的 ' + report.pulled + ' 筆付款／二補狀態寫回 Google Sheet' : '') + '）' +
     (n.ended ? '；' + n.ended + ' 個團移到「' + NOTION_ENDED_TITLE + '」' : '') +
-    (n.noId ? '；' + n.noId + ' 筆訂單沒有訂單編號，沒有同步（在 TWT 代購主控表按「TWT 代購 → 整理系統設定」會補上）' : '');
+    (n.noId ? '；' + n.noId + ' 筆訂單沒有訂單編號，沒有同步（在 TWT 代購管理表按「TWT 代購 → 整理系統設定」會補上）' : '');
 }
 
 // ══════════════════════════════════════════

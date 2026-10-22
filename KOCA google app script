@@ -9,6 +9,7 @@
 // 不會自動讀信：要更新時按選單「KOCA → 讀取通知信」
 // Notion 由「訂單總覽」統一同步：讀完信後，到「訂單總覽」按「同步到 Notion」
 // 第一次按的時候 Google 會要求允許讀取 Gmail。只讀信：不會寄信、刪信，也不會改已讀狀態或標籤
+// 讀的是「按下按鈕的那個 Google 帳號」的信箱；用別的帳號（共用給它當編輯者）按，就會讀那個信箱。每個帳號各自記得讀到哪裡
 // ══════════════════════════════════════════
 var TZ = 'Asia/Taipei';
 var FILE_NAME = 'KOCA 訂單';
@@ -25,8 +26,9 @@ var PAYOUT_NUMBERS = ['提領金額', '提領手續費', '入帳金額'];
 var PARSER_VERSION = '4';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
 var OVERLAP_SEC = 2 * 86400;        // 每次往前多看兩天，晚到的信也不會漏
 var BUDGET_MS = 270000;             // 一次最多讀 4.5 分鐘，剩下的再按一次接著讀
-// 讀到哪裡：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本、資料夾
-var KEY_SINCE = '__MAIL_SINCE__', KEY_SEEN = '__MAIL_SEEN_', KEY_PARSER = '__MAIL_PARSER__', KEY_FOLDER = '__FOLDER__';
+// 每個帳號各自記（User Properties）：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本
+var KEY_SINCE = '__MAIL_SINCE__', KEY_SEEN = '__MAIL_SEEN_', KEY_PARSER = '__MAIL_PARSER__';
+var KEY_FOLDER = '__FOLDER__'; // 所有帳號共用（Script Properties）
 
 // ── 選單 ──
 function onOpen() {
@@ -50,7 +52,7 @@ function readMailNow() {
   } finally {
     lock.releaseLock();
   }
-  return notify(title, summaryText(er) + (folderMsg ? '\n\n' + folderMsg : '') +
+  return notify(title, (er.account ? '帳號 ' + er.account + '：' : '') + summaryText(er) + (folderMsg ? '\n\n' + folderMsg : '') +
     '\n\n要更新 Notion：到 Google Sheet「訂單總覽」按「訂單總覽 → 同步到 Notion」。');
 }
 
@@ -77,6 +79,7 @@ function prepareFile(ss) {
 function moveIntoFolder(ss) {
   try {
     var file = DriveApp.getFileById(ss.getId());
+    if (!isOwner(file)) return ''; // 用共用的帳號讀信時不動資料夾（也不會在那個帳號的雲端硬碟建資料夾）
     var folder = myFolder(file);
     var parents = file.getParents();
     while (parents.hasNext()) if (parents.next().getId() === folder.getId()) return '';
@@ -85,6 +88,12 @@ function moveIntoFolder(ss) {
   } catch (e) {
     return ''; // 搬不動不影響讀信
   }
+}
+function me() {
+  try { return Session.getEffectiveUser().getEmail() || ''; } catch (e) { return ''; }
+}
+function isOwner(file) {
+  try { var owner = file.getOwner(); return !!owner && owner.getEmail() === me(); } catch (e) { return false; }
 }
 function myFolder(file) {
   var sp = PropertiesService.getScriptProperties();
@@ -152,15 +161,15 @@ function writeRows(ss, name, headers, rows, numberCols, wrapCols) {
   }
   return sheet;
 }
-// 大一點的紀錄分段存在 Script Properties（每段 8000 字）
-function loadChunked(prefix) {
-  var props = PropertiesService.getScriptProperties();
+// 大一點的紀錄分段存（每段 8000 字）；props 省略時存在 Script Properties
+function loadChunked(prefix, props) {
+  props = props || PropertiesService.getScriptProperties();
   var n = Number(props.getProperty(prefix + 'N__') || 0), text = '';
   for (var i = 0; i < n; i++) text += props.getProperty(prefix + i) || '';
   try { return text ? JSON.parse(text) : {}; } catch (e) { return {}; }
 }
-function saveChunked(prefix, obj) {
-  var props = PropertiesService.getScriptProperties();
+function saveChunked(prefix, obj, props) {
+  props = props || PropertiesService.getScriptProperties();
   var text = JSON.stringify(obj), chunks = [];
   for (var i = 0; i < text.length; i += 8000) chunks.push(text.slice(i, i + 8000));
   var old = Number(props.getProperty(prefix + 'N__') || 0);
@@ -179,7 +188,10 @@ function emailHtmlLines(html) {
     .replace(/[\r\n\t]+/g, ' ')
     .replace(/<br\b[^>]*>/gi, '\n')
     .replace(/<\/?(?:p|div|tr|td|th|li|ul|ol|table|tbody|thead|tfoot|h[1-6]|section|article|header|footer|blockquote|center|dl|dt|dd|hr)\b[^>]*>/gi, '\n')
-    .replace(/<[^>]*>/g, ' ');
+    // 其他標籤（span、a、b…）：一個結束、緊接著下一個開始（並排的兩格，例如「訂購人」「Yuhua」）中間空一格；
+    // 夾在字中間的不加空白（「取<span>貨</span>付款」→「取貨付款」）
+    .replace(/(?:<\/[a-z][\w-]*\s*> *)+<[a-z][\w-]*\b[^>]*>/gi, ' ')
+    .replace(/<[^>]*>/g, '');
   return emailPlainLines(emailDecode(s));
 }
 function emailPlainLines(text) {
@@ -373,7 +385,7 @@ function emailParse(m) {
 
 // ── 讀信 ──
 function newReport() {
-  return { mails: 0, created: 0, updated: 0, payouts: 0, unmatched: 0, skipped: 0, skippedSubjects: [], unknown: [], errors: [], pending: false, from: 0, to: 0 };
+  return { account: me(), mails: 0, created: 0, updated: 0, payouts: 0, unmatched: 0, skipped: 0, skippedSubjects: [], unknown: [], errors: [], pending: false, from: 0, to: 0 };
 }
 function loadStore(ss) {
   var rows = readRows(ss, ORDER_TAB, HEADERS), byNo = {};
@@ -435,12 +447,12 @@ function applyMail(store, p, sec, er) {
 // 讀新的通知信。第一次（或讀信規則改了之後）讀全部的信；之後從上次讀到的地方往前多看兩天
 function scanMail(ss, er, budgetMs) {
   var started = Date.now();
-  var sp = PropertiesService.getScriptProperties();
+  var sp = PropertiesService.getUserProperties(); // 每個帳號各自讀自己的信箱
   var fresh = sp.getProperty(KEY_PARSER) !== PARSER_VERSION;
   var since = fresh ? 0 : Number(sp.getProperty(KEY_SINCE) || 0);
   if (!since) fresh = true;
   var after = fresh ? 0 : Math.max(0, since - OVERLAP_SEC);
-  var seen = fresh ? {} : loadChunked(KEY_SEEN);
+  var seen = fresh ? {} : loadChunked(KEY_SEEN, sp);
   var threads = [];
   for (var start = 0; start < 5000; start += 100) {
     var batch = GmailApp.search(MAIL_QUERY + (after ? ' after:' + after : ''), start, 100);
@@ -469,7 +481,7 @@ function scanMail(ss, er, budgetMs) {
   saveStore(store); // 寫入失敗會丟出錯誤：讀到哪裡不會記下，下次重讀
   var keep = {};
   Object.keys(seen).forEach(function(id) { if (seen[id] >= latest - OVERLAP_SEC - 3600) keep[id] = seen[id]; });
-  saveChunked(KEY_SEEN, keep);
+  saveChunked(KEY_SEEN, keep, sp);
   sp.setProperty(KEY_SINCE, String(latest));
   sp.setProperty(KEY_PARSER, PARSER_VERSION);
 }

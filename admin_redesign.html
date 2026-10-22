@@ -1235,7 +1235,7 @@ async function saveCloud(){persistTheme();saveLocal();if(!apiUrl()){toast('已�
     const ended=(saveRes&&saveRes.endedTours)||[];const removedNote=ended.length?' · '+ended.length+' 個團改為已結束':'';
     const pend=getPendingTrash();
     if(pend.length){try{const r=await gasPost('trashImages',{ids:pend});setPendingTrash([]);toast('✅ 已儲存 · 新建 '+created.length+' 表 · 已有 '+existing.length+' 表'+removedNote+' · 回收 '+((r&&r.trashed!=null)?r.trashed:pend.length)+' 張圖');}catch(e){toast('✅ 已儲存 · 新建 '+created.length+' 表 · 已有 '+existing.length+' 表'+removedNote+'（圖片回收下次再試）');}}
-    else if(errs.length)toast('⚠️ 已儲存，但建表有 '+errs.length+' 個錯誤，請看主控表「團務索引表單」');
+    else if(errs.length)toast('⚠️ 已儲存，但建表有 '+errs.length+' 個錯誤，請看 TWT 代購管理表「團務索引表單」');
     else toast('✅ 已儲存到雲端 · 新建 '+created.length+' 表 · 已有 '+existing.length+' 表'+removedNote);}
   catch(e){toast('⚠️ 雲端失敗：'+e.message);setConn(false);}}
 async function loadCloud(){if(!apiUrl())return toast('請先設定 API 網址');toast('載入中…');
@@ -1245,7 +1245,7 @@ async function testConnection(){if(!apiUrl())return toast('請先輸入 API 網�
   try{await gasGet('');setConn(true);toast('✅ 連線成功');}catch(e){setConn(false);toast('⚠️ 連線失敗');}}
 async function forceCreateSheets(){if(!apiUrl())return toast('請先設定 API 網址');toast('建立開團表單中…');
   try{const r=await gasGet('createCampaignSheets');const ac=r.autoCreate||{};const c=(ac.created||[]).length,e=(ac.existing||[]).length,s=(ac.skipped||[]).length,err=(ac.errors||[]).length;setConn(true);
-    if(err)toast('⚠️ 建表完成但有 '+err+' 個錯誤，請看主控表「團務索引表單」');else toast('✅ 建表完成 · 新建 '+c+' · 已存在 '+e+' · 略過 '+s);}
+    if(err)toast('⚠️ 建表完成但有 '+err+' 個錯誤，請看 TWT 代購管理表「團務索引表單」');else toast('✅ 建表完成 · 新建 '+c+' · 已存在 '+e+' · 略過 '+s);}
   catch(e){setConn(false);toast('⚠️ 建表失敗：'+e.message);}}
 function setConn(ok){const c=document.getElementById('conn');c.className='conn'+(ok?' on':'');document.getElementById('connText').textContent=ok?'已連線':'未連線';}
 

@@ -8,6 +8,9 @@
 // 不會自動讀信：要更新時按選單「賣貨便 → 讀取通知信」
 // Notion 由「訂單總覽」統一同步：讀完信後，到「訂單總覽」按「同步到 Notion」
 // 第一次按的時候 Google 會要求允許讀取 Gmail。只讀信：不會寄信、刪信，也不會改已讀狀態或標籤
+// 讀的是「按下按鈕的那個 Google 帳號」的信箱。以前賣貨便綁在別的帳號時：把這個檔案共用給那個帳號（編輯者），
+// 用那個帳號打開這個檔案按「讀取通知信」，就會把那個信箱裡的訂單也記進來。每個帳號各自記得讀到哪裡，同一筆訂單不會重複
+// 訂單成立的信在一個信箱、取貨通知在另一個信箱時：先讀到的取貨通知會記著，讀到那筆訂單時自動補上
 // ══════════════════════════════════════════
 var TZ = 'Asia/Taipei';
 var FILE_NAME = '賣貨便訂單';
@@ -21,8 +24,11 @@ var WRAP_COLS = ['商品明細', '收件資訊', '買家回饋', '訂單備註']
 var PARSER_VERSION = '4';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
 var OVERLAP_SEC = 2 * 86400;        // 每次往前多看兩天，晚到的信也不會漏
 var BUDGET_MS = 270000;             // 一次最多讀 4.5 分鐘，剩下的再按一次接著讀
-// 讀到哪裡：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本、資料夾
-var KEY_SINCE = '__MAIL_SINCE__', KEY_SEEN = '__MAIL_SEEN_', KEY_PARSER = '__MAIL_PARSER__', KEY_FOLDER = '__FOLDER__';
+// 每個帳號各自記（User Properties）：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本
+var KEY_SINCE = '__MAIL_SINCE__', KEY_SEEN = '__MAIL_SEEN_', KEY_PARSER = '__MAIL_PARSER__';
+// 所有帳號共用（Script Properties）：資料夾、還沒找到訂單的取貨／取消通知 { 訂單編號: [狀態, 信的時間（秒）] }
+var KEY_FOLDER = '__FOLDER__', KEY_PENDING = '__MAIL_PENDING_';
+var PENDING_KEEP_SEC = 400 * 86400;  // 一年多還沒找到訂單的通知就不再留著
 
 // ── 選單 ──
 function onOpen() {
@@ -46,7 +52,7 @@ function readMailNow() {
   } finally {
     lock.releaseLock();
   }
-  return notify(title, summaryText(er) + (folderMsg ? '\n\n' + folderMsg : '') +
+  return notify(title, (er.account ? '帳號 ' + er.account + '：' : '') + summaryText(er) + (folderMsg ? '\n\n' + folderMsg : '') +
     '\n\n要更新 Notion：到 Google Sheet「訂單總覽」按「訂單總覽 → 同步到 Notion」。');
 }
 
@@ -72,6 +78,7 @@ function prepareFile(ss) {
 function moveIntoFolder(ss) {
   try {
     var file = DriveApp.getFileById(ss.getId());
+    if (!isOwner(file)) return ''; // 用共用的帳號讀信時不動資料夾（也不會在那個帳號的雲端硬碟建資料夾）
     var folder = myFolder(file);
     var parents = file.getParents();
     while (parents.hasNext()) if (parents.next().getId() === folder.getId()) return '';
@@ -80,6 +87,12 @@ function moveIntoFolder(ss) {
   } catch (e) {
     return ''; // 搬不動不影響讀信
   }
+}
+function me() {
+  try { return Session.getEffectiveUser().getEmail() || ''; } catch (e) { return ''; }
+}
+function isOwner(file) {
+  try { var owner = file.getOwner(); return !!owner && owner.getEmail() === me(); } catch (e) { return false; }
 }
 function myFolder(file) {
   var sp = PropertiesService.getScriptProperties();
@@ -147,15 +160,15 @@ function writeRows(ss, name, headers, rows, numberCols, wrapCols) {
   }
   return sheet;
 }
-// 大一點的紀錄分段存在 Script Properties（每段 8000 字）
-function loadChunked(prefix) {
-  var props = PropertiesService.getScriptProperties();
+// 大一點的紀錄分段存（每段 8000 字）；props 省略時存在 Script Properties
+function loadChunked(prefix, props) {
+  props = props || PropertiesService.getScriptProperties();
   var n = Number(props.getProperty(prefix + 'N__') || 0), text = '';
   for (var i = 0; i < n; i++) text += props.getProperty(prefix + i) || '';
   try { return text ? JSON.parse(text) : {}; } catch (e) { return {}; }
 }
-function saveChunked(prefix, obj) {
-  var props = PropertiesService.getScriptProperties();
+function saveChunked(prefix, obj, props) {
+  props = props || PropertiesService.getScriptProperties();
   var text = JSON.stringify(obj), chunks = [];
   for (var i = 0; i < text.length; i += 8000) chunks.push(text.slice(i, i + 8000));
   var old = Number(props.getProperty(prefix + 'N__') || 0);
@@ -174,7 +187,10 @@ function emailHtmlLines(html) {
     .replace(/[\r\n\t]+/g, ' ')
     .replace(/<br\b[^>]*>/gi, '\n')
     .replace(/<\/?(?:p|div|tr|td|th|li|ul|ol|table|tbody|thead|tfoot|h[1-6]|section|article|header|footer|blockquote|center|dl|dt|dd|hr)\b[^>]*>/gi, '\n')
-    .replace(/<[^>]*>/g, ' ');
+    // 其他標籤（span、a、b…）：一個結束、緊接著下一個開始（並排的兩格，例如「訂購人」「Yuhua」）中間空一格；
+    // 夾在字中間的不加空白（「取<span>貨</span>付款」→「取貨付款」）
+    .replace(/(?:<\/[a-z][\w-]*\s*> *)+<[a-z][\w-]*\b[^>]*>/gi, ' ')
+    .replace(/<[^>]*>/g, '');
   return emailPlainLines(emailDecode(s));
 }
 function emailPlainLines(text) {
@@ -307,15 +323,28 @@ function emailParse(m) {
 
 // ── 讀信 ──
 function newReport() {
-  return { mails: 0, created: 0, updated: 0, unmatched: 0, skipped: 0, skippedSubjects: [], unknown: [], errors: [], pending: false, from: 0, to: 0 };
+  return { account: me(), mails: 0, created: 0, updated: 0, unmatched: 0, matched: 0, skipped: 0, skippedSubjects: [], unknown: [], errors: [], pending: false, from: 0, to: 0 };
 }
 function loadStore(ss) {
   var rows = readRows(ss, ORDER_TAB, HEADERS), byNo = {};
   rows.forEach(function(r) { if (r['訂單編號']) byNo[String(r['訂單編號'])] = r; });
-  return { ss: ss, rows: rows, byNo: byNo, dirty: false };
+  return { ss: ss, rows: rows, byNo: byNo, dirty: false, waiting: loadChunked(KEY_PENDING), waitingDirty: false };
 }
 function saveStore(store) {
   if (store.dirty) writeRows(store.ss, ORDER_TAB, HEADERS, store.rows, NUMBER_COLS, WRAP_COLS);
+  if (store.waitingDirty) {
+    var keep = {}, oldest = Math.floor(Date.now() / 1000) - PENDING_KEEP_SEC;
+    Object.keys(store.waiting).forEach(function(no) { if (store.waiting[no][1] >= oldest) keep[no] = store.waiting[no]; });
+    saveChunked(KEY_PENDING, keep);
+  }
+}
+// 這筆訂單的狀態用這封信（比上次的信新才用）
+function setStatus(row, status, sec) {
+  if (!status || sec <= (Number(row['更新時間（系統用）']) || 0)) return false;
+  row['狀態'] = status;
+  row['更新時間（系統用）'] = String(sec);
+  row['最後通知時間'] = fmtTime(new Date(sec * 1000));
+  return true;
 }
 // 一封信寫進表格（在記憶體裡，最後一起寫入）
 function applyMail(store, p, sec, er) {
@@ -328,8 +357,14 @@ function applyMail(store, p, sec, er) {
   if (d.skip) { er.skipped++; er.skippedSubjects.push(p.subject); return; }
   var row = store.byNo[d.orderNo];
   if (!row) {
-    // 只有取貨、取消這類通知、找不到原本的訂單：訂單成立的信被刪掉了，或是自己當買家的訂單
-    if (!d.full) { er.unmatched++; return; }
+    // 只有取貨、取消這類通知、找不到原本的訂單：訂單成立的信在另一個帳號的信箱（還沒讀）、被刪掉了，或是自己當買家的訂單
+    // 先記著，之後讀到這筆訂單時補上
+    if (!d.full) {
+      var w = store.waiting[d.orderNo];
+      if (d.status && (!w || sec > w[1])) { store.waiting[d.orderNo] = [d.status, sec]; store.waitingDirty = true; }
+      er.unmatched++;
+      return;
+    }
     row = {};
     HEADERS.forEach(function(h) { row[h] = ''; });
     row['訂單編號'] = d.orderNo;
@@ -345,24 +380,28 @@ function applyMail(store, p, sec, er) {
     if (String(row[h]) !== String(v)) { row[h] = v; store.dirty = true; }
   });
   // 狀態只用比上次新的信：在 Notion 手動改的狀態，不會被重讀到的舊信蓋回去
-  var last = Number(row['更新時間（系統用）']) || 0;
-  if (d.status && sec > last) {
-    if (row['狀態'] && row['狀態'] !== d.status) er.updated++;
-    row['狀態'] = d.status;
-    row['更新時間（系統用）'] = String(sec);
-    row['最後通知時間'] = fmtTime(new Date(sec * 1000));
+  var before = row['狀態'];
+  if (setStatus(row, d.status, sec)) {
+    if (before && before !== d.status) er.updated++;
     store.dirty = true;
+  }
+  // 之前先記著的取貨、取消通知（在另一個信箱、或比訂單成立的信先讀到）
+  var waiting = store.waiting[d.orderNo];
+  if (waiting) {
+    if (setStatus(row, waiting[0], waiting[1])) { store.dirty = true; er.matched++; }
+    delete store.waiting[d.orderNo];
+    store.waitingDirty = true;
   }
 }
 // 讀新的通知信。第一次（或讀信規則改了之後）讀全部的信；之後從上次讀到的地方往前多看兩天
 function scanMail(ss, er, budgetMs) {
   var started = Date.now();
-  var sp = PropertiesService.getScriptProperties();
+  var sp = PropertiesService.getUserProperties(); // 每個帳號各自讀自己的信箱
   var fresh = sp.getProperty(KEY_PARSER) !== PARSER_VERSION;
   var since = fresh ? 0 : Number(sp.getProperty(KEY_SINCE) || 0);
   if (!since) fresh = true;
   var after = fresh ? 0 : Math.max(0, since - OVERLAP_SEC);
-  var seen = fresh ? {} : loadChunked(KEY_SEEN);
+  var seen = fresh ? {} : loadChunked(KEY_SEEN, sp);
   var threads = [];
   for (var start = 0; start < 5000; start += 100) {
     var batch = GmailApp.search(MAIL_QUERY + (after ? ' after:' + after : ''), start, 100);
@@ -391,7 +430,7 @@ function scanMail(ss, er, budgetMs) {
   saveStore(store); // 寫入失敗會丟出錯誤：讀到哪裡不會記下，下次重讀
   var keep = {};
   Object.keys(seen).forEach(function(id) { if (seen[id] >= latest - OVERLAP_SEC - 3600) keep[id] = seen[id]; });
-  saveChunked(KEY_SEEN, keep);
+  saveChunked(KEY_SEEN, keep, sp);
   sp.setProperty(KEY_SINCE, String(latest));
   sp.setProperty(KEY_PARSER, PARSER_VERSION);
 }
@@ -399,7 +438,8 @@ function summaryText(er) {
   var lines = [];
   if (!er.mails) lines.push('沒有新的賣貨便通知信。');
   else lines.push('讀了 ' + er.mails + ' 封賣貨便通知信（' + fmtTime(new Date(er.from * 1000)).slice(0, 10) + ' ～ ' + fmtTime(new Date(er.to * 1000)).slice(0, 10) + '）：新增 ' + er.created + ' 筆訂單、更新 ' + er.updated + ' 筆狀態。');
-  if (er.unmatched) lines.push('有 ' + er.unmatched + ' 封取貨、取消之類的通知找不到原本的訂單（訂單成立的信不在信箱裡，或是你自己當買家的訂單），沒有記。');
+  if (er.matched) lines.push('補上 ' + er.matched + ' 筆之前先記著的取貨、取消通知。');
+  if (er.unmatched) lines.push('有 ' + er.unmatched + ' 封取貨、取消之類的通知還找不到原本的訂單，先記著：訂單成立的信如果在另一個帳號的信箱，用那個帳號讀信時會自動補上。');
   if (er.skipped) lines.push('有 ' + er.skipped + ' 封看起來是你自己當買家的訂單，沒有記：' + er.skippedSubjects.slice(0, 3).join('、') + (er.skippedSubjects.length > 3 ? ' 等' : '') + '。如果其實是你賣出的訂單，請告訴我。');
   if (er.unknown.length) lines.push('看不懂的通知信（請告訴我，我再加上）：' + er.unknown.slice(0, 3).join('、') + (er.unknown.length > 3 ? ' 等 ' + er.unknown.length + ' 封' : ''));
   if (er.errors.length) lines.push(er.errors.length + ' 封讀取失敗：' + er.errors[0]);

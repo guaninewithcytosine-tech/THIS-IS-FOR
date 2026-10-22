@@ -1,7 +1,7 @@
 // ══════════════════════════════════════════
 // TWT 代購平台 · Google Apps Script 後端（orderId + 自動建團表版）
 // 適配目前賣家後台：catalog、登入、訂單讀取、對帳、二補、圖片上傳/回收
-// saveCatalog 會自動為每個非現貨開團建立獨立 Google Sheet（訂單、商品清單），並在主控表更新「團務資料」與「團務索引表單」
+// saveCatalog 會自動為每個非現貨開團建立獨立 Google Sheet（訂單、商品清單），並在 TWT 代購管理表更新「團務資料」與「團務索引表單」
 // 只有 TWT 代購自己的功能。Notion 由「訂單總覽」的程式統整；賣貨便、KOCA 各自有自己的 Google Sheet 和程式
 // ══════════════════════════════════════════
  
@@ -82,7 +82,7 @@ function login(password) {
   var fails = Number(cache.get('login_fail') || 0);
   if (fails >= LOGIN_FAIL_LIMIT) return { ok: false, error: '嘗試次數過多，請 15 分鐘後再試' };
   var adminPwd = getAdminPassword();
-  if (!adminPwd) return { ok: false, error: '尚未設定後台密碼，請在主控表「' + SETTING_SHEET + '」B1 填入密碼' };
+  if (!adminPwd) return { ok: false, error: '尚未設定後台密碼，請在 TWT 代購管理表「' + SETTING_SHEET + '」B1 填入密碼' };
   if (String(password || '') !== adminPwd) {
     cache.put('login_fail', String(fails + 1), LOGIN_FAIL_WINDOW);
     Utilities.sleep(800);
@@ -265,9 +265,9 @@ function buildPriorityDataText(cardSort, cardSortMode, cardCount) {
 }
  
 // ── 試算表選單：TWT 代購 → 整理系統設定 ──
-// 打開主控表時在上方選單列加入「TWT 代購」。不必透過後台儲存，直接把「系統設定」A1 的舊資料
+// 打開 TWT 代購管理表時在上方選單列加入「TWT 代購」。不必透過後台儲存，直接把「系統設定」A1 的舊資料
 // 整理成新格式（系統設定／團務資料／各團的商品清單），並更新團務索引表單。
-// 也會整理雲端硬碟（主控表、各團的 Google Sheet 都放進「TWT 代購」資料夾），並把之前版本留下的賣貨便、KOCA 資料交給它們自己的檔案。
+// 也會整理雲端硬碟（TWT 代購管理表、各團的 Google Sheet 都放進「TWT 代購」資料夾），並把之前版本留下的賣貨便、KOCA 資料交給它們自己的檔案。
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('TWT 代購')
     .addItem('整理系統設定', 'tidySettingsSheet')
@@ -295,7 +295,7 @@ function tidySettingsSheet() {
     if (filled) notes.push('補上 ' + filled + ' 筆舊訂單的訂單編號。');
     var handed = null;
     try { handed = handOffOldChannels(); }
-    catch (e) { notes.push('之前放在主控表的賣貨便、KOCA 分頁沒有搬：' + e.message); }
+    catch (e) { notes.push('之前放在 TWT 代購管理表的賣貨便、KOCA 分頁沒有搬：' + e.message); }
     if (handed) {
       handed.forEach(function(h) {
         notes.push(h.name + ' 的訂單在 Google Sheet「' + h.file + '」：' + h.url + '\n請在那個檔案的「擴充功能 → Apps Script」貼上' + h.name + '的程式。');
@@ -304,7 +304,7 @@ function tidySettingsSheet() {
     }
     var moved = 0;
     try { moved = organizeTwtFolder(); } catch (ignore) {}
-    if (moved) notes.push('主控表、各團的 Google Sheet、圖片資料夾都放在雲端硬碟的「' + TWT_FOLDER_NAME + '」資料夾。');
+    if (moved) notes.push('TWT 代購管理表、各團的 Google Sheet、圖片資料夾都放在雲端硬碟的「' + TWT_FOLDER_NAME + '」資料夾。');
   } finally {
     lock.releaseLock();
   }
@@ -317,19 +317,19 @@ function tidySettingsSheet() {
 
 // ══════════════════════════════════════════
 // 雲端硬碟整理、交接（按「整理系統設定」時執行）
-// ・主控表、各團的 Google Sheet、圖片資料夾都放在「TWT 代購」資料夾（原本的「TWT_開團表單」資料夾改名）
+// ・TWT 代購管理表、各團的 Google Sheet、圖片資料夾都放在「TWT 代購」資料夾（原本的「TWT_開團表單」資料夾改名）
 // ・Notion 改由「訂單總覽」的程式統整；賣貨便、KOCA 改由它們自己的 Google Sheet 和程式讀通知信
-//   之前的版本放在主控表裡的「賣貨便訂單」「KOCA 訂單」「KOCA 提領」分頁，整個搬到「賣貨便訂單」「KOCA 訂單」兩個檔案
+//   之前的版本放在 TWT 代購管理表裡的「賣貨便訂單」「KOCA 訂單」「KOCA 提領」分頁，整個搬到「賣貨便訂單」「KOCA 訂單」兩個檔案
 // ══════════════════════════════════════════
 var TWT_FOLDER_NAME = 'TWT 代購';
 var LEGACY_CAMPAIGN_FOLDER_NAME = 'TWT_開團表單';
-// 之前的版本留下的賣貨便、KOCA 資料：檔名、之前另外建的檔案、主控表裡的分頁 → 新檔案裡的分頁名稱
+// 之前的版本留下的賣貨便、KOCA 資料：檔名、之前另外建的檔案、TWT 代購管理表裡的分頁 → 新檔案裡的分頁名稱
 var OLD_CHANNELS = [
   { name: '賣貨便', file: '賣貨便訂單', ssKey: '__SHEET_myship__', tabs: { '賣貨便訂單': '訂單' } },
   { name: 'KOCA', file: 'KOCA 訂單', ssKey: '__SHEET_koca__', tabs: { 'KOCA 訂單': '訂單', 'KOCA 提領': '提領' } }
 ];
 
-// 主控表、各團的 Google Sheet、圖片資料夾放進「TWT 代購」資料夾；回傳搬了幾個
+// TWT 代購管理表、各團的 Google Sheet、圖片資料夾放進「TWT 代購」資料夾；回傳搬了幾個
 function organizeTwtFolder() {
   var folder = getCampaignFolder(), moved = 0;
   var props = PropertiesService.getScriptProperties().getProperties();
@@ -350,8 +350,8 @@ function moveIntoFolder(item, folder) {
   return true;
 }
 
-// 之前的版本留下的賣貨便、KOCA 訂單：主控表裡的分頁整個複製到它們自己的檔案（格式不變），
-// 確認筆數一樣後才從主控表移除。回傳 [{ name, file, url }]（沒有要交接的就是空的）
+// 之前的版本留下的賣貨便、KOCA 訂單：TWT 代購管理表裡的分頁整個複製到它們自己的檔案（格式不變），
+// 確認筆數一樣後才從 TWT 代購管理表移除。回傳 [{ name, file, url }]（沒有要交接的就是空的）
 function handOffOldChannels() {
   var sp = PropertiesService.getScriptProperties(), main = getMainSpreadsheetOrThrow(), out = [];
   OLD_CHANNELS.forEach(function(c) {
@@ -363,11 +363,11 @@ function handOffOldChannels() {
       if (!sheet || !isOldChannelTab(sheet)) return; // 不是程式建立的分頁：不動
       if (!ss) ss = SpreadsheetApp.create(c.file);
       var target = ss.getSheetByName(tab);
-      if (target && target.getLastRow() > 1) return; // 新檔案裡已經有資料：不覆蓋，主控表的分頁留著
+      if (target && target.getLastRow() > 1) return; // 新檔案裡已經有資料：不覆蓋，TWT 代購管理表的分頁留著
       var copy = sheet.copyTo(ss);
       if (target) ss.deleteSheet(target);
       copy.setName(tab);
-      if (copy.getLastRow() !== sheet.getLastRow()) throw new Error('搬移「' + oldName + '」時筆數不一致，沒有刪除主控表的分頁');
+      if (copy.getLastRow() !== sheet.getLastRow()) throw new Error('搬移「' + oldName + '」時筆數不一致，沒有刪除 TWT 代購管理表的分頁');
       main.deleteSheet(sheet);
     });
     if (!ss) return;
@@ -843,7 +843,7 @@ function clearTestData(options) {
     report.campaignSpreadsheets.items.push(item);
   });
 
-  // 3) 清主控表的團務索引表單，不留下測試團列。
+  // 3) 清 TWT 代購管理表的團務索引表單，不留下測試團列。
   if (!dryRun) {
     refreshCampaignIndex(null, []);
     report.campaignIndex.cleared = true;
@@ -1146,15 +1146,15 @@ function reconcileCampaignRenames(oldCatalog, newCatalog) {
 function getMainSpreadsheetOrThrow() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   if (!ss) {
-    throw new Error('找不到主控試算表。請從 Google Sheet 的「擴充功能 → Apps Script」建立此 GAS，不要使用 standalone Apps Script。');
+    throw new Error('找不到 TWT 代購管理表。請從 Google Sheet 的「擴充功能 → Apps Script」建立此 GAS，不要使用 standalone Apps Script。');
   }
   return ss;
 }
  
 // ══════════════════════════════════════════
 // 資料儲存
-// ・主控表「系統設定」：只放系統設定，一列一個項目（A1/B1 = 後台密碼）
-// ・主控表「團務資料」：每個團一列（名稱、狀態、說明、連結…），網站顯示的內容
+// ・TWT 代購管理表「系統設定」：只放系統設定，一列一個項目（A1/B1 = 後台密碼）
+// ・TWT 代購管理表「團務資料」：每個團一列（名稱、狀態、說明、連結…），網站顯示的內容
 // ・各團自己的 Google Sheet「商品清單」：該團的區塊與商品
 // ・後台刪除的團：「團務資料」狀態改為「已結束」、圖片刪除；該團的 Google Sheet（訂單、商品）保留
 // 舊版格式（系統設定 A1 的 JSON、「開團資料」「商品資料」分頁）仍可讀取，下次儲存時自動轉成新格式。
@@ -1255,7 +1255,7 @@ function writeCatalog(catalog, options) {
   return { ended: newlyEnded };
 }
 
-// ── 團務資料（主控表）──
+// ── 團務資料（TWT 代購管理表）──
 function getTourSheet(ss) {
   var sheet = ss.getSheetByName(TOUR_SHEET);
   if (sheet) return sheet;
