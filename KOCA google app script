@@ -18,13 +18,13 @@ var FOLDER_NAME = 'KOCA';
 var ORDER_TAB = '訂單';
 var PAYOUT_TAB = '提領';
 var MAIL_QUERY = 'from:koca.shop';
-var HEADERS = ['訂單編號', '狀態', '訂單日期', '買家', '商品明細', '商品小計', '運費', '總金額',
+var HEADERS = ['訂單編號', '狀態', '訂單日期', '買家', '商品明細', '單價', '商品小計', '運費', '總金額',
   '平台服務費', '金流服務費', '其他扣款', '進帳金額', '費用明細', '付款方式', '運送方式', '最後通知時間', '更新時間（系統用）'];
 var NUMBER_COLS = ['商品小計', '運費', '總金額', '平台服務費', '金流服務費', '其他扣款', '進帳金額'];
-var WRAP_COLS = ['商品明細', '費用明細'];
+var WRAP_COLS = ['商品明細', '單價', '費用明細'];
 var PAYOUT_HEADERS = ['入帳時間', '提領金額', '提領手續費', '入帳金額', '銀行'];
 var PAYOUT_NUMBERS = ['提領金額', '提領手續費', '入帳金額'];
-var PARSER_VERSION = '4';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
+var PARSER_VERSION = '5';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
 var OVERLAP_SEC = 2 * 86400;        // 每次往前多看兩天，晚到的信也不會漏
 var BUDGET_MS = 270000;             // 一次最多讀 4.5 分鐘，剩下的再按一次接著讀
 // 每個帳號各自記（User Properties）：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本
@@ -287,10 +287,12 @@ function parseKocaEmail(subject, lines, date) {
   var buyerSide = (buyer && intro.indexOf(buyer) >= 0) || /感謝(?:你|您)的(?:訂購|購買)|評價賣家|賣家出貨後|(?:你|您)購買的/.test(text);
   if (buyerSide && !sellerSide) return { skip: true };
   d.full = true; // KOCA 每封訂單信都有訂單編號：還沒記過的就新增
+  var cols = itemColumns(kocaItems(lines));
   d.fields = {
     '訂單日期': d.status === '待出貨' && date ? fmtTime(date) : '',
     '買家': buyer,
-    '商品明細': kocaItems(lines),
+    '商品明細': cols.names,
+    '單價': cols.prices,
     '商品小計': emailMoney(emailFieldAny(lines, ['商品小計', '商品金額', '商品總額'])),
     '運費': emailMoney(emailField(lines, '運費')),
     '總金額': emailMoney(emailFieldAny(lines, ['總金額', '訂單總額', '訂單金額'])),
@@ -307,10 +309,10 @@ function parseKocaEmail(subject, lines, date) {
   }
   return d;
 }
-// 訂購商品：商品名稱、選項：xx　x1、NT$100；以前的信是一行「商品名稱 910x1」（單價 x 數量）
+// 訂購商品：商品名稱、選項：xx　x1、NT$100；以前的信是一行「商品名稱 910x1」（單價 x 數量）。回傳每樣商品 { name, qty, unit（單價）}
 function kocaItems(lines) {
   var s = emailIndex(lines, /^(訂購商品|購買商品|商品明細|商品資訊)\s*[:：]?$/);
-  if (s < 0) return '';
+  if (s < 0) return [];
   var e = emailIndex(lines, /^(金額明細|進帳明細|付款及運送資訊|付款資訊|運送資訊|付款方式|商品小計|商品金額|商品總額|運費|總金額|訂單總額|訂單金額)/, s + 1); // 商品列表到金額那幾行為止
   if (e < 0) e = Math.min(lines.length, s + 40);
   var items = [], cur = null;
@@ -337,8 +339,13 @@ function kocaItems(lines) {
     }
   }
   return items.filter(function(it) { return it.name || it.option; }).map(function(it) {
-    return it.name + (it.option ? '（' + it.option + '）' : '') + (it.qty ? ' x' + it.qty : ''); // 價格在「商品小計」欄
-  }).join('\n');
+    return { name: it.name + (it.option ? '（' + it.option + '）' : ''), qty: it.qty, unit: it.price != null ? it.price : null };
+  });
+}
+// 品名和數量放「商品明細」，每樣商品各自的單價放「單價」（一行對一行）
+function itemColumns(items) {
+  var prices = items.map(function(it) { return it.unit == null ? '' : String(it.unit); }).join('\n');
+  return { names: items.map(function(it) { return it.name + (it.qty ? ' x' + it.qty : ''); }).join('\n'), prices: /\d/.test(prices) ? prices : '' };
 }
 // 訂單完成信的「進帳明細」：訂單金額、運費、平台服務費（2%）、金流服務費、…、進帳總金額
 // 現在的信：標籤一行、NT$金額一行；以前的信：「平台服務費 (0.02)：-19」同一行、沒有 NT$
@@ -878,20 +885,26 @@ function writeCellsByKey(ss, tab, keyCol, col, values) {
   });
   return done;
 }
+// 已經建好的表格少了 spec 裡的欄位時補上
+function notionEnsureFields(dsId, fields) {
+  var have = notionFetch('get', 'data_sources/' + dsId).properties || {}, add = {}, any = false;
+  fields.forEach(function(f) { if (!have[f[1]]) { add[f[1]] = notionSchema([f])[f[1]]; any = true; } });
+  if (any) notionFetch('patch', 'data_sources/' + dsId, { properties: add });
+}
 // 平台頁面裡的表格（which：orders 或 payouts）：讀出所有列；還沒建或在 Notion 被刪掉時（重新）建立
-// spec.drop：不要的欄位（之前的版本放過的）：已經建好的表格裡拿掉，只做一次
+// spec.drop：不要的欄位（之前的版本放過的）：已經建好的表格裡拿掉；spec.fields 裡新加的欄位補上。欄位有變才做，只做一次
 function notionChannelTable(ext, which, spec, keyField, report) {
-  var drop = ['信件'].concat(spec.drop || []), mark = drop.join('|');
+  var drop = ['信件'].concat(spec.drop || []), mark = drop.join('|') + '#' + spec.fields.map(function(f) { return f[1]; }).join(',');
   if (ext[which]) {
     try {
-      var rows = notionQueryAll(ext[which].ds, spec.fields, notionKeyOf(keyField));
       if (ext[which].dropped !== mark) {
         drop.forEach(function(name) {
           try { notionFetch('patch', 'data_sources/' + ext[which].ds, { properties: oneProp(name) }); } catch (ignore) {} // 沒有這個欄位也沒關係
         });
+        notionEnsureFields(ext[which].ds, spec.fields);
         ext[which].dropped = mark;
       }
-      return rows;
+      return notionQueryAll(ext[which].ds, spec.fields, notionKeyOf(keyField));
     }
     catch (e) { if (e.status !== 404) throw e; }
     ext[which === 'orders' ? 'state' : 'pstate'] = {}; // 表格被刪掉 → 重建，全部重新放進去
@@ -995,6 +1008,7 @@ function notionKocaSpec() {
       ['status', '狀態', 'select', KOCA_STATUS_OPTIONS],
       ['orderNo', '訂單編號', 'text'],
       ['items', '商品', 'text'],
+      ['prices', '單價', 'text'],
       ['subtotal', '商品小計', 'number'],
       ['shipping', '運費', 'number'],
       ['total', '總金額', 'number'],
@@ -1006,7 +1020,7 @@ function notionKocaSpec() {
       ['date', '訂單日期', 'date']
     ],
     views: [{ name: '依狀態', groupBy: '狀態',
-      columns: ['買家', '狀態', '訂單編號', '商品', '總金額', '運費', '平台服務費', '金流服務費', '其他扣款', '進帳金額', '費用明細', '訂單日期'] }]
+      columns: ['買家', '狀態', '訂單編號', '商品', '單價', '總金額', '運費', '平台服務費', '金流服務費', '其他扣款', '進帳金額', '費用明細', '訂單日期'] }]
   };
 }
 function notionKocaWanted(o) {
@@ -1015,6 +1029,7 @@ function notionKocaWanted(o) {
     status: String(o['狀態'] || ''),
     orderNo: String(o['訂單編號'] || ''),
     items: notionText(plainItems(o['商品明細'])),
+    prices: notionText(String(o['單價'] == null ? '' : o['單價'])),
     subtotal: extNum(o['商品小計']),
     shipping: extNum(o['運費']),
     total: extNum(o['總金額']),
