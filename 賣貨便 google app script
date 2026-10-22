@@ -341,13 +341,40 @@ function newReport() {
 function plainItems(text) {
   return String(text == null ? '' : text).split('\n').map(function(l) { return l.replace(/(\sx\d+)\s+\$\s*[\d,]+(?:\.\d+)?\s*$/, '$1'); }).join('\n');
 }
+// 最早的版本把信裡的那一行原樣記下來（「TWICE 九週年 棒球娃娃 1200x1」＝ 單價 1200、數量 1）：拆成品名數量和單價。
+// 只有「單價 × 數量」加起來剛好等於金額時才拆，免得把品名裡的「60x70」之類拆錯
+function legacyItems(o, totalCol) {
+  var lines = String(o['商品明細'] == null ? '' : o['商品明細']).split('\n').filter(Boolean), names = [], prices = [], sum = 0;
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^(.*\S)\s+(\d[\d,]*)[x×](\d+)$/);
+    if (!m) return null;
+    var price = Number(m[2].replace(/,/g, '')), qty = Number(m[3]);
+    names.push(m[1] + ' x' + qty); prices.push(String(price)); sum += price * qty;
+  }
+  var total = extNum(o[totalCol]);
+  return lines.length && total != null && sum === total ? { names: names.join('\n'), prices: prices.join('\n') } : null;
+}
+// 商品（品名和數量）和單價（每樣商品各一行，跟商品一行對一行）。
+// 單價用信裡寫的；舊資料還沒重讀信、沒有單價時：最早版本記的拆開，只有一樣商品的訂單用「金額 ÷ 數量」算
+function itemColumnsOf(o, totalCol) {
+  var own = String(o['單價'] == null ? '' : o['單價']).trim();
+  var legacy = own ? null : legacyItems(o, totalCol);
+  var items = plainItems(legacy ? legacy.names : o['商品明細']);
+  if (own) return { items: items, prices: own };
+  if (legacy) return { items: items, prices: legacy.prices };
+  var lines = items.split('\n').filter(Boolean), total = extNum(o[totalCol]), m = lines.length === 1 && lines[0].match(/\sx(\d+)$/);
+  if (!m || total == null || !Number(m[1])) return { items: items, prices: '' };
+  var unit = total / Number(m[1]);
+  return { items: items, prices: unit === Math.round(unit) ? String(unit) : '' };
+}
 function loadStore(ss) {
   var rows = readRows(ss, ORDER_TAB, HEADERS), byNo = {};
   var dirty = false;
   rows.forEach(function(r) {
     if (r['訂單編號']) byNo[String(r['訂單編號'])] = r;
-    var plain = plainItems(r['商品明細']);
-    if (plain !== String(r['商品明細'] == null ? '' : r['商品明細'])) { r['商品明細'] = plain; dirty = true; } // 以前記的商品明細有價格：拿掉
+    var ic = itemColumnsOf(r, '商品金額'); // 以前記的商品明細有價格、或把單價寫在品名後面：拆開；重讀信時會換成信裡的
+    if (ic.items !== String(r['商品明細'] == null ? '' : r['商品明細'])) { r['商品明細'] = ic.items; dirty = true; }
+    if (ic.prices && !String(r['單價'] == null ? '' : r['單價']).trim()) { r['單價'] = ic.prices; dirty = true; }
   });
   return { ss: ss, rows: rows, byNo: byNo, dirty: dirty, waiting: loadChunked(KEY_PENDING), waitingDirty: false };
 }
@@ -881,6 +908,7 @@ function notionSyncChannelRows(c, ss, ext, rows, report, started) {
     if (!key) continue;
     if (Date.now() - started > NOTION_TIME_BUDGET_MS) { finished = false; break; }
     var want = c.wanted(o), page = have[key], base = state[key];
+    if (want.items && !want.prices) report.noPrice = (report.noPrice || 0) + 1;
     try {
       if (!page) {
         if (base !== undefined) continue; // 同步過、但在 Notion 被刪掉 → 尊重刪除，不再建立
@@ -975,8 +1003,8 @@ function notionMyshipWanted(o) {
     status: String(o['狀態'] || ''),
     orderNo: String(o['訂單編號'] || ''),
     shop: notionText(o['賣場'], 200),
-    items: notionText(plainItems(o['商品明細'])),
-    prices: notionText(String(o['單價'] == null ? '' : o['單價'])),
+    items: notionText(itemColumnsOf(o, '商品金額').items),
+    prices: notionText(itemColumnsOf(o, '商品金額').prices),
     income: myshipReceived(o),
     date: extNotionDate(o['訂單日期'])
   };
@@ -1037,6 +1065,7 @@ function notionSyncOnce() {
     return 'Notion「' + c.emoji + ' ' + c.title + '」：' + text + '。' +
       (report.viewsFailed ? '\n（有些表格的欄位順序沒有設定成功，可以在 Notion 自己拖曳調整；資料同步不受影響）' : '') +
       (report.errors.length ? '\n\n有 ' + report.errors.length + ' 筆沒同步成功：' + report.errors[0] : '') +
+      (report.noPrice ? '\n\n有 ' + report.noPrice + ' 筆訂單還沒有單價（信還沒重讀）：先按「' + c.name + ' → 讀取通知信」重讀信（舊信在別的帳號的信箱時，用那個帳號讀），再同步一次。' : '') +
       (report.pending ? '\n\n資料比較多，還沒同步完：再按一次會接著做。' : '') +
       '\n\n要更新「訂單總覽」：到 Google Sheet「訂單總覽」按「訂單總覽 → 更新全部」。';
   } catch (e) {
