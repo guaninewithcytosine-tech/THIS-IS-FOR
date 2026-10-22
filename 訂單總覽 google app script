@@ -162,21 +162,27 @@ function askTwtLink(ids) {
   } catch (ignore) {} // 從 Apps Script 編輯器執行時沒有對話框
 }
 
+var SYNC_BUDGET_MS = 240000; // 超過這個時間就不開始下一個平台
 // 依序更新幾個平台：讀平台的 Google Sheet，更新這個檔案；最後更新總覽。回傳要給你看的文字
 function syncSources(which, ids) {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) return '正在更新中，請過 1～2 分鐘再按一次。';
-  var lines = [], errors = [];
+  var lines = [], errors = [], started = Date.now();
   try {
     var folderMsg = organizeDrive(ids);
     for (var i = 0; i < which.length; i++) {
       var id = which[i], src = sources().filter(function(s) { return s.id === id; })[0];
+      if (Date.now() - started > SYNC_BUDGET_MS) { // Google 每次最多跑 6 分鐘：快到了就先停，剩下的請單獨再按
+        lines.push(src.name + '：這次時間不夠，沒有更新。請單獨按「更新 ' + src.name + '」');
+        continue;
+      }
       if (!ids[id]) {
         lines.push(src.name + '：還沒有 Google Sheet（在「' + SOURCE_TAB + '」分頁貼上「' + src.label + '」的連結）');
         try { placeholderPage(src); } catch (ignore) {}
         continue;
       }
       var report = { errors: [] };
+      setSourceCell(id, 4, '更新中（' + fmtTime(new Date()).slice(11) + ' 開始）：如果一直是這個，表示更新到這裡就卡住或超過時間'); // 跑完會清掉；卡住時看這裡就知道停在哪個平台
       try {
         lines.push(src.name + '：總覽表 ' + mirrorPlatform(id, SpreadsheetApp.openById(ids[id]), report));
         setSourceCell(id, 3, fmtTime(new Date()));
@@ -305,16 +311,20 @@ function detectByName(name) {
 }
 // TWT 代購管理表：「TWT 代購」資料夾裡有「團務資料」分頁的 Google Sheet
 function detectTwt(s) {
+  var started = Date.now();
   try {
     for (var i = 0; i < s.folders.length; i++) {
       var folders = DriveApp.getFoldersByName(s.folders[i]);
       while (folders.hasNext()) {
         var folder = folders.next();
         if (folder.isTrashed()) continue;
-        var files = folder.getFilesByType(MimeType.GOOGLE_SHEETS), n = 0;
-        while (files.hasNext() && n++ < 80) {
-          var f = files.next();
-          try { if (SpreadsheetApp.openById(f.getId()).getSheetByName(TWT_TOUR_SHEET)) return f.getId(); } catch (ignore) {}
+        var files = folder.getFilesByType(MimeType.GOOGLE_SHEETS), list = [];
+        while (files.hasNext() && list.length < 80) list.push(files.next());
+        // 名字像 TWT 代購管理表的先開；每個 Google Sheet 要開一下才知道有沒有「團務資料」，所以限制總共花的時間
+        list.sort(function(a, b) { return (/代購|TWT|管理/i.test(b.getName()) ? 1 : 0) - (/代購|TWT|管理/i.test(a.getName()) ? 1 : 0); });
+        for (var j = 0; j < list.length; j++) {
+          if (Date.now() - started > 60000) return '';
+          try { if (SpreadsheetApp.openById(list[j].getId()).getSheetByName(TWT_TOUR_SHEET)) return list[j].getId(); } catch (ignore) {}
         }
       }
     }
