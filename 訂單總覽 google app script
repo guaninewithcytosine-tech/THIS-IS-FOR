@@ -1,0 +1,844 @@
+// ══════════════════════════════════════════
+// 訂單總覽 · Google Apps Script（主控）
+// 放在 Google Sheet「訂單總覽」裡（擴充功能 → Apps Script）
+// 只負責讀取、統整：讀 TWT 代購、賣貨便、KOCA 三個 Google Sheet，把三個平台的統計統整到這個檔案
+// ・TWT 代購的網站、開團、下單、對帳、同步 Notion → TWT 代購管理表自己的程式
+// ・賣貨便、KOCA 讀通知信、同步 Notion → 各自的 Google Sheet 自己的程式
+// 三個來源的 Google Sheet 連結在這個檔案的「來源」分頁（自動尋找，也可以自己貼）
+// 這個檔案只放統計（從三個平台讀來，每次更新整張重寫；每一筆訂單的細節留在各平台自己的 Google Sheet）：
+// ・總覽：三個平台並排的簡單比較（訂單數、入帳金額（純數字）、狀態、最後更新）
+// ・TWT 代購：各團的統計
+// ・賣貨便：各狀態的筆數和金額
+// ・KOCA：各狀態的筆數和金額、平台服務費、金流服務費、進帳、提領
+// 三個平台各有自己獨立的一頁，不會放在同一頁裡
+// Notion（選用）：只負責你指定的頁面最上面的「三個平台總覽」。各平台自己的頁面由各平台的 Google Sheet 同步
+// 三個平台各自分開，不會混在一起計算（TWT 的團雖然用賣貨便出貨，賣貨便的訂單不會算進 TWT 的團）
+// 不會自動更新：要更新時按選單「訂單總覽 → 更新全部」
+// 雲端硬碟：這個檔案和「TWT 代購」「賣貨便」「KOCA」三個資料夾一起放在「訂單總覽」資料夾
+// 使用 Notion API 2025-09-03。Notion 現在把「整合」改稱「連接」。
+// ══════════════════════════════════════════
+var TZ = 'Asia/Taipei';
+var SOURCE_TAB = '來源';
+var SOURCE_HEADERS = ['來源', 'Google Sheet 連結', '最後更新', '說明'];
+var TAB_SUMMARY = '總覽';
+var TAB_TWT = 'TWT 代購';
+var TAB_MYSHIP = '賣貨便';
+var TAB_KOCA = 'KOCA';
+var TOP_FOLDER = '訂單總覽';
+var TOP_FOLDER_KEY = '__TOP_FOLDER__';
+var NOTION_API = 'https://api.notion.com/v1/';
+var NOTION_VERSION = '2025-09-03';
+var NOTION_TOKEN_KEY = '__NOTION_TOKEN__';
+var NOTION_PAGES_KEY = '__NOTION_PAGES__';      // { root, twt, active, ended, overview, twtSum }
+var STATS_KEY = '__STATS_';                     // 總覽用的數字（每個平台更新時一起更新）
+var OLD_TABS = { 'TWT 訂單': '團務', '賣貨便 訂單': '訂單編號', 'KOCA 訂單': '訂單編號', 'KOCA 提領': '入帳時間' }; // 之前版本的分頁（改成每個平台一頁），有的話整理掉
+
+// TWT 代購管理表與各團 Google Sheet 的分頁、欄位（跟 TWT 代購的程式一樣）
+// TWT 代購管理表與各團 Google Sheet 的分頁、欄位（跟 TWT 代購的程式一樣）
+var TWT_TOUR_SHEET = '團務資料';
+var TWT_INDEX_SHEET = '團務索引表單';
+var TWT_INDEX_ID = '試算表ID（系統用）';
+var TWT_ORDER_SHEET = '訂單明細';
+var TWT_SECOND_SHEET = '匯率與二補';
+var TWT_SECOND_TOTAL = '二補總計(國際運費+包材)';
+var STATUS_LABELS = { open: '開團中', closed: '停止收單', sorting: '理貨中', instock: '現貨賣場', ended: '團務結束', deleted: '已結束' };
+
+// 賣貨便、KOCA 的 Google Sheet（由它們自己的程式讀通知信寫入）
+// 賣貨便、KOCA 的 Google Sheet（由它們自己的程式讀通知信寫入）
+var ORDER_TAB = '訂單';
+var PAYOUT_TAB = '提領';
+var MYSHIP_HEADERS = ['訂單編號', '狀態', '訂單日期', '賣場', '買家', '收件資訊', '商品明細', '商品金額', '運費', '訂單總額',
+  '付款方式', '配送方式', '買家回饋', '訂單備註', '最後通知時間', '更新時間（系統用）'];
+var KOCA_HEADERS = ['訂單編號', '狀態', '訂單日期', '買家', '商品明細', '商品小計', '運費', '總金額',
+  '平台服務費', '金流服務費', '其他扣款', '進帳金額', '費用明細', '付款方式', '運送方式', '最後通知時間', '更新時間（系統用）'];
+var KOCA_PAYOUT_HEADERS = ['入帳時間', '提領金額', '提領手續費', '入帳金額', '銀行'];
+// 選項順序就是 Notion 分組的順序：要處理的放前面
+var MYSHIP_STATUS_OPTIONS = [
+  { name: '待出貨', color: 'red' }, { name: '已出貨', color: 'yellow' }, { name: '已到店', color: 'blue' }, { name: '未取貨', color: 'orange' },
+  { name: '已取貨', color: 'green' }, { name: '已撥款', color: 'purple' }, { name: '已取消', color: 'gray' }, { name: '退貨／退款', color: 'gray' }
+];
+var KOCA_STATUS_OPTIONS = [
+  { name: '待出貨', color: 'red' }, { name: '已出貨', color: 'yellow' }, { name: '已到店', color: 'blue' },
+  { name: '已完成', color: 'green' }, { name: '已取消', color: 'gray' }, { name: '退貨／退款', color: 'gray' }
+];
+
+// 三個來源：「來源」分頁的列、雲端硬碟裡的資料夾、自動尋找的方式
+// match：「來源」分頁 A 欄的名稱只要有這個字就算這個平台（多一個空格、寫成「賣貨便 訂單」也找得到）
+function sources() {
+  return [
+    { id: 'twt', name: 'TWT 代購', label: 'TWT 代購管理表', match: /twt|代購/i, folders: ['TWT 代購', 'TWT_開團表單'] },
+    { id: 'myship', name: '賣貨便', label: '賣貨便訂單', file: '賣貨便訂單', match: /賣貨便/, folders: ['賣貨便'] },
+    { id: 'koca', name: 'KOCA', label: 'KOCA 訂單', file: 'KOCA 訂單', match: /koca/i, folders: ['KOCA'] }
+  ];
+}
+// 賣貨便、KOCA 的欄位（跟它們自己的 Google Sheet 一樣）
+function channels() {
+  return [
+    { id: 'myship', name: '賣貨便', file: '賣貨便訂單', headers: MYSHIP_HEADERS, numbers: ['商品金額', '運費', '訂單總額'], options: MYSHIP_STATUS_OPTIONS },
+    { id: 'koca', name: 'KOCA', file: 'KOCA 訂單', headers: KOCA_HEADERS, numbers: ['商品小計', '運費', '總金額', '平台服務費', '金流服務費', '其他扣款', '進帳金額'],
+      options: KOCA_STATUS_OPTIONS, payouts: true }
+  ];
+}
+
+// ── 選單 ──
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('訂單總覽')
+    .addItem('更新全部', 'syncAllNow')
+    .addSeparator()
+    .addItem('更新 TWT 代購', 'syncTwtNow')
+    .addItem('更新賣貨便', 'syncMyshipNow')
+    .addItem('更新 KOCA', 'syncKocaNow')
+    .addSeparator()
+    .addItem('設定 Notion（選用）', 'setupNow')
+    .addToUi();
+}
+function syncAllNow() { return syncNow(['myship', 'koca', 'twt']); }
+function syncTwtNow() { return syncNow(['twt']); }
+function syncMyshipNow() { return syncNow(['myship']); }
+function syncKocaNow() { return syncNow(['koca']); }
+
+
+function notify(title, msg) {
+  try { SpreadsheetApp.getUi().alert(title, msg, SpreadsheetApp.getUi().ButtonSet.OK); return msg; } catch (ignore) {}
+  try { SpreadsheetApp.getActiveSpreadsheet().toast(msg, title, 10); } catch (ignore) {} // 從 Apps Script 編輯器執行時沒有對話框
+  console.log(title + '：' + msg);
+  return msg;
+}
+
+// 設定 Notion（選用）：只用來在你指定的頁面最上面放「三個平台總覽」
+function setupNow() {
+  var ui = SpreadsheetApp.getUi();
+  var props = PropertiesService.getScriptProperties();
+  var oldToken = props.getProperty(NOTION_TOKEN_KEY), oldPages = loadJson(NOTION_PAGES_KEY);
+  var r1 = ui.prompt('設定 Notion（1/2）', '貼上 Notion 連接的存取權杖（開發人員工具 → 連接 → 你建立的連接 → 設定／Configuration）' +
+    (oldToken ? '\n已經設定過的話可以留空，沿用之前的權杖。' : ''), ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  var token = String(r1.getResponseText() || '').trim() || oldToken;
+  if (!token) return ui.alert('沒有輸入存取權杖');
+  var r2 = ui.prompt('設定 Notion（2/2）', '貼上要放總覽的 Notion 頁面連結（這個頁面要先在右上角「⋯ → 連接」加入你建立的連接）。' +
+    '\n總覽會放在這個頁面的最上面。賣貨便、KOCA、TWT 代購各自的 Notion 頁面，請在它們自己的 Google Sheet 按「設定 Notion」。' +
+    (oldPages && oldPages.root ? '\n留空就用之前的頁面。' : ''), ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK) return;
+  var linkText = String(r2.getResponseText() || '').trim();
+  var rootId = linkText ? extractNotionId(linkText) : (oldPages && oldPages.root) || '';
+  if (!rootId) return ui.alert('看不出這是 Notion 頁面連結，請在 Notion 頁面按「分享 → 複製連結」再貼上');
+  props.setProperty(NOTION_TOKEN_KEY, token);
+  try {
+    notionFetch('get', 'pages/' + rootId); // 先確認頁面已經加入連接
+  } catch (e) {
+    if (oldToken) props.setProperty(NOTION_TOKEN_KEY, oldToken); else props.deleteProperty(NOTION_TOKEN_KEY);
+    return ui.alert('設定失敗：' + e.message);
+  }
+  if (!oldPages || oldPages.root !== rootId) saveJson(NOTION_PAGES_KEY, { root: rootId }); // 換了頁面：在新的頁面最上面重新放
+  var ids = sourceIds(true);
+  var msg = syncSources(['myship', 'koca', 'twt'], ids);
+  var missing = sources().filter(function(s) { return !ids[s.id]; }).map(function(s) { return s.label; });
+  ui.alert('Notion 設定完成', msg +
+    (missing.length ? '\n\n還沒找到「' + missing.join('」「') + '」：建好之後把它的 Google Sheet 連結貼到這個檔案的「' + SOURCE_TAB + '」分頁，再按一次更新。' : '') +
+    '\n\n不會自動更新：之後要更新時，按「訂單總覽 → 更新全部」。', ui.ButtonSet.OK);
+}
+function notionConfigured() {
+  var pages = loadJson(NOTION_PAGES_KEY);
+  return !!(PropertiesService.getScriptProperties().getProperty(NOTION_TOKEN_KEY) && pages && pages.root);
+}
+
+function syncNow(which) {
+  var ids = sourceIds(true);
+  if (which.indexOf('twt') >= 0 && !ids.twt) askTwtLink(ids);
+  return notify('更新總覽', syncSources(which, ids) + (notionConfigured() ? '' :
+    '\n\nNotion 最上面的總覽還沒設定（選用）：按「訂單總覽 → 設定 Notion（選用）」。賣貨便、KOCA、TWT 代購各自的 Notion 頁面，請在它們自己的 Google Sheet 按「同步到 Notion」。'));
+}
+// 找不到 TWT 代購管理表時，請你貼它的連結
+function askTwtLink(ids) {
+  try {
+    var ui = SpreadsheetApp.getUi();
+    var r = ui.prompt('TWT 代購管理表', '找不到 TWT 代購管理表。請貼上它的 Google Sheet 連結（不更新 TWT 代購就按取消）', ui.ButtonSet.OK_CANCEL);
+    if (r.getSelectedButton() !== ui.Button.OK) return;
+    var id = extractSheetId(r.getResponseText());
+    var bad = id ? checkSource('twt', id) : '看不出這是 Google Sheet 連結';
+    if (bad) { ui.alert(bad + '\n之後可以在「' + SOURCE_TAB + '」分頁貼上連結。'); return; }
+    setSourceCell('twt', 2, sheetUrl(id));
+    ids.twt = id;
+  } catch (ignore) {} // 從 Apps Script 編輯器執行時沒有對話框
+}
+
+var SYNC_BUDGET_MS = 240000; // 超過這個時間就不開始下一個平台
+// 依序更新幾個平台：讀平台的 Google Sheet，更新這個檔案；最後更新總覽。回傳要給你看的文字
+function syncSources(which, ids) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return '正在更新中，請過 1～2 分鐘再按一次。';
+  var lines = [], errors = [], started = Date.now();
+  try {
+    var folderMsg = organizeDrive(ids);
+    for (var i = 0; i < which.length; i++) {
+      var id = which[i], src = sources().filter(function(s) { return s.id === id; })[0];
+      if (Date.now() - started > SYNC_BUDGET_MS) { // Google 每次最多跑 6 分鐘：快到了就先停，剩下的請單獨再按
+        lines.push(src.name + '：這次時間不夠，沒有更新。請單獨按「更新 ' + src.name + '」');
+        continue;
+      }
+      if (!ids[id]) {
+        lines.push(src.name + '：還沒有 Google Sheet（在「' + SOURCE_TAB + '」分頁貼上「' + src.label + '」的連結）');
+        try { placeholderPage(src); } catch (ignore) {}
+        continue;
+      }
+      var report = { errors: [] };
+      setSourceCell(id, 4, '更新中（' + fmtTime(new Date()).slice(11) + ' 開始）：如果一直是這個，表示更新到這裡就卡住或超過時間'); // 跑完會清掉；卡住時看這裡就知道停在哪個平台
+      try {
+        lines.push(src.name + '：總覽表 ' + mirrorPlatform(id, SpreadsheetApp.openById(ids[id]), report));
+        setSourceCell(id, 3, fmtTime(new Date()));
+        setSourceCell(id, 4, report.errors.length ? report.errors.length + ' 筆失敗：' + report.errors[0] : '');
+      } catch (e) {
+        lines.push(src.name + '：總覽表沒有更新（' + e.message + '）');
+        setSourceCell(id, 4, '沒有更新：' + e.message);
+        report.errors.push(src.name + '：' + e.message);
+      }
+      errors = errors.concat(report.errors);
+    }
+    try { writeSummary(); } catch (e) { errors.push('總覽：' + e.message); }
+    var notionMsg = '';
+    if (notionConfigured()) {
+      try { updateOverview(); notionMsg = '\n\nNotion 最上面的總覽已更新。'; }
+      catch (e) { errors.push('Notion 總覽：' + e.message); }
+    }
+    return lines.join('\n') + (folderMsg ? '\n\n' + folderMsg : '') + notionMsg +
+      (errors.length ? '\n\n有 ' + errors.length + ' 筆沒更新成功：' + errors[0] : '');
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+// 三個平台各有自己的一頁：還沒有 Google Sheet 的平台先放一頁說明
+function pageName(id) { return id === 'twt' ? TAB_TWT : id === 'myship' ? TAB_MYSHIP : TAB_KOCA; }
+function placeholderPage(src) {
+  var book = SpreadsheetApp.getActiveSpreadsheet();
+  if (book.getSheetByName(pageName(src.id))) return;
+  writeBlocks(book, pageName(src.id), [{ text: [src.name, '還沒有找到「' + src.label + '」。建好之後，把它的 Google Sheet 連結貼到「' + SOURCE_TAB + '」分頁，再按「訂單總覽 → 更新全部」。'] }]);
+}
+
+// ── 「來源」分頁：三個 Google Sheet 的連結 ──
+function sourceSheet() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(SOURCE_TAB);
+  if (sheet) return sheet;
+  var sheets = ss.getSheets();
+  // 新建的空白試算表：把預設的分頁改名成「來源」
+  if (sheets.length === 1 && sheets[0].getLastRow() === 0) sheet = sheets[0].setName(SOURCE_TAB);
+  else sheet = ss.insertSheet(SOURCE_TAB, 0);
+  var rows = [SOURCE_HEADERS].concat(sources().map(function(s) { return [s.label, '', '', '']; }));
+  sheet.getRange(1, 1, rows.length, SOURCE_HEADERS.length).setNumberFormat('@').setValues(rows);
+  sheet.getRange(1, 1, 1, SOURCE_HEADERS.length).setFontWeight('bold').setBackground('#e5e7eb');
+  sheet.getRange(2, 1, rows.length - 1, 1).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+  sheet.setColumnWidth(2, 420);
+  if (/^(未命名|Untitled)/i.test(ss.getName())) ss.rename(TOP_FOLDER);
+  return sheet;
+}
+// 「來源」分頁裡屬於這個平台的列（名稱有平台的字就算，打錯一點也找得到）；一列都沒有時回傳空陣列
+function sourceRows(sheet, id) {
+  var src = sources().filter(function(s) { return s.id === id; })[0], out = [];
+  var col = sheet.getRange(1, 1, Math.max(1, sheet.getLastRow()), 1).getValues();
+  for (var i = 1; i < col.length; i++) if (src.match.test(String(col[i][0]))) out.push(i + 1);
+  return out;
+}
+// 這個平台在「來源」分頁的列；名稱不是標準寫法時改成標準寫法，一列都沒有時加一列
+function sourceRow(sheet, id) {
+  var label = sources().filter(function(s) { return s.id === id; })[0].label;
+  var rows = sourceRows(sheet, id);
+  if (rows.length) {
+    if (String(sheet.getRange(rows[0], 1).getValue()).trim() !== label) sheet.getRange(rows[0], 1).setNumberFormat('@').setValue(label);
+    return rows[0];
+  }
+  var row = Math.max(1, sheet.getLastRow()) + 1;
+  sheet.getRange(row, 1).setNumberFormat('@').setValue(label);
+  return row;
+}
+function setSourceCell(id, col, value) {
+  try {
+    var sheet = sourceSheet();
+    sheet.getRange(sourceRow(sheet, id), col).setNumberFormat('@').setValue(value);
+  } catch (ignore) {} // 只是記錄，寫不進去也不影響同步
+}
+function sheetUrl(id) { return 'https://docs.google.com/spreadsheets/d/' + id + '/edit'; }
+function extractSheetId(text) {
+  var s = String(text || '').trim();
+  var m = s.match(/\/spreadsheets\/d\/([\w-]+)/) || s.match(/^([\w-]{30,})$/);
+  return m ? m[1] : '';
+}
+// 讀「來源」分頁的連結；detect：空著的自動在雲端硬碟裡找，找到就填進去
+function sourceIds(detect) {
+  var sheet = sourceSheet(), out = {};
+  sources().forEach(function(s) {
+    var row = sourceRow(sheet, s.id), id = '', rows = sourceRows(sheet, s.id);
+    // 同一個平台有好幾列時（例如多打了一列），用第一個有連結的
+    rows.forEach(function(r) {
+      var v = extractSheetId(sheet.getRange(r, 2).getValue());
+      if (!id && v) id = v;
+    });
+    if (id && rows.length > 1 && !extractSheetId(sheet.getRange(row, 2).getValue())) sheet.getRange(row, 2).setNumberFormat('@').setValue(sheetUrl(id));
+    if (!id && detect) {
+      id = s.id === 'twt' ? detectTwt(s) : detectByName(s.file);
+      if (id) sheet.getRange(row, 2).setNumberFormat('@').setValue(sheetUrl(id));
+    }
+    // 多出來、沒有連結的列清掉（只留第一列）
+    rows.slice(1).forEach(function(r) {
+      if (!String(sheet.getRange(r, 2).getValue()).trim() && !String(sheet.getRange(r, 3).getValue()).trim()) sheet.getRange(r, 1, 1, SOURCE_HEADERS.length).clearContent();
+    });
+    if (id) out[s.id] = id;
+  });
+  return out;
+}
+// 你貼的連結是不是對的檔案：回傳問題（沒問題時回傳空字串）
+function checkSource(id, ssId) {
+  var ss;
+  try { ss = SpreadsheetApp.openById(ssId); } catch (e) { return '打不開這個 Google Sheet'; }
+  if (id === 'twt') return ss.getSheetByName(TWT_TOUR_SHEET) ? '' : '這個 Google Sheet 裡沒有「' + TWT_TOUR_SHEET + '」分頁，不是 TWT 代購管理表';
+  return ss.getSheetByName(ORDER_TAB) ? '' : '這個 Google Sheet 裡沒有「' + ORDER_TAB + '」分頁';
+}
+// 賣貨便、KOCA：檔名是「賣貨便訂單」「KOCA 訂單」、有「訂單」分頁的 Google Sheet（有好幾個時用最近更新的）
+function detectByName(name) {
+  var best = null;
+  try {
+    var it = DriveApp.getFilesByName(name);
+    while (it.hasNext()) {
+      var f = it.next();
+      if (f.isTrashed() || f.getMimeType() !== MimeType.GOOGLE_SHEETS) continue;
+      try { if (!SpreadsheetApp.openById(f.getId()).getSheetByName(ORDER_TAB)) continue; } catch (e) { continue; }
+      if (!best || f.getLastUpdated().getTime() > best.getLastUpdated().getTime()) best = f;
+    }
+  } catch (ignore) {}
+  return best ? best.getId() : '';
+}
+// TWT 代購管理表：「TWT 代購」資料夾裡有「團務資料」分頁的 Google Sheet
+function detectTwt(s) {
+  var started = Date.now();
+  try {
+    for (var i = 0; i < s.folders.length; i++) {
+      var folders = DriveApp.getFoldersByName(s.folders[i]);
+      while (folders.hasNext()) {
+        var folder = folders.next();
+        if (folder.isTrashed()) continue;
+        var files = folder.getFilesByType(MimeType.GOOGLE_SHEETS), list = [];
+        while (files.hasNext() && list.length < 80) list.push(files.next());
+        // 名字像 TWT 代購管理表的先開；每個 Google Sheet 要開一下才知道有沒有「團務資料」，所以限制總共花的時間
+        list.sort(function(a, b) { return (/代購|TWT|管理/i.test(b.getName()) ? 1 : 0) - (/代購|TWT|管理/i.test(a.getName()) ? 1 : 0); });
+        for (var j = 0; j < list.length; j++) {
+          if (Date.now() - started > 60000) return '';
+          try { if (SpreadsheetApp.openById(list[j].getId()).getSheetByName(TWT_TOUR_SHEET)) return list[j].getId(); } catch (ignore) {}
+        }
+      }
+    }
+  } catch (ignore) {}
+  return '';
+}
+
+// ── 雲端硬碟：這個檔案和三個平台的資料夾放在同一個「訂單總覽」資料夾 ──
+function organizeDrive(ids) {
+  try {
+    var me = DriveApp.getFileById(SpreadsheetApp.getActiveSpreadsheet().getId());
+    var top = topFolder(me), moved = [];
+    sources().forEach(function(s) {
+      if (!ids[s.id]) return;
+      var parents = DriveApp.getFileById(ids[s.id]).getParents();
+      while (parents.hasNext()) {
+        var p = parents.next();
+        if (s.folders.indexOf(p.getName()) < 0 || p.getId() === top.getId()) continue;
+        var up = p.getParents(), inside = false;
+        while (up.hasNext()) if (up.next().getId() === top.getId()) inside = true;
+        if (!inside) { p.moveTo(top); moved.push(p.getName()); }
+      }
+    });
+    return moved.length ? '雲端硬碟：「' + moved.join('」「') + '」資料夾已經放進「' + top.getName() + '」資料夾。' : '';
+  } catch (e) {
+    return ''; // 整理資料夾失敗不影響同步
+  }
+}
+function topFolder(me) {
+  var props = PropertiesService.getScriptProperties();
+  var saved = props.getProperty(TOP_FOLDER_KEY);
+  if (saved) { try { var f = DriveApp.getFolderById(saved); if (!f.isTrashed()) return f; } catch (ignore) {} }
+  var root = DriveApp.getRootFolder(), parents = me.getParents(), parent = null;
+  while (parents.hasNext() && !parent) parent = parents.next();
+  var top;
+  if (parent && parent.getId() !== root.getId()) {
+    top = parent; // 這個檔案已經放在某個資料夾：就用那個資料夾
+  } else {
+    var found = root.getFoldersByName(TOP_FOLDER);
+    top = found.hasNext() ? found.next() : root.createFolder(TOP_FOLDER);
+    me.moveTo(top);
+  }
+  props.setProperty(TOP_FOLDER_KEY, top.getId());
+  return top;
+}
+
+// ── 表格讀寫與小工具 ──
+function getHeaderMap(headers) {
+  var map = {};
+  headers.forEach(function(h, i) { if (h !== '' && h !== null && h !== undefined) map[String(h).trim()] = i; });
+  return map;
+}
+function readTable(sheet) {
+  var lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return [];
+  var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  var head = getHeaderMap(values[0]);
+  return values.slice(1)
+    .filter(function(r) { return r.some(function(c) { return c !== '' && c !== null; }); })
+    .map(function(r) { return function(name) { var i = head[name]; return i === undefined ? '' : r[i]; }; });
+}
+// 一個分頁讀成 [{ 欄名: 值 }]
+function readRows(ss, name, headers) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) return [];
+  return readTable(sheet).map(function(get) {
+    var o = {};
+    headers.forEach(function(h) { o[h] = get(h); });
+    return o;
+  });
+}
+// 大一點的紀錄分段存在 Script Properties（每段 8000 字）
+function loadChunked(prefix) {
+  var props = PropertiesService.getScriptProperties();
+  var n = Number(props.getProperty(prefix + 'N__') || 0), text = '';
+  for (var i = 0; i < n; i++) text += props.getProperty(prefix + i) || '';
+  try { return text ? JSON.parse(text) : {}; } catch (e) { return {}; }
+}
+function saveChunked(prefix, obj) {
+  var props = PropertiesService.getScriptProperties();
+  var text = JSON.stringify(obj), chunks = [];
+  for (var i = 0; i < text.length; i += 8000) chunks.push(text.slice(i, i + 8000));
+  var old = Number(props.getProperty(prefix + 'N__') || 0);
+  var put = {};
+  chunks.forEach(function(c, i) { put[prefix + i] = c; });
+  put[prefix + 'N__'] = String(chunks.length);
+  props.setProperties(put);
+  for (var j = chunks.length; j < old; j++) props.deleteProperty(prefix + j);
+}
+function loadJson(key) {
+  try { return JSON.parse(PropertiesService.getScriptProperties().getProperty(key) || 'null'); } catch (e) { return null; }
+}
+function saveJson(key, obj) { PropertiesService.getScriptProperties().setProperty(key, JSON.stringify(obj)); }
+function fmtTime(date) { return Utilities.formatDate(date, TZ, 'yyyy-MM-dd HH:mm'); }
+function fmtMoney(n) { return '$' + String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function cellText(v) { return v == null ? '' : String(v); }
+function extNum(v) { return (v === '' || v == null || !isFinite(Number(v))) ? null : Number(v); }
+function labelToKey(map, label) {
+  label = String(label || '').trim();
+  if (map.hasOwnProperty(label.toLowerCase())) return label.toLowerCase();
+  for (var k in map) if (map[k] === label) return k;
+  return '';
+}
+function richText(s) { return s ? [{ type: 'text', text: { content: s } }] : []; }
+function readText(x) { return ((x && (x.title || x.rich_text)) || []).map(function(t) { return t.plain_text || (t.text && t.text.content) || ''; }).join(''); }
+function numOrNull(v) { var n = Number(v); return (v === '' || v == null || !isFinite(n) || n === 0) ? null : n; }
+
+// ── Notion：只在你指定的頁面最上面放「三個平台總覽」 ──
+function notionFetch(method, path, body) {
+  var token = PropertiesService.getScriptProperties().getProperty(NOTION_TOKEN_KEY);
+  if (!token) throw new Error('尚未設定 Notion 存取權杖');
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var options = {
+      method: method,
+      headers: { Authorization: 'Bearer ' + token, 'Notion-Version': NOTION_VERSION },
+      muteHttpExceptions: true
+    };
+    if (body) { options.contentType = 'application/json'; options.payload = JSON.stringify(body); }
+    var res;
+    try {
+      res = UrlFetchApp.fetch(NOTION_API + path, options);
+    } catch (e) {
+      // 這支程式之前授權時還沒有「連到外部服務」：要在 Apps Script 編輯器裡執行一次，重新授權
+      if (/external_request|UrlFetchApp/.test(String(e && e.message))) {
+        throw new Error('要連到 Notion，需要先授權這支程式「連到外部服務」。請打開「擴充功能 → Apps Script」，在上方的函式選單選「syncAllNow」，按「執行」，在跳出的視窗按「檢閱權限」→ 選帳號 →「進階」→「前往…（不安全）」→「允許」，授權後再回來按一次。');
+      }
+      throw e;
+    }
+    var code = res.getResponseCode();
+    if (code === 429 || code >= 500) {
+      var headers = res.getHeaders() || {};
+      var wait = Number(headers['Retry-After'] || headers['retry-after'] || 0) || (attempt + 1);
+      Utilities.sleep(Math.min(30, wait) * 1000);
+      continue;
+    }
+    var json = {};
+    try { json = JSON.parse(res.getContentText() || '{}'); } catch (ignore) {}
+    if (code >= 400) {
+      var msg = code === 401 ? 'Notion 存取權杖不正確或已失效'
+        : code === 404 ? 'Notion 找不到這個頁面或資料庫：請在 Notion 頁面右上角「⋯ → 連接」加入你建立的連接'
+        : 'Notion ' + code + '：' + (json.message || '');
+      var err = new Error(msg);
+      err.status = code;
+      throw err;
+    }
+    return json;
+  }
+  throw new Error('Notion 目前太忙，稍後再試');
+}
+// 從 Notion 連結取出頁面 ID（最後一段 32 碼）
+function extractNotionId(text) {
+  var clean = String(text || '').split('?')[0].replace(/-/g, '');
+  var all = clean.match(/[0-9a-f]{32}/gi);
+  if (!all) return '';
+  var id = all[all.length - 1].toLowerCase();
+  return id.slice(0, 8) + '-' + id.slice(8, 12) + '-' + id.slice(12, 16) + '-' + id.slice(16, 20) + '-' + id.slice(20);
+}
+function notionBareId(id) { return String(id || '').replace(/-/g, ''); }
+// 在頁面最下面加區塊，回傳新區塊的 ID
+function notionAppendBlocks(parentId, children) {
+  var res = notionFetch('patch', 'blocks/' + parentId + '/children', { children: children });
+  return (res.results || []).map(function(b) { return b.id; });
+}
+// 在頁面最上面加一個區塊；Notion 不接受時改加在最下面
+function notionInsertTop(parentId, block) {
+  try {
+    var res = notionFetch('patch', 'blocks/' + parentId + '/children', { children: [block], position: { type: 'start' } });
+    return ((res.results || [])[0] || {}).id;
+  } catch (e) {
+    if (e.status !== 400) throw e;
+    return notionAppendBlocks(parentId, [block])[0];
+  }
+}
+function notionBlockGone(blockId) {
+  try {
+    var b = notionFetch('get', 'blocks/' + blockId);
+    return !!(b.in_trash || b.archived);
+  } catch (e) {
+    if (e.status === 404) return true;
+    throw e;
+  }
+}
+// 頁面裡的區塊：[{ id, type, title（子頁面、表格的名稱）, text（摘要框的文字）}]
+function notionChildren(pageId) {
+  var out = [], cursor = null;
+  do {
+    var res = notionFetch('get', 'blocks/' + pageId + '/children?page_size=100' + (cursor ? '&start_cursor=' + encodeURIComponent(cursor) : ''));
+    (res.results || []).forEach(function(b) {
+      if (b.in_trash || b.archived) return;
+      out.push({ id: b.id, type: b.type,
+        title: (b.child_page && b.child_page.title) || (b.child_database && b.child_database.title) || '',
+        text: b.callout ? readText({ rich_text: b.callout.rich_text }) : '' });
+    });
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor);
+  return out;
+}
+// parts：[文字, 粗體, 連結網址]
+function notionRich(parts) {
+  return parts.filter(function(p) { return p[0]; }).map(function(p) {
+    var t = { type: 'text', text: { content: String(p[0]).slice(0, 1900) } };
+    if (p[2]) t.text.link = { url: p[2] };
+    if (p[1]) t.annotations = { bold: true };
+    return t;
+  });
+}
+function notionCallout(parts, emoji) {
+  return { object: 'block', type: 'callout', callout: { rich_text: notionRich(parts), icon: { type: 'emoji', emoji: emoji }, color: 'gray_background' } };
+}
+function notionHash(s) {
+  var h = 0;
+  for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+// 摘要框：有變才更新；在 Notion 刪掉了就不再加回來（holder[key] 變成 false）
+function notionUpdateCallout(holder, key, block) {
+  var id = holder[key], hash = notionHash(JSON.stringify(block.callout));
+  if (!id || holder[key + 'Hash'] === hash) return;
+  try {
+    notionFetch('patch', 'blocks/' + id, { callout: block.callout });
+    holder[key + 'Hash'] = hash;
+  } catch (e) {
+    if ((e.status !== 404 && e.status !== 400) || !notionBlockGone(id)) throw e;
+    holder[key] = false;
+  }
+}
+
+// ── 總覽用的數字（每個平台更新時一起更新）和 Notion 最上面的總覽 ──
+function loadStats() { return loadChunked(STATS_KEY); }
+function saveStats(id, s) {
+  var all = loadStats();
+  s.at = fmtTime(new Date());
+  all[id] = s;
+  saveChunked(STATS_KEY, all);
+}
+function statusLine(count, options) {
+  var order = options.map(function(o) { return o.name; });
+  Object.keys(count).forEach(function(s) { if (order.indexOf(s) < 0) order.push(s); });
+  return order.filter(function(s) { return count[s]; }).map(function(s) { return s + ' ' + count[s]; }).join('・');
+}
+function twtLine(s) {
+  return '進行中 ' + s.campCount + ' 團・訂單 ' + s.count + ' 筆・總額 ' + fmtMoney(s.total) +
+    '・已付款 ' + s.paid + '・未付款 ' + s.unpaid + (s.mismatch ? '・金額不符 ' + s.mismatch : '') + (s.second ? '・二補待收 ' + s.second : '');
+}
+function overviewBlock(stats) {
+  var t = stats.twt, m = stats.myship, k = stats.koca;
+  var at = function(s) { return s ? '（' + s.at.slice(5) + ' 同步）' : ''; };
+  return notionCallout([
+    ['TWT 代購　', true], [t ? twtLine(t) + at(t) : '還沒同步'],
+    ['\n賣貨便　', true], [m ? (m.count ? m.count + ' 筆：' + statusLine(m.status, MYSHIP_STATUS_OPTIONS) + '・已取貨的入帳 ' + fmtMoney(m.picked || 0) : '還沒有訂單') + at(m) : '還沒同步'],
+    ['\nKOCA　', true], [k ? (k.count ? k.count + ' 筆：' + statusLine(k.status, KOCA_STATUS_OPTIONS) + '・已完成的進帳 ' + fmtMoney(k.income) : '還沒有訂單') +
+      (k.payout ? '・已提領入帳 ' + fmtMoney(k.payout) : '') + at(k) : '還沒同步'],
+    ['\n三個平台各自計算，不會混在一起；要更新時在 Google Sheet「訂單總覽」按「訂單總覽 → 更新全部」']
+  ], '📊');
+}
+function updateOverview() {
+  var pages = loadJson(NOTION_PAGES_KEY) || {};
+  if (!pages.root) return;
+  if (pages.overview === undefined) {
+    // 已經有的總覽就沿用，沒有才放在頁面最上面
+    var hit = notionChildren(pages.root).filter(function(k) { return k.type === 'callout' && /三個平台各自計算/.test(k.text); })[0];
+    pages.overview = hit ? hit.id : notionInsertTop(pages.root, notionCallout([['同步中…']], '📊'));
+  }
+  notionUpdateCallout(pages, 'overview', overviewBlock(loadStats()));
+  saveJson(NOTION_PAGES_KEY, pages);
+}
+
+
+// ══════════════════════════════════════════
+// 這個檔案裡的分頁：把三個平台的訂單統整過來
+// 只放統計（不算平台之間的合計），每次更新整張重寫
+// ══════════════════════════════════════════
+// 寫一個分頁（整張重寫）：由幾個區塊從上往下排，區塊中間空一行
+// 文字區塊：{ text: ['第一行（粗體）', '第二行', …] }；表格區塊：{ headers, rows, numbers: [數字欄], wrap: [自動換行的欄] }
+// 文字欄設成純文字（訂單編號、日期不會被改成數字或日期），數字欄保持數字
+function writeBlocks(book, name, blocks) {
+  var sheet = book.getSheetByName(name) || book.insertSheet(name);
+  sheet.clear();
+  var row = 1;
+  blocks.forEach(function(b) {
+    if (b.text) {
+      sheet.getRange(row, 1, b.text.length, 1).setNumberFormat('@').setValues(b.text.map(function(t) { return [t]; }));
+      sheet.getRange(row, 1).setFontWeight('bold').setFontSize(14);
+      row += b.text.length + 1;
+      return;
+    }
+    var numbers = b.numbers || [], wrap = b.wrap || [], width = b.headers.length, count = b.rows.length + 1;
+    for (var c = 0; c < width; c++) {
+      var end = c, isNum = numbers.indexOf(b.headers[c]) >= 0;
+      while (end + 1 < width && (numbers.indexOf(b.headers[end + 1]) >= 0) === isNum) end++;
+      sheet.getRange(row, c + 1, count, end - c + 1).setNumberFormat(isNum ? '#,##0' : '@');
+      c = end;
+    }
+    sheet.getRange(row, 1, count, width).setValues([b.headers.slice()].concat(b.rows));
+    sheet.getRange(row, 1, 1, width).setFontWeight('bold').setBackground('#e5e7eb');
+    b.headers.forEach(function(h, c) { if (wrap.indexOf(h) >= 0 && b.rows.length) sheet.getRange(row + 1, c + 1, b.rows.length, 1).setWrap(true); });
+    row += count + 1;
+  });
+  return sheet;
+}
+// 之前版本的分頁（程式建立的才移除）
+function dropOldTabs(book) {
+  Object.keys(OLD_TABS).forEach(function(name) {
+    var old = book.getSheetByName(name);
+    if (!old || book.getSheets().length < 2 || old.getLastColumn() < 1) return;
+    if (String(old.getRange(1, 1).getValue()).trim() === OLD_TABS[name]) book.deleteSheet(old);
+  });
+}
+function isTwtActive(c) { return c.status !== 'deleted'; }
+// 更新這個檔案裡一個平台的分頁和總覽用的數字；回傳要給你看的文字
+function mirrorPlatform(id, src, report) {
+  var book = SpreadsheetApp.getActiveSpreadsheet();
+  return id === 'twt' ? mirrorTwt(src, book, report) : mirrorChannel(channelById(id), src, book);
+}
+// TWT 代購：一頁，只有統計：每個團一列（進行中的團排在前面）。每一筆訂單的細節在 TWT 代購管理表和各團的 Google Sheet
+function mirrorTwt(src, book, report) {
+  var camps = readTwtCampaigns(src);
+  camps = camps.filter(isTwtActive).concat(camps.filter(function(c) { return !isTwtActive(c); }));
+  var all = [], liveCount = 0, orderCount = 0, total = { count: 0, total: 0, received: 0, paid: 0, unpaid: 0, mismatch: 0, second: 0 }, shown = 0;
+  camps.forEach(function(c) {
+    var orders;
+    try { orders = readCampaignOrders(c.ssId); }
+    catch (e) { report.errors.push(c.name + '：' + e.message); return; }
+    var st = campaignStats(orders);
+    all.push([c.name, STATUS_LABELS[c.status] || c.status, st.count, st.total, st.paid, st.unpaid, st.mismatch, st.second]);
+    if (isTwtActive(c)) {
+      liveCount++;
+      Object.keys(total).forEach(function(k) { total[k] += st[k]; });
+    }
+    orderCount += st.count;
+    shown++;
+  });
+  total.campCount = liveCount;
+  writeBlocks(book, TAB_TWT, [
+    { text: ['TWT 代購', '這一頁只有統計。每一筆訂單的細節在「TWT 代購管理表」和各團自己的 Google Sheet。',
+      '進行中 ' + liveCount + ' 團・訂單 ' + total.count + ' 筆・總額 ' + fmtMoney(total.total) + '・已付款 ' + total.paid + '・未付款 ' + total.unpaid +
+      (total.mismatch ? '・金額不符 ' + total.mismatch : '') + (total.second ? '・二補待收 ' + total.second : '')] },
+    { headers: ['團務', '狀態', '訂單數', '訂單總額', '已付款', '未付款', '金額不符', '二補待收'], rows: all, numbers: ['訂單數', '訂單總額', '已付款', '未付款', '金額不符', '二補待收'] }
+  ]);
+  dropOldTabs(book);
+  saveStats('twt', total);
+  return orderCount + ' 筆訂單（' + shown + ' 個團）';
+}
+// 賣貨便、KOCA：各一頁，只有統計：各狀態的筆數和金額（KOCA 還有平台服務費、金流服務費、進帳、提領）。每一筆訂單的細節在它們自己的 Google Sheet
+function mirrorChannel(c, src, book) {
+  if (!src.getSheetByName(ORDER_TAB)) throw new Error('「' + c.file + '」裡沒有「' + ORDER_TAB + '」分頁：請先在那個檔案按「' + c.name + ' → 讀取通知信」');
+  var rows = readRows(src, ORDER_TAB, c.headers), payouts = c.payouts ? readRows(src, PAYOUT_TAB, KOCA_PAYOUT_HEADERS) : [];
+  var st = channelStats(c, rows, payouts), money = c.payouts ? '總金額' : '商品金額', label = c.payouts ? '總金額' : '訂單總額'; // 賣貨便的訂單總額＝實收：商品金額（運費不是你的）
+  var statusRows = [], seen = {};
+  c.options.map(function(o) { return o.name; }).concat(Object.keys(st.status)).forEach(function(name) {
+    if (seen[name] || !st.status[name]) return;
+    seen[name] = true;
+    statusRows.push([name, st.status[name], emailSum(rows.filter(function(r) { return (String(r['狀態'] || '').trim() || '未知') === name; }), money)]);
+  });
+  var blocks = [{ text: [c.name, '這一頁只有統計。每一筆訂單的細節在「' + c.file + '」。',
+    c.payouts ? '共 ' + st.count + ' 筆・已完成的進帳 ' + fmtMoney(st.income) + '・已提領入帳 ' + fmtMoney(st.payout)
+      : '共 ' + st.count + ' 筆・已取貨的入帳 ' + fmtMoney(st.picked) + '（只算已取貨，商品金額，運費不算）'] },
+    { headers: ['狀態', '筆數', label], rows: statusRows, numbers: ['筆數', label] }];
+  if (c.payouts) {
+    blocks.push({ headers: ['KOCA 費用', '筆數', '總金額', '運費', '平台服務費', '金流服務費', '其他扣款', '進帳金額'],
+      rows: [['已完成的訂單', st.done.count, st.done.total, st.done.shipping, st.done.platform, st.done.payment, st.done.other, st.done.income],
+        ['還沒完成的訂單（完成後才知道實際扣多少）', st.open.count, st.open.total, '', '', '', '', '']],
+      numbers: ['筆數', '總金額', '運費', '平台服務費', '金流服務費', '其他扣款', '進帳金額'] });
+    blocks.push({ headers: ['KOCA 提領', '次數', '提領金額', '提領手續費', '入帳金額'],
+      rows: [['已入帳', st.payouts.count, st.payouts.amount, st.payouts.fee, st.payouts.net]], numbers: ['次數', '提領金額', '提領手續費', '入帳金額'] });
+  }
+  writeBlocks(book, pageName(c.id), blocks);
+  dropOldTabs(book);
+  saveStats(c.id, { count: st.count, status: st.status, total: st.total, picked: st.picked, shipping: st.shipping, income: st.income, payout: st.payout });
+  return rows.length + ' 筆訂單' + (c.payouts ? '、' + payouts.length + ' 筆提領' : '');
+}
+// 「總覽」：三個平台並排的簡單比較（沒有把平台加在一起的合計），細節在各平台自己的分頁
+function summaryRows(stats) {
+  var t = stats.twt, m = stats.myship, k = stats.koca;
+  var at = function(x) { return x ? x.at.slice(5) : '還沒更新'; };
+  var money = function(n) { return n == null ? '' : n; }; // 入帳金額只放數字
+  return [
+    ['TWT 代購', t ? t.count : '', t ? money(t.received) : '', at(t),
+      t ? '進行中 ' + t.campCount + ' 團・已付款 ' + t.paid + '・未付款 ' + t.unpaid + (t.mismatch ? '・金額不符 ' + t.mismatch : '') + (t.second ? '・二補待收 ' + t.second : '') : ''],
+    ['賣貨便', m ? m.count : '', m ? money(m.picked) : '', at(m), m ? statusLine(m.status, MYSHIP_STATUS_OPTIONS) : ''],
+    ['KOCA', k ? k.count : '', k ? money(k.income) : '', at(k),
+      k ? statusLine(k.status, KOCA_STATUS_OPTIONS) + (k.payout ? '・已提領入帳 ' + fmtMoney(k.payout) : '') : '']
+  ];
+}
+function writeSummary() {
+  var book = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = writeBlocks(book, TAB_SUMMARY, [
+    { text: ['訂單總覽', '三個平台各自計算，不會混在一起。這個檔案只放統計，各平台有自己的一頁（TWT 代購、賣貨便、KOCA）；每一筆訂單的細節留在各平台自己的 Google Sheet。每次更新整張重寫，要修改請到各平台的 Google Sheet。'] },
+    { headers: ['平台', '訂單數', '入帳金額', '最後更新', '狀態'], rows: summaryRows(loadStats()), numbers: ['訂單數', '入帳金額'] }
+  ]);
+  if (book.getSheets()[0].getName() !== TAB_SUMMARY) { try { book.setActiveSheet(sheet); book.moveActiveSheet(1); } catch (ignore) {} } // 排在最前面
+  sheet.setColumnWidth(1, 160);
+  sheet.setColumnWidth(3, 120);
+}
+
+// ══════════════════════════════════════════
+// 讀 TWT 代購管理表：團務資料、團務索引表單，和各團 Google Sheet 的訂單明細、匯率與二補
+// ══════════════════════════════════════════
+function payLabel(v) {
+  var s = String(v || '').trim();
+  if (s === 'paid' || s === '已付款') return '已付款';
+  if (!s || s === 'pending' || s === '未付款' || s === '未收款') return '未付款';
+  return s;
+}
+function normalizeSecondStatus(s) {
+  s = String(s || '').trim();
+  if (!s || s === '未通知' || s === 'pending' || s === '未付款' || s === '未收款') return '未收款';
+  if (s === 'paid' || s === '已付款' || s === '已收款') return '已收款';
+  return s;
+}
+function safeIsoTime(v) {
+  if (!v) return '';
+  var d = v instanceof Date ? v : new Date(v);
+  return isNaN(d.getTime()) ? '' : d.toISOString();
+}
+// TWT 代購管理表裡的團（含已結束的團）：[{ ssId, name, status, group, progress, sellLink }]
+function readTwtCampaigns(ss) {
+  var tourSheet = ss.getSheetByName(TWT_TOUR_SHEET), index = ss.getSheetByName(TWT_INDEX_SHEET);
+  if (!tourSheet) throw new Error('TWT 代購管理表裡找不到「' + TWT_TOUR_SHEET + '」分頁');
+  var head = index && index.getLastColumn() ? getHeaderMap(index.getRange(1, 1, 1, index.getLastColumn()).getValues()[0]) : {};
+  if (head[TWT_INDEX_ID] === undefined) {
+    throw new Error('TWT 代購管理表的「' + TWT_INDEX_SHEET + '」還沒有各團的試算表ID：請先更新 TWT 代購管理表的程式，再按「TWT 代購 → 整理系統設定」');
+  }
+  var idByName = {};
+  readTable(index).forEach(function(get) {
+    var name = cellText(get('團務名稱')).trim(), id = cellText(get(TWT_INDEX_ID)).trim();
+    if (name && id) idByName[name] = id;
+  });
+  var camps = [], seen = {};
+  readTable(tourSheet).forEach(function(get) {
+    var name = cellText(get('團務名稱') || get('開團名稱')).trim(), id = idByName[name];
+    if (!name || !id || seen[id]) return;
+    seen[id] = true;
+    var rawStatus = String(get('狀態') || 'open').trim();
+    camps.push({ ssId: id, name: name, status: labelToKey(STATUS_LABELS, rawStatus) || rawStatus.toLowerCase(),
+      group: cellText(get('團體')).trim(), progress: cellText(get('團務進度')).trim(), sellLink: cellText(get('賣貨便連結')).trim() });
+  });
+  return camps;
+}
+// 一個團的訂單（含二補）
+function readCampaignOrders(ssId) {
+  var ss = SpreadsheetApp.openById(ssId);
+  var sheet = ss.getSheetByName(TWT_ORDER_SHEET);
+  if (!sheet) return [];
+  var second = {}, secondByPhone = {};
+  var sec = ss.getSheetByName(TWT_SECOND_SHEET);
+  if (sec) {
+    readTable(sec).forEach(function(get) {
+      var info = { weight: get('商品重量(kg)'), intlShipping: get('國際運費分攤'), packagingFee: get('包材費'),
+        secondPayment: get(TWT_SECOND_TOTAL), secondPayStatus: get('二補收款狀態') };
+      var id = cellText(get('訂單編號')), phone = cellText(get('手機號碼')).replace(/\D/g, '');
+      if (id) second[id] = info;
+      if (phone) secondByPhone[phone] = info;
+    });
+  }
+  return readTable(sheet).map(function(get) {
+    var orderId = cellText(get('訂單編號')).trim(), phone = cellText(get('手機號碼')).replace(/\D/g, '');
+    var s = (orderId && second[orderId]) || secondByPhone[phone] || {};
+    return {
+      spreadsheetId: ssId, orderId: orderId, phone: phone,
+      timestamp: safeIsoTime(get('時間戳記')),
+      socialName: cellText(get('社群帳號')),
+      orderDetails: cellText(get('訂單明細')),
+      totalAmount: Number(get('系統總計金額')) || 0,
+      remitAmount: Number(get('買家匯款金額')) || 0,
+      bank5: cellText(get('匯款後五碼')).replace(/\D/g, '').slice(-5),
+      payStatus: cellText(get('付款狀態')) || 'pending',
+      weight: s.weight, intlShipping: s.intlShipping, packagingFee: s.packagingFee,
+      secondPayment: s.secondPayment, secondPayStatus: normalizeSecondStatus(s.secondPayStatus)
+    };
+  });
+}
+// 金額不符、退款各自分開，不算進已付款或未付款；received＝已付款的訂單金額（二補是從賣貨便補收的，算在賣貨便那邊，這裡不算）
+function campaignStats(orders) {
+  var s = { count: 0, total: 0, received: 0, paid: 0, unpaid: 0, mismatch: 0, refund: 0, second: 0, secondPaid: 0 };
+  orders.forEach(function(o) {
+    var pay = payLabel(o.payStatus);
+    s.count++;
+    s.total += Number(o.totalAmount) || 0;
+    if (pay === '已付款') { s.paid++; s.received += Number(o.totalAmount) || 0; }
+    else if (pay === '金額不符') s.mismatch++;
+    else if (pay === '退款') s.refund++;
+    else s.unpaid++;
+    if ((Number(o.secondPayment) || 0) > 0) {
+      if (normalizeSecondStatus(o.secondPayStatus) === '已收款') s.secondPaid++; else s.second++;
+    }
+  });
+  return s;
+}
+
+// ══════════════════════════════════════════
+// 賣貨便、KOCA：讀它們自己的 Google Sheet 算出總覽用的數字
+// ══════════════════════════════════════════
+function channelById(id) { return channels().filter(function(c) { return c.id === id; })[0]; }
+function countStatus(rows) {
+  var count = {};
+  rows.forEach(function(r) { var s = String(r['狀態'] || '').trim() || '未知'; count[s] = (count[s] || 0) + 1; });
+  return count;
+}
+// 賣貨便的入帳：只算已取貨（已撥款也是取過貨的）的商品金額，運費不算
+function isPickedUp(r) { return /^(已取貨|已撥款)$/.test(String(r['狀態'] || '').trim()); }
+function emailSum(rows, col) { return rows.reduce(function(t, r) { return t + (Number(r[col]) || 0); }, 0); }
+function channelStats(c, rows, payouts) {
+  var live = rows.filter(function(r) { return !/取消|退|未取/.test(String(r['狀態'] || '')); }); // 取消、退貨、沒取貨的都不算成立
+  var s = { count: rows.length, status: countStatus(rows), total: emailSum(live, c.payouts ? '總金額' : '商品金額'), shipping: emailSum(live, '運費'),
+    income: emailSum(rows, '進帳金額'), payout: emailSum(payouts, '入帳金額') };
+  if (!c.payouts) s.picked = emailSum(rows.filter(isPickedUp), '商品金額');
+  if (c.payouts) {
+    var done = rows.filter(function(r) { return extNum(r['進帳金額']) != null; });
+    var open = live.filter(function(r) { return extNum(r['進帳金額']) == null; });
+    s.done = { count: done.length, total: emailSum(done, '總金額'), shipping: emailSum(done, '運費'), platform: emailSum(done, '平台服務費'),
+      payment: emailSum(done, '金流服務費'), other: emailSum(done, '其他扣款'), income: emailSum(done, '進帳金額') };
+    s.open = { count: open.length, total: emailSum(open, '總金額') };
+    s.payouts = { count: payouts.length, amount: emailSum(payouts, '提領金額'), net: emailSum(payouts, '入帳金額'), fee: emailSum(payouts, '提領手續費') };
+  }
+  return s;
+}

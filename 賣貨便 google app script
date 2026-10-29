@@ -1,0 +1,1142 @@
+// ══════════════════════════════════════════
+// 賣貨便訂單 · Google Apps Script
+// 放在 Google Sheet「賣貨便訂單」裡（擴充功能 → Apps Script），跟 TWT 代購、KOCA 的程式分開
+// 做兩件事：讀信（以下），和（選用）把這個檔案的訂單同步到 Notion。讀信：從 Gmail 讀取賣貨便（no-reply@sp88.com）的訂單通知信，記在這個檔案的「訂單」分頁
+// ・訂單成立通知 → 新增一筆（待出貨）；買家完成取貨等通知 → 更新狀態
+// ・同一筆訂單不會重複；狀態只用比上次新的信，在 Notion 改的狀態不會被重讀到的舊信蓋回去
+// ・這個檔案會放到雲端硬碟的「賣貨便」資料夾
+// 不會自動讀信：要更新時按選單「賣貨便 → 讀取通知信」
+// Notion（選用）：按「賣貨便 → 設定 Notion」貼上存取權杖和要放的 Notion 頁面連結，之後按「賣貨便 → 同步到 Notion」（在最下面）
+// 統整由「訂單總覽」負責（它會把這個檔案的訂單讀過去）：讀完信、同步完 Notion 後，到「訂單總覽」按「更新全部」
+// 第一次按的時候 Google 會要求允許讀取 Gmail。只讀信：不會寄信、刪信，也不會改已讀狀態或標籤
+// 讀的是「按下按鈕的那個 Google 帳號」的信箱。以前賣貨便綁在別的帳號時：把這個檔案共用給那個帳號（編輯者），
+// 用那個帳號打開這個檔案按「讀取通知信」，就會把那個信箱裡的訂單也記進來。每個帳號各自記得讀到哪裡，同一筆訂單不會重複
+// 訂單成立的信在一個信箱、取貨通知在另一個信箱時：先讀到的取貨通知會記著，讀到那筆訂單時自動補上
+// ══════════════════════════════════════════
+var TZ = 'Asia/Taipei';
+var FILE_NAME = '賣貨便訂單';
+var FOLDER_NAME = '賣貨便';
+var ORDER_TAB = '訂單';
+var MAIL_QUERY = '{from:sp88.com from:7-11.com.tw}';
+var HEADERS = ['訂單編號', '狀態', '訂單日期', '賣場', '買家', '收件資訊', '商品明細', '單價', '商品金額', '運費', '訂單總額',
+  '付款方式', '配送方式', '買家回饋', '訂單備註', '最後通知時間', '更新時間（系統用）'];
+var NUMBER_COLS = ['商品金額', '運費', '訂單總額'];
+var WRAP_COLS = ['商品明細', '單價', '收件資訊', '買家回饋', '訂單備註'];
+var PARSER_VERSION = '9';           // 讀信規則改了就換號碼：下次讀信時重讀全部的信（同一筆訂單不會重複，手動改的狀態也不會被蓋掉）
+var OVERLAP_SEC = 2 * 86400;        // 每次往前多看兩天，晚到的信也不會漏
+var BUDGET_MS = 270000;             // 一次最多讀 4.5 分鐘，剩下的再按一次接著讀
+// 每個帳號各自記（User Properties）：最後一封信的時間（秒）、最近讀過的信（往前多看的兩天裡不再重讀）、讀信規則的版本
+var KEY_SINCE = '__MAIL_SINCE__', KEY_SEEN = '__MAIL_SEEN_', KEY_PARSER = '__MAIL_PARSER__';
+// 所有帳號共用（Script Properties）：資料夾、還沒找到訂單的取貨／取消通知 { 訂單編號: [狀態, 信的時間（秒）] }
+var KEY_FOLDER = '__FOLDER__', KEY_PENDING = '__MAIL_PENDING_';
+var PENDING_KEEP_SEC = 400 * 86400;  // 一年多還沒找到訂單的通知就不再留著
+
+// ── 選單 ──
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('賣貨便')
+    .addItem('讀取通知信', 'readMailNow')
+    .addItem('檢查這個帳號的信箱', 'checkMailbox')
+    .addSeparator()
+    .addItem('同步到 Notion', 'notionSyncNow')
+    .addItem('設定 Notion（選用）', 'notionSetup')
+    .addToUi();
+}
+
+function readMailNow() {
+  var title = '賣貨便：讀取通知信';
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return notify(title, '正在讀取中，請過 1～2 分鐘再按一次。');
+  var er = newReport(), ss, folderMsg = '';
+  try {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+    prepareFile(ss);
+    folderMsg = moveIntoFolder(ss);
+    scanMail(ss, er, BUDGET_MS);
+  } catch (e) {
+    return notify(title, '讀取失敗：' + e.message);
+  } finally {
+    lock.releaseLock();
+  }
+  return notify(title, (er.account ? '帳號 ' + er.account + '：' : '') + summaryText(er) + (folderMsg ? '\n\n' + folderMsg : '') +
+    '\n\n要更新 Notion：按「賣貨便 → 同步到 Notion」；要更新「訂單總覽」：到 Google Sheet「訂單總覽」按「訂單總覽 → 更新全部」。');
+}
+
+function notify(title, msg) {
+  try { SpreadsheetApp.getUi().alert(title, msg, SpreadsheetApp.getUi().ButtonSet.OK); return msg; } catch (ignore) {}
+  try { SpreadsheetApp.getActiveSpreadsheet().toast(msg, title, 10); } catch (ignore) {} // 從 Apps Script 編輯器執行時沒有對話框
+  console.log(title + '：' + msg);
+  return msg;
+}
+
+// ── 這個檔案：「訂單」分頁、檔名、資料夾 ──
+function prepareFile(ss) {
+  if (!ss.getSheetByName(ORDER_TAB)) {
+    var sheets = ss.getSheets();
+    // 新建的空白試算表：把預設的分頁改名成「訂單」
+    if (sheets.length === 1 && sheets[0].getLastRow() === 0) sheets[0].setName(ORDER_TAB);
+    writeRows(ss, ORDER_TAB, HEADERS, [], NUMBER_COLS, WRAP_COLS);
+  }
+  if (/^(未命名|Untitled)/i.test(ss.getName())) ss.rename(FILE_NAME);
+}
+
+// 放到「賣貨便」資料夾（之後被「訂單總覽」整理到別的地方也沒關係，會記住是哪個資料夾）
+function moveIntoFolder(ss) {
+  try {
+    var file = DriveApp.getFileById(ss.getId());
+    if (!isOwner(file)) return ''; // 用共用的帳號讀信時不動資料夾（也不會在那個帳號的雲端硬碟建資料夾）
+    var folder = myFolder(file);
+    var parents = file.getParents();
+    while (parents.hasNext()) if (parents.next().getId() === folder.getId()) return '';
+    file.moveTo(folder);
+    return '這個檔案已經放到雲端硬碟的「' + FOLDER_NAME + '」資料夾。';
+  } catch (e) {
+    return ''; // 搬不動不影響讀信
+  }
+}
+function me() {
+  try { return Session.getEffectiveUser().getEmail() || ''; } catch (e) { return ''; }
+}
+function isOwner(file) {
+  try { var owner = file.getOwner(); return !!owner && owner.getEmail() === me(); } catch (e) { return false; }
+}
+function myFolder(file) {
+  var sp = PropertiesService.getScriptProperties();
+  var id = sp.getProperty(KEY_FOLDER);
+  if (id) { try { var saved = DriveApp.getFolderById(id); if (!saved.isTrashed()) return saved; } catch (ignore) {} }
+  var folder = null, parents = file.getParents();
+  while (parents.hasNext() && !folder) { var p = parents.next(); if (p.getName() === FOLDER_NAME) folder = p; }
+  if (!folder) {
+    var found = DriveApp.getFoldersByName(FOLDER_NAME);
+    while (found.hasNext() && !folder) { var f = found.next(); if (!f.isTrashed()) folder = f; }
+  }
+  if (!folder) folder = DriveApp.createFolder(FOLDER_NAME);
+  sp.setProperty(KEY_FOLDER, folder.getId());
+  return folder;
+}
+
+// ── 表格讀寫 ──
+function getHeaderMap(headers) {
+  var map = {};
+  headers.forEach(function(h, i) { if (h !== '' && h !== null && h !== undefined) map[String(h).trim()] = i; });
+  return map;
+}
+// 一個分頁讀成 [{ 欄名: 值 }]
+function readRows(ss, name, headers) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) return [];
+  var lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+  if (lastRow < 2 || lastCol < 1) return [];
+  var values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  var head = getHeaderMap(values[0]);
+  return values.slice(1).filter(function(r) { return r.some(function(c) { return c !== '' && c !== null; }); }).map(function(r) {
+    var o = {};
+    headers.forEach(function(h) { o[h] = head[h] === undefined ? '' : r[head[h]]; });
+    return o;
+  });
+}
+function writeRows(ss, name, headers, rows, numberCols, wrapCols) {
+  var sheet = ss.getSheetByName(name) || ss.insertSheet(name);
+  var width = headers.length;
+  var total = Math.max(rows.length + 1, sheet.getLastRow(), 2);
+  var values = [headers.slice()].concat(rows.map(function(o) { return headers.map(function(h) { return o[h] == null ? '' : o[h]; }); }));
+  while (values.length < total) values.push(new Array(width).fill(''));
+  // 文字欄設成純文字（訂單編號、日期不會被改成數字或日期）；相鄰的文字欄一次設定，數字欄保持預設格式
+  for (var c = 0; c < width; c++) {
+    if (numberCols.indexOf(headers[c]) >= 0) continue;
+    var end = c;
+    while (end + 1 < width && numberCols.indexOf(headers[end + 1]) < 0) end++;
+    sheet.getRange(1, c + 1, total, end - c + 1).setNumberFormat('@');
+    c = end;
+  }
+  sheet.getRange(1, 1, total, width).setValues(values); // 一次寫入，多出來的舊列同時清空
+  sheet.getRange(1, 1, 1, width).setFontWeight('bold').setBackground('#e5e7eb');
+  headers.forEach(function(h, c) {
+    if (h.indexOf('（系統用）') >= 0) sheet.getRange(1, c + 1).setBackground('#f3f4f6').setFontColor('#9ca3af');
+    if (wrapCols.indexOf(h) >= 0) sheet.getRange(2, c + 1, total - 1, 1).setWrap(true);
+  });
+  sheet.setFrozenRows(1);
+  // 之前的版本有「信件連結」欄：清掉（你自己加的欄位不動）
+  var last = sheet.getLastColumn();
+  if (last > width) {
+    sheet.getRange(1, width + 1, 1, last - width).getValues()[0].forEach(function(h, i) {
+      h = String(h || '').trim();
+      if (h === '信件連結' || headers.indexOf(h) >= 0) sheet.getRange(1, width + 1 + i, Math.max(1, sheet.getLastRow()), 1).clearContent();
+    });
+  }
+  return sheet;
+}
+// 大一點的紀錄分段存（每段 8000 字）；props 省略時存在 Script Properties
+function loadChunked(prefix, props) {
+  props = props || PropertiesService.getScriptProperties();
+  var n = Number(props.getProperty(prefix + 'N__') || 0), text = '';
+  for (var i = 0; i < n; i++) text += props.getProperty(prefix + i) || '';
+  try { return text ? JSON.parse(text) : {}; } catch (e) { return {}; }
+}
+function saveChunked(prefix, obj, props) {
+  props = props || PropertiesService.getScriptProperties();
+  var text = JSON.stringify(obj), chunks = [];
+  for (var i = 0; i < text.length; i += 8000) chunks.push(text.slice(i, i + 8000));
+  var old = Number(props.getProperty(prefix + 'N__') || 0);
+  var put = {};
+  chunks.forEach(function(c, i) { put[prefix + i] = c; });
+  put[prefix + 'N__'] = String(chunks.length);
+  props.setProperties(put);
+  for (var j = chunks.length; j < old; j++) props.deleteProperty(prefix + j);
+}
+
+// ── 信件內容 → 一行一行的文字（表格的每一格、每個區塊各一行）──
+function emailHtmlLines(html) {
+  var s = String(html || '')
+    .replace(/<(style|script|head|title)\b[\s\S]*?<\/\1\s*>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/<br\b[^>]*>/gi, '\n')
+    .replace(/<\/?(?:p|div|tr|td|th|li|ul|ol|table|tbody|thead|tfoot|h[1-6]|section|article|header|footer|blockquote|center|dl|dt|dd|hr)\b[^>]*>/gi, '\n')
+    // 其他標籤（span、a、b…）：一個結束、緊接著下一個開始（並排的兩格，例如「訂購人」「Yuhua」）中間空一格；
+    // 夾在字中間的不加空白（「取<span>貨</span>付款」→「取貨付款」）
+    .replace(/(?:<\/[a-z][\w-]*\s*> *)+<[a-z][\w-]*\b[^>]*>/gi, ' ')
+    .replace(/<[^>]*>/g, '');
+  return emailPlainLines(emailDecode(s));
+}
+function emailPlainLines(text) {
+  return String(text || '').replace(/[​-‍⁠﻿­]/g, '').split(/\r?\n/).map(function(l) { return l.replace(/\s+/g, ' ').trim(); }).filter(Boolean);
+}
+function emailDecode(s) {
+  var named = { nbsp: ' ', amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", times: '×', middot: '·', hellip: '…', ndash: '–', mdash: '—', yen: '¥' };
+  return s.replace(/&(#x[0-9a-f]+|#\d+|[a-z]+);/gi, function(m, e) {
+    if (e.charAt(0) === '#') {
+      var code = /^#x/i.test(e) ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      try { return String.fromCodePoint(code); } catch (x) { return m; }
+    }
+    var k = e.toLowerCase();
+    return named.hasOwnProperty(k) ? named[k] : m;
+  });
+}
+function emailEsc(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function emailIndex(lines, re, from) {
+  for (var i = Math.max(0, from || 0); i < lines.length; i++) if (re.test(lines[i])) return i;
+  return -1;
+}
+// 欄位的值：「標籤：值」「標籤 值」在同一行，或標籤自己一行、值在下一行
+function emailField(lines, label, from) {
+  var re = new RegExp('^' + emailEsc(label) + '(?:\\s*[:：]\\s*(.*)|\\s+(.+))?$');
+  for (var i = Math.max(0, from || 0); i < lines.length; i++) {
+    var m = lines[i].match(re);
+    if (!m) continue;
+    var v = (m[1] || m[2] || '').trim();
+    return v || lines[i + 1] || '';
+  }
+  return '';
+}
+// 標籤後面的幾行（到 endRe 或 max 行為止）
+function emailBlock(lines, label, endRe, max) {
+  var re = new RegExp('^' + emailEsc(label) + '\\s*[:：]?\\s*(.*)$');
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(re);
+    if (!m) continue;
+    var out = m[1] ? [m[1].trim()] : [];
+    for (var j = i + 1; j < lines.length && out.length < max && !endRe.test(lines[j]); j++) out.push(lines[j]);
+    return out;
+  }
+  return [];
+}
+var EMAIL_MONEY_RE = /^-?\s*(?:NT\s*\$|\$|＄)\s*[\d,]+(?:\.\d+)?$/i;
+// NT$1,234 → 1234；-NT$38 → -38；沒有數字 → null
+function emailMoney(s) {
+  var m = String(s == null ? '' : s).replace(/,/g, '').match(/(-)?\s*(?:NT\s*\$|NTD|\$|＄)?\s*(\d+(?:\.\d+)?)/i);
+  return m ? Number(m[2]) * (m[1] ? -1 : 1) : null;
+}
+function emailDate(s) {
+  var m = String(s || '').match(/(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?/);
+  if (!m) return '';
+  var d = m[1] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[3]).slice(-2);
+  return m[4] ? d + ' ' + ('0' + m[4]).slice(-2) + ':' + m[5] : d;
+}
+function fmtTime(date) { return Utilities.formatDate(date, TZ, 'yyyy-MM-dd HH:mm'); }
+
+// ── 賣貨便的信 ──
+function myshipStatus(kind) {
+  if (/取消/.test(kind)) return '已取消';
+  // 取貨提醒（還在門市等）：不是取貨完成，也不是棄單
+  if (/即將|提醒|儘速|盡速|請於|請儘快|請盡快|剩餘|快到期|將到期/.test(kind)) return /取貨|取件|到店|到貨|門市/.test(kind) ? '已到店' : '';
+  // 沒有取貨、被棄單退回：訂單不成立。「退件到店」是買家沒取、貨退回賣家的門市（標題有「到店」，不是商品到店）
+  if (/未取|未領|逾期|棄單|退件|期限已過|超過.*期限/.test(kind)) return '未取貨';
+  if (/退貨|退款|退回|退件|退還/.test(kind)) return '退貨／退款';
+  if (/撥款/.test(kind)) return '已撥款';
+  if (/已取貨|完成取貨|取貨完成|已取件|完成取件|取件完成/.test(kind)) return '已取貨';
+  if (/到店|到貨|抵達|送達/.test(kind)) return '已到店';
+  if (/取貨|取件/.test(kind)) return '已取貨';
+  if (/寄件|出貨|交寄/.test(kind)) return '已出貨';
+  if (/成立|新訂單/.test(kind)) return '待出貨';
+  return '';
+}
+// 信裡的訂單資料（訂單成立通知、退件到店通知都有同樣的表格）
+function myshipOrderFields(lines) {
+  var recipient = emailBlock(lines, '收件者資訊', /^(付款方式|配送方式|商品名稱)/, 4);
+  var feedback = emailBlock(lines, '買家回饋資訊', /^(訂單備註|★)/, 10).map(function(l) { return l.replace(/^\d+\s*[.、)]\s*/, ''); });
+  var social = feedback.length && feedback[0].match(/[:：]\s*(.+)$/);
+  var cols = itemColumns(myshipItems(lines));
+  return {
+    '訂單日期': emailDate(emailField(lines, '訂單日期')),
+    '賣場': emailField(lines, '賣場名稱'),
+    '買家': (social && social[1].trim()) || recipient[0] || '',
+    '收件資訊': recipient.join(' '),
+    '商品明細': cols.names,
+    '單價': cols.prices,
+    '商品金額': emailMoney(emailField(lines, '商品總額')),
+    '運費': emailMoney(emailField(lines, '運費')),
+    '訂單總額': emailMoney(emailField(lines, '訂單總額')),
+    '付款方式': emailField(lines, '付款方式'),
+    '配送方式': emailField(lines, '配送方式'),
+    '買家回饋': feedback.join('；'),
+    '訂單備註': emailBlock(lines, '訂單備註', /^(★|寄送流程|提醒|如在家|如前往|親愛的|此為系統|任何問題)/, 3).join(' ')
+  };
+}
+// 退件通知裡只有賣家才會看到的字：貨退回你寄件的門市，要你去取回（買家收到的退件通知沒有這段）
+var MYSHIP_SELLER_RETURN_RE = /賣家仍未前往取件|賣家需自行來電|簽收單據免費取回|貨退回原寄件門市/;
+function parseMyshipEmail(subject, lines, html) {
+  var text = lines.join('\n');
+  // 訂單編號：信裡「訂單編號：」後面；沒有這個欄位的通知，用標題「訂單(CM…)」或內文「訂單 CM…」
+  var no = text.match(/訂單編號\s*[:：]?\s*([A-Z]{1,4}\d{8,})/) || String(subject || '').match(/[(（]\s*([A-Z]{1,4}\d{8,})\s*[)）]/) || text.match(/訂單\s*([A-Z]{2}\d{8,})/);
+  if (!no) return null;
+  var kind = String(subject || '').replace(/^[\s\S]*?賣貨便\s*[:：]?\s*/, '').replace(/通知\s*$/, '').trim();
+  var d = { orderNo: no[1], status: myshipStatus(kind), fields: {} };
+  // 標題看不出來時，內文寫著逾期沒取貨、棄單退回，也算沒取貨
+  if (!d.status && /逾期未取|未於.{0,12}取貨|棄單|未取貨.{0,10}退回/.test(text)) d.status = '未取貨';
+  d.returned = /退件/.test(kind);
+  // 我出貨、被退件：信裡有完整的訂單資料，訂單成立的信不在這個信箱時，用這封信補上這筆訂單（已經有的欄位不改）
+  if (d.returned && MYSHIP_SELLER_RETURN_RE.test(text)) { d.full = true; d.fillOnly = true; d.fields = myshipOrderFields(lines); return d; }
+  if (d.status !== '待出貨') return d; // 取貨、取消等通知只有訂單編號：更新已經記下的訂單
+  // 自己在賣貨便買東西時收到的信不算：賣家收到的信會請你安排出貨
+  if (!/有新的訂單|安排出貨|交貨便代碼/.test(text)) return { skip: true };
+  d.full = true;
+  d.fields = myshipOrderFields(lines);
+  return d;
+}
+// 商品表格：商品名稱｜單價｜數量｜小計。回傳每樣商品 { name, qty, unit（單價）}
+function myshipItems(lines) {
+  var h = -1;
+  for (var i = 0; i + 1 < lines.length; i++) if (lines[i] === '商品名稱' && lines[i + 1] === '單價') { h = i; break; }
+  if (h < 0) return [];
+  var end = emailIndex(lines, /^商品總額/, h);
+  if (end < 0) end = Math.min(lines.length, h + 40);
+  var j = h + 2;
+  while (j < end && /^(數量|小計)$/.test(lines[j])) j++;
+  var items = [], cur = null;
+  for (; j < end; j++) {
+    var l = lines[j];
+    if (cur && EMAIL_MONEY_RE.test(l)) { if (cur.price == null) cur.price = emailMoney(l); else cur.sub = emailMoney(l); }
+    else if (cur && /^\d+$/.test(l) && cur.qty == null) cur.qty = Number(l);
+    else { cur = { name: l }; items.push(cur); }
+  }
+  return items.map(function(it) {
+    return { name: it.name, qty: it.qty, unit: it.price != null ? it.price : (it.sub != null && it.qty ? it.sub / it.qty : null) };
+  });
+}
+// 品名和數量放「商品明細」，每樣商品各自的單價放「單價」（一行對一行）
+function itemColumns(items) {
+  var prices = items.map(function(it) { return it.unit == null ? '' : String(it.unit); }).join('\n');
+  return { names: items.map(function(it) { return it.name + (it.qty ? ' x' + it.qty : ''); }).join('\n'), prices: /\d/.test(prices) ? prices : '' };
+}
+// 一封信 → { mine: 是不是賣貨便的通知信, data }
+function emailParse(m) {
+  var from = String(m.getFrom() || ''), subject = String(m.getSubject() || '');
+  if (!/sp88\.com|7-11\.com\.tw/i.test(from) || !/賣貨便/.test(subject)) return { mine: false };
+  var html = m.getBody() || '';
+  var lines = emailHtmlLines(html);
+  if (!lines.length) lines = emailPlainLines(m.getPlainBody());
+  return { mine: true, subject: subject, hasOrderNo: /訂單(?:編號|號碼)/.test(lines.join('\n')), data: parseMyshipEmail(subject, lines, html) };
+}
+
+// ── 讀信 ──
+function newReport() {
+  return { account: me(), mails: 0, created: 0, updated: 0, unmatched: 0, matched: 0, skipped: 0, skippedSubjects: [], returnedOther: [], unknown: [], errors: [], pending: false, from: 0, to: 0 };
+}
+// 商品明細只放品名和數量（「元卡*2 x1」）；價格在「商品金額」「商品小計」欄。
+// 之前的版本把價格也寫在後面（「元卡*2 x1 $230」）：拿掉
+function plainItems(text) {
+  return String(text == null ? '' : text).split('\n').map(function(l) { return l.replace(/(\sx\d+)\s+\$\s*[\d,]+(?:\.\d+)?\s*$/, '$1'); }).join('\n');
+}
+// 最早的版本把信裡的那一行原樣記下來（「TWICE 九週年 棒球娃娃 1200x1」＝ 單價 1200、數量 1）：拆成品名數量和單價。
+// 只有「單價 × 數量」加起來剛好等於金額時才拆，免得把品名裡的「60x70」之類拆錯
+function legacyItems(o, totalCol) {
+  var lines = String(o['商品明細'] == null ? '' : o['商品明細']).split('\n').filter(Boolean), names = [], prices = [], sum = 0;
+  for (var i = 0; i < lines.length; i++) {
+    var m = lines[i].match(/^(.*\S)\s+(\d[\d,]*)[x×](\d+)$/);
+    if (!m) return null;
+    var price = Number(m[2].replace(/,/g, '')), qty = Number(m[3]);
+    names.push(m[1] + ' x' + qty); prices.push(String(price)); sum += price * qty;
+  }
+  var total = extNum(o[totalCol]);
+  return lines.length && total != null && sum === total ? { names: names.join('\n'), prices: prices.join('\n') } : null;
+}
+// 商品（品名和數量）和單價（每樣商品各一行，跟商品一行對一行）。
+// 單價用信裡寫的；舊資料還沒重讀信、沒有單價時：最早版本記的拆開，只有一樣商品的訂單用「金額 ÷ 數量」算
+function itemColumnsOf(o, totalCol) {
+  var own = String(o['單價'] == null ? '' : o['單價']).trim();
+  var legacy = own ? null : legacyItems(o, totalCol);
+  var items = plainItems(legacy ? legacy.names : o['商品明細']);
+  if (own) return { items: items, prices: own };
+  if (legacy) return { items: items, prices: legacy.prices };
+  var lines = items.split('\n').filter(Boolean), total = extNum(o[totalCol]), m = lines.length === 1 && lines[0].match(/\sx(\d+)$/);
+  if (!m || total == null || !Number(m[1])) return { items: items, prices: '' };
+  var unit = total / Number(m[1]);
+  return { items: items, prices: unit === Math.round(unit) ? String(unit) : '' };
+}
+function loadStore(ss) {
+  var rows = readRows(ss, ORDER_TAB, HEADERS), byNo = {};
+  var dirty = false;
+  rows.forEach(function(r) {
+    if (r['訂單編號']) byNo[String(r['訂單編號'])] = r;
+    var ic = itemColumnsOf(r, '商品金額'); // 以前記的商品明細有價格、或把單價寫在品名後面：拆開；重讀信時會換成信裡的
+    if (ic.items !== String(r['商品明細'] == null ? '' : r['商品明細'])) { r['商品明細'] = ic.items; dirty = true; }
+    if (ic.prices && !String(r['單價'] == null ? '' : r['單價']).trim()) { r['單價'] = ic.prices; dirty = true; }
+  });
+  return { ss: ss, rows: rows, byNo: byNo, dirty: dirty, waiting: loadChunked(KEY_PENDING), waitingDirty: false };
+}
+function saveStore(store) {
+  if (store.dirty) writeRows(store.ss, ORDER_TAB, HEADERS, store.rows, NUMBER_COLS, WRAP_COLS);
+  if (store.waitingDirty) {
+    var keep = {}, oldest = Math.floor(Date.now() / 1000) - PENDING_KEEP_SEC;
+    Object.keys(store.waiting).forEach(function(no) { if (store.waiting[no][1] >= oldest) keep[no] = store.waiting[no]; });
+    saveChunked(KEY_PENDING, keep);
+  }
+}
+// 這筆訂單的狀態用這封信（比上次的信新才用）
+// 以前的讀信規則看錯的信（例如「退件到店」當成已到店、取貨提醒當成已取貨）：重讀同一封信時，用現在的讀法改過來。
+// 只改這幾種，手動改的狀態不會被蓋掉
+var MYSHIP_MISREAD = { '已到店': ['未取貨'], '已取貨': ['未取貨', '已到店'] };
+function setStatus(row, status, sec) {
+  if (!status) return false;
+  var last = Number(row['更新時間（系統用）']) || 0;
+  var misread = sec === last && (MYSHIP_MISREAD[row['狀態']] || []).indexOf(status) >= 0;
+  if (sec <= last && !misread) return false;
+  row['狀態'] = status;
+  row['更新時間（系統用）'] = String(sec);
+  row['最後通知時間'] = fmtTime(new Date(sec * 1000));
+  return true;
+}
+// 一封信寫進表格（在記憶體裡，最後一起寫入）
+function applyMail(store, p, sec, er) {
+  if (!p.mine) return;
+  er.mails++;
+  if (!er.from || sec < er.from) er.from = sec;
+  if (sec > er.to) er.to = sec;
+  var d = p.data;
+  if (!d) { if (p.hasOrderNo) er.unknown.push(p.subject); return; }
+  if (d.skip) { er.skipped++; er.skippedSubjects.push(p.subject); return; }
+  var row = store.byNo[d.orderNo];
+  if (!row) {
+    // 只有取貨、取消這類通知、找不到原本的訂單：訂單成立的信在另一個帳號的信箱（還沒讀）、被刪掉了，或是自己當買家的訂單
+    // 先記著，之後讀到這筆訂單時補上
+    if (!d.full) {
+      var w = store.waiting[d.orderNo];
+      if (d.status && (!w || sec > w[1])) { store.waiting[d.orderNo] = [d.status, sec]; store.waitingDirty = true; }
+      if (d.returned) er.returnedOther.push(p.subject); else er.unmatched++; // 找不到訂單的退件：看起來是你買東西被退的
+      return;
+    }
+    row = {};
+    HEADERS.forEach(function(h) { row[h] = ''; });
+    row['訂單編號'] = d.orderNo;
+    store.rows.push(row);
+    store.byNo[d.orderNo] = row;
+    store.dirty = true;
+    er.created++;
+  }
+  if (!d.status) er.unknown.push(p.subject);
+  Object.keys(d.fields).forEach(function(h) {
+    var v = d.fields[h];
+    if (v === '' || v == null || HEADERS.indexOf(h) < 0) return;
+    if (d.fillOnly && row[h] !== '' && row[h] != null) return; // 退件通知只補沒有的欄位（買家名稱之類不要被信裡遮掉的名字蓋掉）
+    if (String(row[h]) !== String(v)) { row[h] = v; store.dirty = true; }
+  });
+  // 狀態只用比上次新的信：在 Notion 手動改的狀態，不會被重讀到的舊信蓋回去
+  var before = row['狀態'];
+  if (setStatus(row, d.status, sec)) {
+    if (before && before !== d.status) er.updated++;
+    store.dirty = true;
+  }
+  // 之前先記著的取貨、取消通知（在另一個信箱、或比訂單成立的信先讀到）
+  var waiting = store.waiting[d.orderNo];
+  if (waiting) {
+    if (setStatus(row, waiting[0], waiting[1])) { store.dirty = true; er.matched++; }
+    delete store.waiting[d.orderNo];
+    store.waitingDirty = true;
+  }
+}
+// 讀新的通知信。第一次（或讀信規則改了之後）讀全部的信；之後從上次讀到的地方往前多看兩天
+function scanMail(ss, er, budgetMs) {
+  var started = Date.now();
+  var sp = PropertiesService.getUserProperties(); // 每個帳號各自讀自己的信箱
+  var fresh = sp.getProperty(KEY_PARSER) !== PARSER_VERSION;
+  var since = fresh ? 0 : Number(sp.getProperty(KEY_SINCE) || 0);
+  if (!since) fresh = true;
+  var after = fresh ? 0 : Math.max(0, since - OVERLAP_SEC);
+  var seen = fresh ? {} : loadChunked(KEY_SEEN, sp);
+  var threads = [];
+  for (var start = 0; start < 5000; start += 100) {
+    var batch = GmailApp.search(MAIL_QUERY + (after ? ' after:' + after : ''), start, 100);
+    threads = threads.concat(batch);
+    if (batch.length < 100) break;
+  }
+  er.fresh = fresh;
+  er.found = threads.length;
+  var items = [];
+  if (threads.length) {
+    GmailApp.getMessagesForThreads(threads).forEach(function(list) {
+      list.forEach(function(m) {
+        var sec = Math.floor(m.getDate().getTime() / 1000);
+        if (sec >= after && !seen[m.getId()]) items.push({ msg: m, sec: sec });
+      });
+    });
+  }
+  er.examined = items.length;
+  items.sort(function(a, b) { return a.sec - b.sec; });
+  var store = loadStore(ss), latest = since;
+  for (var i = 0; i < items.length; i++) {
+    if (Date.now() - started > budgetMs) { er.pending = true; break; } // 從舊到新讀，剩下的再按一次接著讀
+    var it = items[i];
+    try { applyMail(store, emailParse(it.msg), it.sec, er); }
+    catch (e) { er.errors.push((it.msg.getSubject() || '') + '：' + e.message); }
+    seen[it.msg.getId()] = it.sec;
+    if (it.sec > latest) latest = it.sec;
+  }
+  saveStore(store); // 寫入失敗會丟出錯誤：讀到哪裡不會記下，下次重讀
+  var keep = {};
+  Object.keys(seen).forEach(function(id) { if (seen[id] >= latest - OVERLAP_SEC - 3600) keep[id] = seen[id]; });
+  saveChunked(KEY_SEEN, keep, sp);
+  sp.setProperty(KEY_SINCE, String(latest));
+  sp.setProperty(KEY_PARSER, PARSER_VERSION);
+}
+// 第一次讀（或讀信規則更新後重讀）卻什麼都沒讀到時，說明可能的原因
+function mailboxHint(er, name, from) {
+  if (!er.fresh) return '';
+  if (!er.found) return '\n這個信箱裡找不到寄件人' + from + '的信。請確認上面的帳號是不是要讀的那個；如果不是，用那個帳號打開這個檔案（建議開無痕視窗、只登入那個帳號）再按一次。要看這個信箱裡有哪些信，按「' + name + ' → 檢查這個帳號的信箱」。';
+  if (er.examined) return '\n信箱裡有 ' + er.examined + ' 封寄件人' + from + '的信，但都不是' + name + '的訂單通知，所以沒有記。按「' + name + ' → 檢查這個帳號的信箱」可以看到信的主旨。';
+  return '';
+}
+function summaryText(er) {
+  var lines = [];
+  if (!er.mails) lines.push('沒有新的賣貨便通知信。' + mailboxHint(er, '賣貨便', '含 sp88.com 或 7-11.com.tw '));
+  else lines.push('讀了 ' + er.mails + ' 封賣貨便通知信（' + fmtTime(new Date(er.from * 1000)).slice(0, 10) + ' ～ ' + fmtTime(new Date(er.to * 1000)).slice(0, 10) + '）：新增 ' + er.created + ' 筆訂單、更新 ' + er.updated + ' 筆狀態。');
+  if (er.matched) lines.push('補上 ' + er.matched + ' 筆之前先記著的取貨、取消通知。');
+  if (er.unmatched) lines.push('有 ' + er.unmatched + ' 封取貨、取消之類的通知還找不到原本的訂單，先記著：訂單成立的信如果在另一個帳號的信箱，用那個帳號讀信時會自動補上。');
+  if (er.returnedOther.length) lines.push('有 ' + er.returnedOther.length + ' 封退件通知找不到訂單，也沒有賣家才會有的「去門市取回」說明，看起來是你買東西被退的，沒有記：' + er.returnedOther.slice(0, 3).join('、') + (er.returnedOther.length > 3 ? ' 等' : '') + '。如果其實是你出貨被退的，請把標題告訴我。');
+  if (er.skipped) lines.push('有 ' + er.skipped + ' 封看起來是你自己當買家的訂單，沒有記：' + er.skippedSubjects.slice(0, 3).join('、') + (er.skippedSubjects.length > 3 ? ' 等' : '') + '。如果其實是你賣出的訂單，請告訴我。');
+  if (er.unknown.length) lines.push('看不懂的通知信（請告訴我，我再加上）：' + er.unknown.slice(0, 3).join('、') + (er.unknown.length > 3 ? ' 等 ' + er.unknown.length + ' 封' : ''));
+  if (er.errors.length) lines.push(er.errors.length + ' 封讀取失敗：' + er.errors[0]);
+  if (er.pending) lines.push('信比較多，還沒讀完：再按一次會接著讀。');
+  return lines.join('\n');
+}
+
+// ══════════════════════════════════════════
+// Notion（選用）：把這個檔案的訂單同步到 Notion 的「🏪 賣貨便訂單」頁面
+// 按選單「賣貨便 → 設定 Notion（選用）」貼上存取權杖和要放的 Notion 頁面連結；之後按「賣貨便 → 同步到 Notion」
+// 之前已經在那個頁面建立的「賣貨便訂單」會直接沿用；跟其他平台（TWT 代購、KOCA）放在同一個 Notion 頁面裡各自一頁
+// 狀態雙向：在 Notion 改（例如寄出後改成「已出貨」）會寫回這個檔案；之後收到這筆訂單更新的通知信時以信為準
+// 使用 Notion API 2025-09-03。Notion 現在把「整合」改稱「連接」。
+// ══════════════════════════════════════════
+var NOTION_API = 'https://api.notion.com/v1/';
+var NOTION_VERSION = '2025-09-03';
+var NOTION_TOKEN_KEY = '__NOTION_TOKEN__';
+var NOTION_TIME_BUDGET_MS = 270000;             // 單次最多跑 4.5 分鐘，剩下的再按一次同步接著做
+var NOTION_WRAP_COLUMNS = ['明細', '商品', '收件資訊', '備註', '費用明細']; // 這些欄位在表格裡自動換行
+var NOTION_ROOT_KEY = '__NOTION_ROOT__';              // 要放的 Notion 頁面
+
+function notionSchema(fields) {
+  var out = {};
+  fields.forEach(function(f) {
+    var type = f[2], cfg = f[3];
+    out[f[1]] = type === 'title' ? { title: {} }
+      : type === 'text' ? { rich_text: {} }
+      : type === 'date' ? { date: {} }
+      : type === 'number' ? { number: { format: cfg || 'number_with_commas' } }
+      : { select: { options: cfg || [] } };
+  });
+  return out;
+}
+function notionPropValue(type, v) {
+  if (type === 'title') return { title: richText(v) };
+  if (type === 'text') return { rich_text: richText(v) };
+  if (type === 'number') return { number: v == null || v === '' ? null : v };
+  if (type === 'date') return { date: v ? { start: v } : null };
+  return { select: v ? { name: v } : null };
+}
+function notionReadValue(type, x) {
+  if (type === 'title' || type === 'text') return readText(x);
+  if (type === 'number') return readNumber(x);
+  if (type === 'date') return (x && x.date && x.date.start) || '';
+  return readSelect(x);
+}
+// 沒給的欄位（undefined）不寫
+function notionProps(fields, w) {
+  var out = {};
+  fields.forEach(function(f) { if (w[f[0]] !== undefined) out[f[1]] = notionPropValue(f[2], w[f[0]]); });
+  return out;
+}
+function notionRead(fields, page) {
+  var p = (page && page.properties) || {}, out = {};
+  fields.forEach(function(f) { out[f[0]] = notionReadValue(f[2], p[f[1]]); });
+  return out;
+}
+// 只回傳跟 Notion 上不一樣的欄位；都一樣時回傳 null
+function notionChanged(fields, want, have) {
+  var out = {}, changed = false;
+  fields.forEach(function(f) {
+    var k = f[0];
+    if (want[k] === undefined) return;
+    var same = f[2] === 'date' ? sameTime(want[k], have[k]) : sameValue(want[k], have[k]);
+    if (!same) { out[f[1]] = notionPropValue(f[2], want[k]); changed = true; }
+  });
+  return changed ? out : null;
+}
+function notionText(s, max) { return String(s == null ? '' : s).slice(0, max || 1900); }
+function richText(s) { return s ? [{ type: 'text', text: { content: s } }] : []; }
+function readText(x) { return ((x && (x.title || x.rich_text)) || []).map(function(t) { return t.plain_text || (t.text && t.text.content) || ''; }).join(''); }
+function readSelect(x) { return (x && x.select && x.select.name) || ''; }
+function readNumber(x) { return (x && typeof x.number === 'number') ? x.number : null; }
+function sameValue(a, b) { return String(a == null ? '' : a) === String(b == null ? '' : b); }
+function sameTime(a, b) {
+  if (!a || !b) return !a && !b;
+  return Math.floor(new Date(a).getTime() / 60000) === Math.floor(new Date(b).getTime() / 60000);
+}
+function notionFetch(method, path, body) {
+  var token = PropertiesService.getScriptProperties().getProperty(NOTION_TOKEN_KEY);
+  if (!token) throw new Error('尚未設定 Notion 存取權杖');
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var options = {
+      method: method,
+      headers: { Authorization: 'Bearer ' + token, 'Notion-Version': NOTION_VERSION },
+      muteHttpExceptions: true
+    };
+    if (body) { options.contentType = 'application/json'; options.payload = JSON.stringify(body); }
+    var res;
+    try {
+      res = UrlFetchApp.fetch(NOTION_API + path, options);
+    } catch (e) {
+      // 這支程式之前授權時還沒有「連到外部服務」：要在 Apps Script 編輯器裡執行一次，重新授權
+      if (/external_request|UrlFetchApp/.test(String(e && e.message))) {
+        throw new Error('要連到 Notion，需要先授權這支程式「連到外部服務」。請打開「擴充功能 → Apps Script」，在上方的函式選單選「notionSyncNow」，按「執行」，在跳出的視窗按「檢閱權限」→ 選帳號 →「進階」→「前往…（不安全）」→「允許」，授權後再回來按一次。');
+      }
+      throw e;
+    }
+    var code = res.getResponseCode();
+    if (code === 429 || code >= 500) {
+      var headers = res.getHeaders() || {};
+      var wait = Number(headers['Retry-After'] || headers['retry-after'] || 0) || (attempt + 1);
+      Utilities.sleep(Math.min(30, wait) * 1000);
+      continue;
+    }
+    var json = {};
+    try { json = JSON.parse(res.getContentText() || '{}'); } catch (ignore) {}
+    if (code >= 400) {
+      var msg = code === 401 ? 'Notion 存取權杖不正確或已失效'
+        : code === 404 ? 'Notion 找不到這個頁面或資料庫：請在 Notion 頁面右上角「⋯ → 連接」加入你建立的連接'
+        : 'Notion ' + code + '：' + (json.message || '');
+      var err = new Error(msg);
+      err.status = code;
+      throw err;
+    }
+    return json;
+  }
+  throw new Error('Notion 目前太忙，稍後再試');
+}
+// 從 Notion 連結取出頁面 ID（最後一段 32 碼）
+function extractNotionId(text) {
+  var clean = String(text || '').split('?')[0].replace(/-/g, '');
+  var all = clean.match(/[0-9a-f]{32}/gi);
+  if (!all) return '';
+  var id = all[all.length - 1].toLowerCase();
+  return id.slice(0, 8) + '-' + id.slice(8, 12) + '-' + id.slice(12, 16) + '-' + id.slice(16, 20) + '-' + id.slice(20);
+}
+function notionBareId(id) { return String(id || '').replace(/-/g, ''); }
+function notionCreatePage(parentId, title, emoji) {
+  var body = { parent: { type: 'page_id', page_id: parentId }, properties: { title: { title: richText(title) } } };
+  if (emoji) body.icon = { type: 'emoji', emoji: emoji };
+  return notionFetch('post', 'pages', body).id;
+}
+// 在頁面最下面加區塊，回傳新區塊的 ID
+function notionAppendBlocks(parentId, children) {
+  var res = notionFetch('patch', 'blocks/' + parentId + '/children', { children: children });
+  return (res.results || []).map(function(b) { return b.id; });
+}
+// 在頁面最上面加一個區塊；Notion 不接受時改加在最下面
+function notionInsertTop(parentId, block) {
+  try {
+    var res = notionFetch('patch', 'blocks/' + parentId + '/children', { children: [block], position: { type: 'start' } });
+    return ((res.results || [])[0] || {}).id;
+  } catch (e) {
+    if (e.status !== 400) throw e;
+    return notionAppendBlocks(parentId, [block])[0];
+  }
+}
+function notionBlockGone(blockId) {
+  try {
+    var b = notionFetch('get', 'blocks/' + blockId);
+    return !!(b.in_trash || b.archived);
+  } catch (e) {
+    if (e.status === 404) return true;
+    throw e;
+  }
+}
+function notionPageGone(pageId) {
+  try {
+    var pg = notionFetch('get', 'pages/' + pageId);
+    return !!(pg.in_trash || pg.archived);
+  } catch (e) {
+    if (e.status === 404) return true;
+    throw e;
+  }
+}
+// 頁面裡的區塊：[{ id, type, title（子頁面、表格的名稱）, text（摘要框的文字）}]
+function notionChildren(pageId) {
+  var out = [], cursor = null;
+  do {
+    var res = notionFetch('get', 'blocks/' + pageId + '/children?page_size=100' + (cursor ? '&start_cursor=' + encodeURIComponent(cursor) : ''));
+    (res.results || []).forEach(function(b) {
+      if (b.in_trash || b.archived) return;
+      out.push({ id: b.id, type: b.type,
+        title: (b.child_page && b.child_page.title) || (b.child_database && b.child_database.title) || '',
+        text: b.callout ? readText({ rich_text: b.callout.rich_text }) : '' });
+    });
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor);
+  return out;
+}
+function findChild(kids, type, title) {
+  return kids.filter(function(k) { return k.type === type && (title === undefined || k.title === title); })[0] || null;
+}
+// 表格的資料來源
+function notionDataSource(dbId) {
+  var db = notionFetch('get', 'databases/' + dbId);
+  return db.data_sources && db.data_sources[0] && db.data_sources[0].id;
+}
+// 沿用頁面裡已經有的表格：{ db, ds }；沒有就回傳 null
+function notionFindTable(kids, title) {
+  var hit = findChild(kids, 'child_database', title);
+  if (!hit) return null;
+  var ds = notionDataSource(hit.id);
+  return ds ? { db: hit.id, ds: ds } : null;
+}
+// parts：[文字, 粗體, 連結網址]
+function notionRich(parts) {
+  return parts.filter(function(p) { return p[0]; }).map(function(p) {
+    var t = { type: 'text', text: { content: String(p[0]).slice(0, 1900) } };
+    if (p[2]) t.text.link = { url: p[2] };
+    if (p[1]) t.annotations = { bold: true };
+    return t;
+  });
+}
+function notionCallout(parts, emoji) {
+  return { object: 'block', type: 'callout', callout: { rich_text: notionRich(parts), icon: { type: 'emoji', emoji: emoji }, color: 'gray_background' } };
+}
+function notionHash(s) {
+  var h = 0;
+  for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+// 摘要框：有變才更新；在 Notion 刪掉了就不再加回來（holder[key] 變成 false）
+function notionUpdateCallout(holder, key, block) {
+  var id = holder[key], hash = notionHash(JSON.stringify(block.callout));
+  if (!id || holder[key + 'Hash'] === hash) return;
+  try {
+    notionFetch('patch', 'blocks/' + id, { callout: block.callout });
+    holder[key + 'Hash'] = hash;
+  } catch (e) {
+    if ((e.status !== 404 && e.status !== 400) || !notionBlockGone(id)) throw e;
+    holder[key] = false;
+  }
+}
+// 在某個頁面裡建一個表格（內嵌），回傳 { db, ds }
+function notionCreateTable(parentPageId, title, schema) {
+  var db = notionFetch('post', 'databases', {
+    parent: { type: 'page_id', page_id: parentPageId },
+    title: [{ type: 'text', text: { content: title } }],
+    is_inline: true,
+    initial_data_source: { properties: schema }
+  });
+  var dsId = db.data_sources && db.data_sources[0] && db.data_sources[0].id;
+  if (!dsId) dsId = notionDataSource(db.id);
+  if (!dsId) throw new Error('Notion 表格建立了，但找不到它的資料來源');
+  return { db: db.id, ds: dsId };
+}
+// 排好某個資料來源的分頁與欄位順序。只影響外觀：失敗時回傳 false，資料照樣同步
+function notionArrangeViews(dbId, dsId, views, primary) {
+  try {
+    var src = notionFetch('get', 'data_sources/' + dsId);
+    var ids = {};
+    Object.keys(src.properties || {}).forEach(function(name) { ids[name] = src.properties[name].id; });
+    var list = notionFetch('get', 'views?database_id=' + encodeURIComponent(dbId));
+    var mine = [];
+    (list.results || []).forEach(function(ref) {
+      var v = notionFetch('get', 'views/' + ref.id);
+      var vds = v.data_source_id ? notionBareId(v.data_source_id) : '';
+      if (vds ? vds === notionBareId(dsId) : primary) mine.push(ref.id);
+    });
+    views.forEach(function(v, i) {
+      var shown = v.columns.filter(function(n) { return ids[n]; });
+      var props = shown.map(function(n) {
+        var c = { property_id: ids[n], visible: true };
+        if (NOTION_WRAP_COLUMNS.indexOf(n) >= 0) c.wrap = true;
+        return c;
+      }).concat(Object.keys(ids).filter(function(n) { return shown.indexOf(n) < 0; }).map(function(n) {
+        return { property_id: ids[n], visible: false };
+      }));
+      var group = v.groupBy && ids[v.groupBy] ? { type: 'select', property_id: ids[v.groupBy], sort: { type: 'manual' }, hide_empty_groups: true } : null;
+      notionSaveView(mine[i] || null, dbId, dsId, v, props, group);
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+// 先用完整設定；Notion 不接受時改用另一種寫法，或拿掉分組／篩選再試
+function notionSaveView(viewId, dbId, dsId, v, props, group) {
+  var tries = [];
+  [true, false].forEach(function(extras) {
+    [{ type: 'table', properties: props }, { table: { properties: props } }].forEach(function(cfg) {
+      if (!extras && !group && !v.filter && tries.length) return;
+      var c = JSON.parse(JSON.stringify(cfg));
+      if (extras && group) (c.table || c).group_by = group;
+      var body = { configuration: c };
+      if (v.name) body.name = v.name;
+      if (extras && v.filter) body.filter = v.filter;
+      tries.push(body);
+    });
+  });
+  var lastErr;
+  for (var i = 0; i < tries.length; i++) {
+    var body = tries[i];
+    try {
+      if (viewId) return notionFetch('patch', 'views/' + viewId, body);
+      body.data_source_id = dsId; body.database_id = dbId; body.type = 'table'; body.position = { type: 'end' };
+      return notionFetch('post', 'views', body);
+    } catch (e) {
+      if (e.status !== 400) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr;
+}
+// 讀出一個表格的所有列：{ key: { id, values, edited（Notion 最後編輯時間）} }
+function notionQueryAll(dsId, fields, keyFn) {
+  var out = {}, cursor = null;
+  do {
+    var body = { page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+    var res = notionFetch('post', 'data_sources/' + dsId + '/query', body);
+    (res.results || []).forEach(function(pg) {
+      if (pg.object !== 'page' || pg.in_trash || pg.archived) return;
+      var v = notionRead(fields, pg), key = keyFn(pg, v);
+      if (key && !out[key]) out[key] = { id: pg.id, values: v, edited: pg.last_edited_time || '' };
+    });
+    cursor = res.has_more ? res.next_cursor : null;
+  } while (cursor);
+  return out;
+}
+function notionKeyOf(keyField) { return function(pg, v) { return v[keyField]; }; }
+function fmtMoney(n) { return '$' + String(Math.round(Number(n) || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+function extNum(v) { return (v === '' || v == null || !isFinite(Number(v))) ? null : Number(v); }
+// 選項順序就是 Notion 分組的順序：要處理的放前面
+var MYSHIP_STATUS_OPTIONS = [
+  { name: '待出貨', color: 'red' }, { name: '已出貨', color: 'yellow' }, { name: '已到店', color: 'blue' }, { name: '未取貨', color: 'orange' },
+  { name: '已取貨', color: 'green' }, { name: '已撥款', color: 'purple' }, { name: '已取消', color: 'gray' }, { name: '退貨／退款', color: 'gray' }
+];
+
+
+// 訂單日期 → Notion 日期（2026-09-23 或 2026-10-15T15:04:00+08:00）
+function extNotionDate(s) {
+  if (s instanceof Date) s = fmtTime(s);
+  s = String(s || '').trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  var m = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})/);
+  return m ? m[1] + 'T' + m[2] + ':00' + Utilities.formatDate(new Date(), TZ, 'XXX') : '';
+}
+function extJoin(list, sep) { return list.filter(function(s) { return String(s == null ? '' : s).trim(); }).join(sep); }
+function countStatus(rows) {
+  var count = {};
+  rows.forEach(function(r) { var s = String(r['狀態'] || '').trim() || '未知'; count[s] = (count[s] || 0) + 1; });
+  return count;
+}
+function emailSum(rows, col) { return rows.reduce(function(t, r) { return t + (Number(r[col]) || 0); }, 0); }
+function statusLine(count, options) {
+  var order = options.map(function(o) { return o.name; });
+  Object.keys(count).forEach(function(s) { if (order.indexOf(s) < 0) order.push(s); });
+  return order.filter(function(s) { return count[s]; }).map(function(s) { return s + ' ' + count[s]; }).join('・');
+}
+function notionSheetLine(c, url) {
+  return url ? [['\nGoogle Sheet　', true], ['「' + c.file + '」', false, url]] : [];
+}
+var STATUS_HINT = '\n狀態可以直接在表格裡改（例如寄出後改成「已出貨」）；之後讀到這筆訂單新的通知信時會再更新';
+// 最新一封通知信的時間，和要怎麼更新
+function mailLine(c, rows) {
+  var last = rows.map(function(r) { var v = r['最後通知時間']; return v instanceof Date ? fmtTime(v) : String(v || ''); }).sort().pop();
+  return (last ? '最新一封是 ' + last : '還沒有讀到通知信') + '；要更新時先按「' + c.name + ' → 讀取通知信」，再按「' + c.name + ' → 同步到 Notion」';
+}
+// 用某一欄（例如訂單編號）找到那一列，改另一欄；回傳有改到的 key
+function writeCellsByKey(ss, tab, keyCol, col, values) {
+  var sheet = ss.getSheetByName(tab), done = {};
+  if (!sheet || sheet.getLastRow() < 2) return done;
+  var head = getHeaderMap(sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]);
+  if (head[keyCol] === undefined || head[col] === undefined) return done;
+  var keys = sheet.getRange(2, head[keyCol] + 1, sheet.getLastRow() - 1, 1).getValues();
+  keys.forEach(function(r, i) {
+    var k = String(r[0]);
+    if (values.hasOwnProperty(k) && !done[k]) { sheet.getRange(i + 2, head[col] + 1).setValue(values[k]); done[k] = true; }
+  });
+  return done;
+}
+// 已經建好的表格少了 spec 裡的欄位時補上
+function notionEnsureFields(dsId, fields) {
+  var have = notionFetch('get', 'data_sources/' + dsId).properties || {}, add = {}, any = false;
+  fields.forEach(function(f) { if (!have[f[1]]) { add[f[1]] = notionSchema([f])[f[1]]; any = true; } });
+  if (any) notionFetch('patch', 'data_sources/' + dsId, { properties: add });
+}
+// 平台頁面裡的表格（which：orders 或 payouts）：讀出所有列；還沒建或在 Notion 被刪掉時（重新）建立
+// spec.drop：不要的欄位（之前的版本放過的）：已經建好的表格裡拿掉；spec.fields 裡新加的欄位補上。欄位有變才做，只做一次
+function notionChannelTable(ext, which, spec, keyField, report) {
+  var drop = ['信件'].concat(spec.drop || []), mark = drop.join('|') + '#' + spec.fields.map(function(f) { return f[1]; }).join(',');
+  if (ext[which]) {
+    try {
+      if (ext[which].dropped !== mark) {
+        drop.forEach(function(name) {
+          try { notionFetch('patch', 'data_sources/' + ext[which].ds, { properties: oneProp(name) }); } catch (ignore) {} // 沒有這個欄位也沒關係
+        });
+        notionEnsureFields(ext[which].ds, spec.fields);
+        ext[which].dropped = mark;
+      }
+      return notionQueryAll(ext[which].ds, spec.fields, notionKeyOf(keyField));
+    }
+    catch (e) { if (e.status !== 404) throw e; }
+    ext[which === 'orders' ? 'state' : 'pstate'] = {}; // 表格被刪掉 → 重建，全部重新放進去
+  }
+  var t = notionCreateTable(ext.page, spec.title, notionSchema(spec.fields), false);
+  ext[which] = { db: t.db, ds: t.ds, dropped: mark };
+  if (!notionArrangeViews(t.db, t.ds, spec.views, true)) report.viewsFailed = true;
+  return {};
+}
+function oneProp(name) { var o = {}; o[name] = null; return o; }
+// Notion 那一列最後編輯的時間比這筆訂單最後一封通知信新
+function notionNewer(edited, sec) {
+  var t = Date.parse(edited || '');
+  return isFinite(t) && t > (Number(sec) || 0) * 1000;
+}
+// 訂單：狀態雙向，其他欄位由 Google Sheet 寫到 Notion；時間用完時回傳 false
+function notionSyncChannelRows(c, ss, ext, rows, report, started) {
+  var spec = c.spec();
+  var have = notionChannelTable(ext, 'orders', spec, 'orderNo', report);
+  var state = ext.state || (ext.state = {});
+  var pulls = {}, pending = [], finished = true;
+  for (var i = 0; i < rows.length; i++) {
+    var o = rows[i], key = String(o['訂單編號'] || '');
+    if (!key) continue;
+    if (Date.now() - started > NOTION_TIME_BUDGET_MS) { finished = false; break; }
+    var want = c.wanted(o), page = have[key], base = state[key];
+    if (want.items && !want.prices) report.noPrice = (report.noPrice || 0) + 1;
+    try {
+      if (!page) {
+        if (base !== undefined) continue; // 同步過、但在 Notion 被刪掉 → 尊重刪除，不再建立
+        notionFetch('post', 'pages', { parent: { type: 'data_source_id', data_source_id: ext.orders.ds }, properties: notionProps(spec.fields, want) });
+        report.created++;
+        state[key] = want.status;
+        Utilities.sleep(340);
+        continue;
+      }
+      // 狀態：Google Sheet 沒變（沒有新的通知信）、Notion 改了 → 用 Notion 的；收到新的通知信 → 用信的
+      // 沒有同步紀錄（第一次接手之前建立的表格）時，看哪一邊比較新：Notion 最後編輯的時間、或這筆訂單最後一封通知信
+      var now = page.values.status;
+      if (now && now !== want.status && (base === undefined ? notionNewer(page.edited, o['更新時間（系統用）']) : want.status === base)) {
+        pulls[key] = now;
+        want.status = now; // 寫回 Google Sheet 之後才更新 Notion 的其他欄位
+      }
+      pending.push({ key: key, page: page, want: want });
+    } catch (e) {
+      report.errors.push(c.name + ' ' + key + '：' + e.message);
+      if (e.status === 401) throw e;
+    }
+  }
+  // 從 Notion 改的狀態寫回 Google Sheet（只改「狀態」那一格）；寫不回去的這次不動，下次同步再試
+  var written = Object.keys(pulls).length ? writeCellsByKey(ss, ORDER_TAB, '訂單編號', '狀態', pulls) : {};
+  Object.keys(pulls).forEach(function(k) {
+    if (written[k]) report.pulled++;
+    else report.errors.push(c.name + ' ' + k + '：狀態沒寫回 Google Sheet（找不到這筆訂單），下次同步再試');
+  });
+  rows.forEach(function(o) { var k = String(o['訂單編號'] || ''); if (written[k]) o['狀態'] = pulls[k]; });
+  for (var j = 0; j < pending.length; j++) {
+    var p = pending[j];
+    if (pulls[p.key] && !written[p.key]) continue;
+    try {
+      var patch = notionChanged(spec.fields, p.want, p.page.values);
+      if (patch) {
+        notionFetch('patch', 'pages/' + p.page.id, { properties: patch });
+        report.updated++;
+        Utilities.sleep(340);
+      }
+      state[p.key] = p.want.status;
+    } catch (e) {
+      report.errors.push(c.name + ' ' + p.key + '：' + e.message);
+      if (e.status === 401) throw e;
+    }
+  }
+  return finished;
+}
+// 這個平台的 Notion 頁面（放在你指定的頁面裡，跟其他平台並列）：之前建立的同名頁面就沿用
+function channelPage(c, pages) {
+  var ext = loadChunked(c.notionKey);
+  if (ext.page && ext.root === pages.root && !notionPageGone(ext.page)) return ext;
+  var hit = findChild(notionChildren(pages.root), 'child_page', c.title);
+  if (hit) {
+    ext = { root: pages.root, page: hit.id };
+    var kids = notionChildren(hit.id);
+    var sum = kids.filter(function(k) { return k.type === 'callout' && /通知信/.test(k.text); })[0];
+    ext.sum = sum ? sum.id : notionInsertTop(hit.id, notionCallout([['同步中…']], c.emoji));
+    var orders = notionFindTable(kids, c.spec().title);
+    if (orders) ext.orders = orders;
+  } else {
+    // 還沒建、或頁面在 Notion 被刪掉了 → 建一個新的（按了同步就是要看到這個頁面）
+    ext = { root: pages.root, page: notionCreatePage(pages.root, c.title, c.emoji) };
+    ext.sum = notionAppendBlocks(ext.page, [notionCallout([['同步中…']], c.emoji)])[0];
+  }
+  saveChunked(c.notionKey, ext); // 馬上記住，避免中途出錯時重複建立
+  return ext;
+}
+function notionMyshipSpec() {
+  return {
+    title: '訂單',
+    // 運費不是你的收入：不放。門市、付款方式、備註也不放。訂單總額是實收（扣掉運費），所以不另外放商品金額
+    drop: ['運費', '付款方式', '收件資訊', '備註', '商品金額'],
+    fields: [
+      ['buyer', '買家', 'title'],
+      ['status', '狀態', 'select', MYSHIP_STATUS_OPTIONS],
+      ['orderNo', '訂單編號', 'text'],
+      ['shop', '賣場', 'text'],
+      ['items', '商品', 'text'],
+      ['prices', '單價', 'text'],
+      ['income', '訂單總額', 'number'],
+      ['date', '訂單日期', 'date']
+    ],
+    views: [{ name: '依狀態', groupBy: '狀態',
+      columns: ['買家', '狀態', '訂單編號', '賣場', '商品', '單價', '訂單總額', '訂單日期'] }]
+  };
+}
+// 訂單總額＝實際收到的錢：商品金額（買家付的運費不是你的）。賣貨便的訂單成立信沒有手續費，所以沒有別的要扣
+function myshipReceived(o) { return extNum(o['商品金額']); }
+function notionMyshipWanted(o) {
+  return {
+    buyer: notionText(o['買家'] || '（未填）', 200),
+    status: String(o['狀態'] || ''),
+    orderNo: String(o['訂單編號'] || ''),
+    shop: notionText(o['賣場'], 200),
+    items: notionText(itemColumnsOf(o, '商品金額').items),
+    prices: notionText(itemColumnsOf(o, '商品金額').prices),
+    income: myshipReceived(o),
+    date: extNotionDate(o['訂單日期'])
+  };
+}
+function notionMyshipSummary(c, rows, payouts, url) {
+  var picked = rows.filter(function(r) { return /^(已取貨|已撥款)$/.test(String(r['狀態'] || '').trim()); }); // 入帳只算已取貨（已撥款也是取過貨的）
+  return notionCallout([
+    ['訂單　', true], [rows.length ? rows.length + ' 筆：' + statusLine(countStatus(rows), MYSHIP_STATUS_OPTIONS) : '還沒有訂單'],
+    ['\n金額　', true], [rows.length ? '已取貨的入帳 ' + fmtMoney(emailSum(picked, '商品金額')) + '（只算已取貨，運費不算）' : '—'],
+    ['\n通知信　', true], [mailLine(c, rows)]
+  ].concat(notionSheetLine(c, url), [[STATUS_HINT]]), '🏪');
+}
+
+function channel() {
+  return { id: 'myship', name: '賣貨便', file: FILE_NAME, title: '賣貨便訂單', emoji: '🏪', notionKey: '__NOTION_MYSHIP_', headers: HEADERS,
+    spec: notionMyshipSpec, wanted: notionMyshipWanted, summary: notionMyshipSummary };
+}
+
+// 設定 Notion，設定好就同步一次
+function notionSetup() {
+  var ui = SpreadsheetApp.getUi(), c = channel();
+  var props = PropertiesService.getScriptProperties();
+  var oldToken = props.getProperty(NOTION_TOKEN_KEY), oldRoot = props.getProperty(NOTION_ROOT_KEY);
+  var r1 = ui.prompt(c.name + '：設定 Notion（1/2）', '貼上 Notion 連接的存取權杖（開發人員工具 → 連接 → 你建立的連接 → 設定／Configuration）' +
+    (oldToken ? '\n已經設定過的話可以留空，沿用之前的權杖。' : ''), ui.ButtonSet.OK_CANCEL);
+  if (r1.getSelectedButton() !== ui.Button.OK) return;
+  var token = String(r1.getResponseText() || '').trim() || oldToken;
+  if (!token) return ui.alert('沒有輸入存取權杖');
+  var r2 = ui.prompt(c.name + '：設定 Notion（2/2）', '貼上要放「' + c.title + '」的 Notion 頁面連結（這個頁面要先在右上角「⋯ → 連接」加入你建立的連接；TWT 代購、KOCA 也放在同一個頁面）。' +
+    '\n之前已經在這個頁面建立的「' + c.title + '」會直接沿用。' + (oldRoot ? '\n留空就用之前的頁面。' : ''), ui.ButtonSet.OK_CANCEL);
+  if (r2.getSelectedButton() !== ui.Button.OK) return;
+  var linkText = String(r2.getResponseText() || '').trim();
+  var rootId = linkText ? extractNotionId(linkText) : oldRoot || '';
+  if (!rootId) return ui.alert('看不出這是 Notion 頁面連結，請在 Notion 頁面按「分享 → 複製連結」再貼上');
+  props.setProperty(NOTION_TOKEN_KEY, token);
+  try {
+    notionFetch('get', 'pages/' + rootId); // 先確認頁面已經加入連接
+  } catch (e) {
+    if (oldToken) props.setProperty(NOTION_TOKEN_KEY, oldToken); else props.deleteProperty(NOTION_TOKEN_KEY);
+    return ui.alert('設定失敗：' + e.message);
+  }
+  props.setProperty(NOTION_ROOT_KEY, rootId);
+  if (oldRoot && oldRoot !== rootId) saveChunked(c.notionKey, {}); // 換了頁面：在新的頁面重新建
+  ui.alert(c.name + '：Notion 設定完成', notionSyncOnce(), ui.ButtonSet.OK);
+}
+function notionSyncNow() { return notify(channel().name + '：同步到 Notion', notionSyncOnce()); }
+
+// 同步一次；回傳要給你看的文字
+function notionSyncOnce() {
+  var sp = PropertiesService.getScriptProperties(), c = channel();
+  var root = sp.getProperty(NOTION_ROOT_KEY);
+  if (!sp.getProperty(NOTION_TOKEN_KEY) || !root) return '還沒設定 Notion：請先按「' + c.name + ' → 設定 Notion（選用）」。';
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return '正在讀信或同步中，請過 1～2 分鐘再按一次。';
+  var report = { created: 0, updated: 0, pulled: 0, errors: [], pending: false };
+  try {
+    var text = syncChannel(c, SpreadsheetApp.getActiveSpreadsheet(), { root: root }, report, Date.now());
+    return 'Notion「' + c.emoji + ' ' + c.title + '」：' + text + '。' +
+      (report.viewsFailed ? '\n（有些表格的欄位順序沒有設定成功，可以在 Notion 自己拖曳調整；資料同步不受影響）' : '') +
+      (report.errors.length ? '\n\n有 ' + report.errors.length + ' 筆沒同步成功：' + report.errors[0] : '') +
+      (report.noPrice ? '\n\n有 ' + report.noPrice + ' 筆訂單還沒有單價（信還沒重讀）：先按「' + c.name + ' → 讀取通知信」重讀信（舊信在別的帳號的信箱時，用那個帳號讀），再同步一次。' : '') +
+      (report.pending ? '\n\n資料比較多，還沒同步完：再按一次會接著做。' : '') +
+      '\n\n要更新「訂單總覽」：到 Google Sheet「訂單總覽」按「訂單總覽 → 更新全部」。';
+  } catch (e) {
+    return 'Notion 同步失敗：' + e.message;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// 這個檔案的訂單同步到 Notion；回傳要給你看的文字
+function syncChannel(c, ss, pages, report, started) {
+  if (!ss.getSheetByName(ORDER_TAB)) throw new Error('這個檔案裡沒有「' + ORDER_TAB + '」分頁：請先按「' + c.name + ' → 讀取通知信」');
+  var ext = channelPage(c, pages);
+  try {
+    var rows = readRows(ss, ORDER_TAB, c.headers);
+    if (!notionSyncChannelRows(c, ss, ext, rows, report, started)) { report.pending = true; }
+    else {
+      notionUpdateCallout(ext, 'sum', c.summary(c, rows, [], ss.getUrl()));
+    }
+  } finally {
+    saveChunked(c.notionKey, ext);
+  }
+  return '新增 ' + report.created + ' 筆、更新 ' + report.updated + ' 筆' +
+    (report.pulled ? '；把 Notion 改的 ' + report.pulled + ' 筆狀態寫回這個檔案' : '');
+}
+
+// 看這個帳號的信箱裡有沒有賣貨便寄來的信（不寫入任何資料）
+function checkMailbox() {
+  var title = '賣貨便：檢查這個帳號的信箱';
+  var threads = [];
+  try {
+    for (var start = 0; start < 5000; start += 100) {
+      var batch = GmailApp.search(MAIL_QUERY, start, 100);
+      threads = threads.concat(batch);
+      if (batch.length < 100) break;
+    }
+  } catch (e) {
+    return notify(title, '讀取失敗：' + e.message);
+  }
+  var lines = ['帳號：' + (me() || '（看不到，可能還沒授權）')];
+  if (!threads.length) {
+    lines.push('這個信箱裡找不到寄件人含 sp88.com 或 7-11.com.tw 的信。',
+      '請確認上面的帳號是不是要讀的那個；如果不是，用那個帳號打開這個檔案（建議開無痕視窗、只登入那個帳號）再按一次。');
+  } else {
+    lines.push('寄件人含 sp88.com 或 7-11.com.tw 的信：' + threads.length + ' 個對話', '最新的幾封：');
+    threads.slice(0, 5).forEach(function(t) { lines.push('・' + fmtTime(t.getLastMessageDate()) + '　' + t.getFirstMessageSubject()); });
+    lines.push('最舊的一封：' + fmtTime(threads[threads.length - 1].getLastMessageDate()));
+  }
+  return notify(title, lines.join('\n'));
+}
