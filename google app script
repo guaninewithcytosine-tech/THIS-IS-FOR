@@ -274,6 +274,9 @@ function onOpen() {
     .addSeparator()
     .addItem('同步到 Notion', 'notionSyncNow')
     .addItem('設定 Notion（選用）', 'notionSetup')
+    .addSeparator()
+    .addItem('通知到 Discord', 'discordNotifyNow')
+    .addItem('設定 Discord（選用）', 'discordSetup')
     .addToUi();
 }
 
@@ -3467,3 +3470,168 @@ function notionSyncOnce() {
   }
 }
 
+// ══════════════════════════════════════════
+// Discord（選用）：按「TWT 代購 → 通知到 Discord」時，把上次通知之後的新訂單，和各團還沒處理的數字，貼到你指定的 Discord 頻道。不會自動通知
+// 用頻道的 Webhook（編輯頻道 → 整合 → Webhook），不用裝機器人。只貼社群帳號、金額、商品和訂單編號；手機、匯款後五碼不會貼到 Discord
+// ══════════════════════════════════════════
+var DISCORD_WEBHOOK_KEY = '__DISCORD_WEBHOOK__'; // 這個網址等於密碼：只存在這裡
+var DISCORD_SENT_KEY = '__DISCORD_SENT_';        // 已經通知過的訂單：{ 試算表ID: [訂單編號, …] }
+var DISCORD_MAX_CHARS = 1900;                    // Discord 一則訊息最多 2000 字，超過就分成幾則
+
+function discordWebhookOf(text) {
+  var m = String(text || '').trim().match(/^https:\/\/(?:(?:canary|ptb)\.)?discord(?:app)?\.com\/api\/webhooks\/\d+\/[\w-]+/);
+  return m ? m[0] : '';
+}
+// 貼一則訊息到頻道；不會 @ 到任何人（社群帳號裡有 @everyone 也一樣）
+function discordPost(content) {
+  var url = PropertiesService.getScriptProperties().getProperty(DISCORD_WEBHOOK_KEY);
+  if (!url) throw new Error('還沒設定 Discord：請先按「TWT 代購 → 設定 Discord（選用）」');
+  var options = { method: 'post', contentType: 'application/json', muteHttpExceptions: true,
+    payload: JSON.stringify({ content: content, username: TWT_TITLE, allowed_mentions: { parse: [] } }) };
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var res;
+    try {
+      res = UrlFetchApp.fetch(url, options);
+    } catch (e) {
+      if (/external_request|UrlFetchApp/.test(String(e && e.message))) {
+        throw new Error('要連到 Discord，需要先授權這支程式「連到外部服務」。請打開「擴充功能 → Apps Script」，在上方的函式選單選「discordNotifyNow」，按「執行」，在跳出的視窗按「檢閱權限」→ 選帳號 →「進階」→「前往…（不安全）」→「允許」，授權後再回來按一次。');
+      }
+      throw e;
+    }
+    var code = res.getResponseCode();
+    if (code === 429 || code >= 500) {
+      var wait = 0;
+      try { wait = Number(JSON.parse(res.getContentText() || '{}').retry_after) || 0; } catch (ignore) {}
+      Utilities.sleep(Math.min(30, wait || attempt + 1) * 1000 + 250);
+      continue;
+    }
+    if (code >= 400) {
+      var err = new Error(code === 401 || code === 404 ? 'Discord 的 Webhook 網址不能用了（可能在 Discord 刪掉了）：請再按一次「TWT 代購 → 設定 Discord（選用）」貼上新的網址'
+        : 'Discord ' + code + '：' + String(res.getContentText() || '').slice(0, 200));
+      err.status = code;
+      throw err;
+    }
+    return true;
+  }
+  throw new Error('Discord 目前太忙，稍後再試');
+}
+// 放進 Discord 訊息的文字：換行改成頓號、太長就截斷，*、_、~ 這類字不會變成粗體或刪除線，[文字](網址) 不會變成連結
+function discordText(v, max) {
+  var s = String(v == null ? '' : v).replace(/\s*\n\s*/g, '、').replace(/\s+/g, ' ').trim();
+  if (max && s.length > max) s = s.slice(0, max - 1) + '…';
+  return s.replace(/([\\*_~`|>\[\]])/g, '\\$1');
+}
+function discordNow() { return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MM/dd HH:mm'); }
+// 一個團還沒處理的數字（跟團務索引表單一樣的算法）
+function discordTodoLine(name, st) {
+  var parts = [];
+  if (st.unpaid) parts.push('未付款 ' + st.unpaid);
+  if (st.mismatch) parts.push('金額不符 ' + st.mismatch);
+  if (st.second) parts.push('二補待收 ' + st.second);
+  return parts.length ? '・' + name + '：' + parts.join('・') : '';
+}
+// 把幾行分成幾則訊息（每則不超過 Discord 的字數上限）；每一則記著裡面有哪些訂單，貼成功才算通知過
+function discordChunks(lines) {
+  var out = [], cur = { text: '', orders: [] };
+  lines.forEach(function(l) {
+    if (cur.text && cur.text.length + 1 + l.text.length > DISCORD_MAX_CHARS) { out.push(cur); cur = { text: '', orders: [] }; }
+    cur.text += (cur.text ? '\n' : '') + l.text;
+    if (l.order) cur.orders.push(l.order);
+  });
+  if (cur.text) out.push(cur);
+  return out;
+}
+// 現在有的訂單都算通知過（第一次設定時用：之前的訂單不會一次全部貼上去）
+function discordBaseline() {
+  var sent = {}, n = 0;
+  twtCampaigns().forEach(function(c) {
+    sent[c.ssId] = loadCampaignOrders(c.ssId).map(function(o) { return o.orderId; }).filter(Boolean);
+    n += sent[c.ssId].length;
+  });
+  saveChunked(DISCORD_SENT_KEY, sent);
+  return n;
+}
+
+function discordSetup() {
+  var ui = SpreadsheetApp.getUi(), sp = PropertiesService.getScriptProperties();
+  var old = sp.getProperty(DISCORD_WEBHOOK_KEY);
+  var r = ui.prompt('TWT 代購：設定 Discord（選用）', '在 Discord 要收通知的頻道（建議用只有你和小幫手看得到的管理頻道）按「編輯頻道 → 整合 → Webhook → 新 Webhook → 複製 Webhook 網址」，貼在這裡。' +
+    '\n這個網址等於密碼，不要貼給別人。' + (old ? '\n已經設定過的話可以留空，沿用之前的網址。' : ''), ui.ButtonSet.OK_CANCEL);
+  if (r.getSelectedButton() !== ui.Button.OK) return;
+  var text = String(r.getResponseText() || '').trim();
+  var url = text ? discordWebhookOf(text) : old;
+  if (!url) return ui.alert('看不出這是 Discord 的 Webhook 網址（應該是 https://discord.com/api/webhooks/… 開頭）');
+  sp.setProperty(DISCORD_WEBHOOK_KEY, url);
+  try {
+    discordPost('✅ 「' + TWT_TITLE + '」已經連到這個頻道。之後在 Google Sheet 按「TWT 代購 → 通知到 Discord」，新訂單會貼在這裡。');
+  } catch (e) {
+    if (old) sp.setProperty(DISCORD_WEBHOOK_KEY, old); else sp.deleteProperty(DISCORD_WEBHOOK_KEY);
+    return ui.alert('設定失敗：' + e.message);
+  }
+  var first = !sp.getProperty(DISCORD_SENT_KEY + 'N__'), n = first ? discordBaseline() : 0;
+  ui.alert('TWT 代購：Discord 設定完成', '已經在那個頻道貼了一則測試訊息。' +
+    (first ? '\n現在有的 ' + n + ' 筆訂單算已經通知過，不會再貼；' : '\n') + '之後有新訂單時，按「TWT 代購 → 通知到 Discord」就會貼上去。不會自動通知。', ui.ButtonSet.OK);
+}
+function discordNotifyNow() {
+  var msg = discordNotifyOnce();
+  try { SpreadsheetApp.getUi().alert('TWT 代購：通知到 Discord', msg, SpreadsheetApp.getUi().ButtonSet.OK); return msg; } catch (ignore) {}
+  try { getMainSpreadsheetOrThrow().toast(msg, 'TWT 代購', 10); } catch (ignore) {}
+  return msg;
+}
+// 通知一次；回傳要給你看的文字。連按兩次時第二次不會重貼
+function discordNotifyOnce() {
+  if (!PropertiesService.getScriptProperties().getProperty(DISCORD_WEBHOOK_KEY)) return '還沒設定 Discord：請先按「TWT 代購 → 設定 Discord（選用）」。';
+  var cache = CacheService.getScriptCache();
+  if (cache.get('discord_notify_running')) return '正在通知中，請過 1 分鐘再按一次。';
+  cache.put('discord_notify_running', '1', 330);
+  try {
+    var sent = loadChunked(DISCORD_SENT_KEY), keep = {}, lines = [], todo = [], newCount = 0, newCamps = 0, errors = [];
+    twtCampaigns().forEach(function(c) {
+      keep[c.ssId] = sent[c.ssId] || []; // 不在團務資料裡的團不再記
+      if (c.status === 'deleted') return; // 團務結束的團不會有新訂單
+      var orders;
+      try { orders = loadCampaignOrders(c.ssId); } catch (e) { errors.push(c.name + '：' + e.message); return; }
+      var had = {};
+      keep[c.ssId].forEach(function(id) { had[id] = true; });
+      var news = orders.filter(function(o) { return o.orderId && !had[o.orderId]; })
+        .sort(function(a, b) { return String(a.timestamp).localeCompare(String(b.timestamp)); });
+      if (news.length) {
+        newCount += news.length;
+        newCamps++;
+        lines.push({ text: '\n**' + discordText(c.name, 60) + '**（新 ' + news.length + ' 筆）' });
+        news.forEach(function(o) {
+          lines.push({ text: '• ' + (discordText(o.socialName, 40) || '（沒填社群帳號）') + '｜' + fmtMoney(o.totalAmount) + '｜' + discordText(o.orderDetails, 80) + '（' + o.orderId + '）',
+            order: { ssId: c.ssId, id: o.orderId } });
+        });
+      }
+      var st = campaignStats(orders);
+      if (discordTodoLine(c.name, st)) todo.push({ name: c.name, st: st });
+    });
+    var todoText = todo.length ? '\n\n還沒處理的：\n' + todo.map(function(t) { return discordTodoLine(t.name, t.st); }).join('\n') : '';
+    var errText = errors.length ? '\n\n有 ' + errors.length + ' 個團讀不到：' + errors[0] : '';
+    if (!newCount) {
+      saveChunked(DISCORD_SENT_KEY, keep);
+      return '上次通知之後沒有新訂單，這次沒有貼到 Discord。' + todoText + errText;
+    }
+    lines.unshift({ text: '📦 **' + TWT_TITLE + '**　新訂單 ' + newCount + ' 筆（' + discordNow() + '）' });
+    if (todo.length) {
+      lines.push({ text: '\n**還沒處理的**' });
+      todo.forEach(function(t) { lines.push({ text: discordTodoLine(discordText(t.name, 60), t.st) }); });
+    }
+    var chunks = discordChunks(lines), posted = 0;
+    try {
+      chunks.forEach(function(ch, i) {
+        if (i) Utilities.sleep(400);
+        discordPost(ch.text);
+        ch.orders.forEach(function(o) { keep[o.ssId].push(o.id); posted++; });
+      });
+    } catch (e) {
+      saveChunked(DISCORD_SENT_KEY, keep); // 已經貼上去的不會重貼，沒貼上的下次再貼
+      return '通知到 Discord 失敗：' + e.message + (posted ? '\n（已經貼了 ' + posted + ' 筆，剩下的下次按的時候再貼）' : '');
+    }
+    saveChunked(DISCORD_SENT_KEY, keep);
+    return '已經貼到 Discord：新訂單 ' + newCount + ' 筆（' + newCamps + ' 個團）。' + todoText + errText;
+  } finally {
+    cache.remove('discord_notify_running');
+  }
+}
